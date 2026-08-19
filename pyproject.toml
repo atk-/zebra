@@ -1,0 +1,11 @@
+[project]
+name = "zebra"
+version = "0.1.0"
+description = "Hashcat mask-coverage tracker and planner"
+requires-python = ">=3.12"
+dependencies = [
+    "django>=6.1",
+]
+
+[tool.uv]
+package = false

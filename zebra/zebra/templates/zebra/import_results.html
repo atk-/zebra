@@ -1,0 +1,19 @@
+{% extends "zebra/base.html" %}
+{% block title %}Import results — {{ project.name }}{% endblock %}
+{% block content %}
+<h1>Import results</h1>
+<p class="muted"><a href="{% url 'project_detail' project.pk %}">← {{ project.name }}</a></p>
+{% if message %}<div class="note ok">{{ message }}</div>{% endif %}
+{% if error %}<div class="note warn">{{ error }}</div>{% endif %}
+<form method="post" class="card">
+  {% csrf_token %}
+  <label>Type</label>
+  <select name="kind">
+    <option value="potfile">Potfile (hash:plaintext)</option>
+    <option value="status">Status JSON (--status-json)</option>
+  </select>
+  <label>Paste content</label>
+  <textarea name="text" rows="10" placeholder="5f4dcc3b5aa765d61d8327deb882cf99:password"></textarea>
+  <div style="margin-top:12px"><button class="btn" type="submit">Import</button></div>
+</form>
+{% endblock %}

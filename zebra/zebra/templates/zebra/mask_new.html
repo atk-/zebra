@@ -1,0 +1,50 @@
+{% extends "zebra/base.html" %}
+{% block title %}Plan a mask — {{ project.name }}{% endblock %}
+{% block content %}
+<h1>Plan a mask</h1>
+<p class="muted"><a href="{% url 'project_detail' project.pk %}">← {{ project.name }}</a></p>
+
+<form method="post" class="card">
+  {% csrf_token %}
+  <label>Mask pattern</label>
+  <input type="text" name="pattern" value="{{ pattern|default:'' }}"
+         placeholder="?u?l?l?l?d?d" autofocus>
+  <label>Custom charsets <span class="muted">(optional, one <code>key=def</code> per line, e.g. <code>1=?l?d</code>)</span></label>
+  <textarea name="custom_charsets" rows="2">{{ custom_charsets_raw|default:'' }}</textarea>
+  <label>Hashcat module (-m)</label>
+  <input type="text" name="module" value="{{ module|default:'0' }}">
+  <div style="margin-top:14px">
+    <button class="btn secondary" name="action" value="preview" type="submit">Evaluate</button>
+    {% if evaluation and not evaluation.error %}
+    <button class="btn" name="action" value="save" type="submit">Save mask</button>
+    {% endif %}
+  </div>
+</form>
+
+{% if evaluation %}
+  {% if evaluation.error %}
+    <div class="note warn">Parse error: {{ evaluation.error }}</div>
+  {% else %}
+  <div class="card">
+    <h2 style="margin-top:0">Evaluation</h2>
+    <p>Length <strong>{{ evaluation.length }}</strong> ·
+       candidate keyspace <strong>{{ evaluation.keyspace }}</strong></p>
+    {% if evaluation.subsumed %}
+      <div class="note warn"><strong>Redundant.</strong> This mask is already fully
+        covered by masks you've run — it would add no new keyspace.</div>
+    {% elif evaluation.overlap %}
+      <div class="note warn"><strong>Partial overlap.</strong>
+        {{ evaluation.overlap }} of {{ evaluation.keyspace }} candidates are already
+        covered; only <strong>{{ evaluation.marginal }}</strong> would be new.</div>
+    {% else %}
+      <div class="note ok"><strong>All new.</strong> No overlap with existing masks —
+        adds {{ evaluation.marginal }} candidates.</div>
+    {% endif %}
+    {% if command %}
+      <p class="muted" style="margin-bottom:4px">Generated command:</p>
+      <code class="cmd">{{ command }}</code>
+    {% endif %}
+  </div>
+  {% endif %}
+{% endif %}
+{% endblock %}

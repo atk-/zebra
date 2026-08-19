@@ -1,0 +1,49 @@
+{% extends "zebra/base.html" %}
+{% block title %}{{ project.name }} — zebra{% endblock %}
+{% block content %}
+<h1>{{ project.name }}</h1>
+{% if project.description %}<p class="muted">{{ project.description }}</p>{% endif %}
+
+<div class="card">
+  <strong>{{ cracked }}/{{ total_hashes }}</strong> hashes cracked
+  ({{ cracked_pct|floatformat:1 }}%)
+  &nbsp;·&nbsp; <a class="btn" href="{% url 'mask_new' project.pk %}">Plan a mask</a>
+  <a class="btn secondary" href="{% url 'import_results' project.pk %}">Import results</a>
+</div>
+
+<h2>Coverage by password length</h2>
+{% if coverage %}
+<table>
+  <tr><th>Length</th><th>Masks</th><th>Covered</th><th>Total</th><th>Remaining</th><th style="width:34%">Coverage</th></tr>
+  {% for row in coverage %}
+  <tr>
+    <td>{{ row.length }}</td>
+    <td>{{ row.masks }}</td>
+    <td>{{ row.covered }}</td>
+    <td>{% if row.total %}{{ row.total }}{% else %}—{% endif %}</td>
+    <td>{% if row.remaining is not None %}{{ row.remaining }}{% else %}—{% endif %}</td>
+    <td>
+      <div class="bar"><span style="width:{{ row.percent|floatformat:4 }}%"></span></div>
+      <span class="muted">{{ row.percent|floatformat:4 }}%</span>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="muted">Totals use {% if project.universe %}the project universe
+  <code>{{ project.universe }}</code>{% else %}a fallback per-position universe
+  (set <em>universe</em> on the project for a fixed denominator){% endif %}.</p>
+{% else %}
+<p class="muted">No masks recorded yet. <a href="{% url 'mask_new' project.pk %}">Plan the first one.</a></p>
+{% endif %}
+
+<h2>Recent runs</h2>
+{% if runs %}
+<table>
+  <tr><th>Mask</th><th>Status</th><th>Progress</th><th>Created</th></tr>
+  {% for r in runs %}
+  <tr><td><code>{{ r.mask.pattern|default:"—" }}</code></td><td>{{ r.status }}</td>
+      <td>{{ r.progress|floatformat:2 }}</td><td class="muted">{{ r.created_at }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}<p class="muted">No runs recorded.</p>{% endif %}
+{% endblock %}

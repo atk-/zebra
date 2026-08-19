@@ -1,0 +1,13 @@
+{% extends "zebra/base.html" %}
+{% block content %}
+<h1>Projects</h1>
+<p class="muted">Track masks run against each hashlist and see what keyspace is left.</p>
+{% for p in projects %}
+  <div class="card">
+    <a href="{% url 'project_detail' p.pk %}"><strong>{{ p.name }}</strong></a>
+    {% if p.description %}<div class="muted">{{ p.description }}</div>{% endif %}
+  </div>
+{% empty %}
+  <p class="muted">No projects yet. Create one in the <a href="/admin/">admin</a>.</p>
+{% endfor %}
+{% endblock %}
