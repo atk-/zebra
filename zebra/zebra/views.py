@@ -3,7 +3,7 @@ from decimal import Decimal
 from django.shortcuts import render, get_object_or_404, redirect
 from django.urls import reverse
 
-from .models import Project, Mask, HashType, Run
+from .models import Project, Mask, HashType, Hash, Run
 from . import coverage_helpers as ch
 from .services import hashcat as hc
 
@@ -11,6 +11,45 @@ from .services import hashcat as hc
 def index(request):
     projects = Project.objects.all()
     return render(request, 'zebra/index.html', {'projects': projects})
+
+
+def project_new(request):
+    hashtypes = HashType.objects.all()
+    context = {'hashtypes': hashtypes}
+    if request.method == 'POST':
+        name = (request.POST.get('name') or '').strip()
+        description = (request.POST.get('description') or '').strip()
+        universe = (request.POST.get('universe') or '').strip()
+        hashtype_id = request.POST.get('hashtype')
+        hashlist_raw = request.POST.get('hashlist') or ''
+        context.update({'name': name, 'description': description,
+                        'universe': universe, 'hashtype_id': hashtype_id,
+                        'hashlist': hashlist_raw})
+
+        hashtype = hashtypes.filter(pk=hashtype_id).first() if hashtype_id else None
+        if not name:
+            context['error'] = 'Project name is required.'
+        elif Project.objects.filter(name=name).exists():
+            context['error'] = 'A project named "%s" already exists.' % name
+        elif hashtype is None:
+            context['error'] = 'Please choose a hashtype.'
+        else:
+            project = Project.objects.create(
+                name=name, description=description or None,
+                universe=universe or None)
+            # One Hash per unique, non-empty line of the pasted hashlist.
+            seen, rows = set(), []
+            for line in hashlist_raw.splitlines():
+                line = line.strip()
+                if not line or line in seen:
+                    continue
+                seen.add(line)
+                rows.append(Hash(hashstring=line, hashtype=hashtype,
+                                 project=project, cracked=False))
+            if rows:
+                Hash.objects.bulk_create(rows)
+            return redirect(reverse('project_detail', args=[project.pk]))
+    return render(request, 'zebra/project_new.html', context)
 
 
 def project_detail(request, pk):
@@ -25,6 +64,7 @@ def project_detail(request, pk):
         'total_hashes': total_hashes,
         'cracked_pct': (100.0 * cracked / total_hashes) if total_hashes else 0.0,
         'coverage': ch.project_coverage(project),
+        'masks': project.masks.all(),
         'runs': Run.objects.filter(mask__project=project)[:50],
     }
     return render(request, 'zebra/project_detail.html', context)

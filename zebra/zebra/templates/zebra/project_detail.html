@@ -36,6 +36,20 @@
 <p class="muted">No masks recorded yet. <a href="{% url 'mask_new' project.pk %}">Plan the first one.</a></p>
 {% endif %}
 
+<h2>Masks tried ({{ masks|length }})</h2>
+{% if masks %}
+<table>
+  <tr><th>Mask</th><th>Length</th><th>Keyspace</th><th>Comment</th></tr>
+  {% for m in masks %}
+  <tr><td><code>{{ m.pattern }}</code></td><td>{{ m.length }}</td>
+      <td>{{ m.keyspace|default:"—" }}</td>
+      <td class="muted">{{ m.comment|default:"" }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">No masks tried yet. <a href="{% url 'mask_new' project.pk %}">Plan the first one.</a></p>
+{% endif %}
+
 <h2>Recent runs</h2>
 {% if runs %}
 <table>

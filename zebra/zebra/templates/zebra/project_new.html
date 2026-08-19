@@ -1,0 +1,51 @@
+{% extends "zebra/base.html" %}
+{% block title %}New project — zebra{% endblock %}
+{% block content %}
+<h1>New project</h1>
+<p class="muted"><a href="{% url 'index' %}">← Projects</a></p>
+
+{% if error %}<div class="note warn">{{ error }}</div>{% endif %}
+
+{% if not hashtypes %}
+  <div class="note warn">
+    No hashtypes defined yet. Add one in the
+    <a href="/admin/zebra/hashtype/add/">admin</a> (name + hashcat module number,
+    e.g. <code>NTLM</code> / <code>1000</code>), then come back to create a project.
+  </div>
+{% else %}
+<form method="post" class="card">
+  {% csrf_token %}
+
+  <label>Project name</label>
+  <input type="text" name="name" value="{{ name|default:'' }}"
+         placeholder="Acme engagement" autofocus>
+
+  <label>Description <span class="muted">(optional)</span></label>
+  <input type="text" name="description" value="{{ description|default:'' }}">
+
+  <label>Hashtype</label>
+  <select name="hashtype">
+    <option value="">— choose —</option>
+    {% for ht in hashtypes %}
+    <option value="{{ ht.pk }}" {% if hashtype_id == ht.pk|stringformat:'s' %}selected{% endif %}>
+      {{ ht.name }} ({{ ht.hashcat_module }})
+    </option>
+    {% endfor %}
+  </select>
+
+  <label>Universe <span class="muted">(optional — the character set used as the
+    coverage-% denominator; leave blank to use a per-position fallback)</span></label>
+  <input type="text" name="universe" value="{{ universe|default:'' }}"
+         placeholder="abcdefghijklmnopqrstuvwxyz0123456789">
+
+  <label>Hashlist <span class="muted">(one hash per line)</span></label>
+  <textarea name="hashlist" rows="8"
+            placeholder="5f4dcc3b5aa765d61d8327deb882cf99&#10;e10adc3949ba59abbe56e057f20f883e">{{ hashlist|default:'' }}</textarea>
+
+  <div style="margin-top:14px">
+    <button class="btn" type="submit">Create project</button>
+    <a class="btn secondary" href="{% url 'index' %}">Cancel</a>
+  </div>
+</form>
+{% endif %}
+{% endblock %}
