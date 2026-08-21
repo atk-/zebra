@@ -1,0 +1,32 @@
+{% extends "zebra/base.html" %}
+{% block title %}Add hashes — {{ project.name }}{% endblock %}
+{% block content %}
+<h1>Add hashes</h1>
+<p class="muted"><a href="{% url 'project_detail' project.pk %}">← {{ project.name }}</a></p>
+
+{% if message %}<div class="note ok">{{ message }}
+  &nbsp;<a href="{% url 'project_detail' project.pk %}">Back to project</a></div>{% endif %}
+{% if error %}<div class="note warn">{{ error }}</div>{% endif %}
+
+{% if not hashtypes %}
+  <div class="note warn">
+    No hashtypes defined yet. Add one in the
+    <a href="/admin/zebra/hashtype/add/">admin</a> first.
+  </div>
+{% else %}
+<form method="post" class="card">
+  {% csrf_token %}
+  <label>Hashtype</label>
+  {% include "zebra/_hashtype_combobox.html" with selected=hashtype_id %}
+
+  <label>Hashlist <span class="muted">(one hash per line; duplicates are skipped)</span></label>
+  <textarea name="hashlist" rows="10"
+            placeholder="5f4dcc3b5aa765d61d8327deb882cf99&#10;e10adc3949ba59abbe56e057f20f883e">{{ hashlist|default:'' }}</textarea>
+
+  <div style="margin-top:12px">
+    <button class="btn" type="submit">Add hashes</button>
+    <a class="btn secondary" href="{% url 'project_detail' project.pk %}">Done</a>
+  </div>
+</form>
+{% endif %}
+{% endblock %}

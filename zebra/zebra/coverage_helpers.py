@@ -28,15 +28,24 @@ def compute_and_cache_keyspace(mask):
     return mask
 
 
+def covered_masks(project):
+    """Masks that count as covered: those with at least one exhausted run.
+
+    Single source of truth for "actually-searched keyspace" -- a mask only counts
+    once a run against it has been recorded as exhausted (keyspace fully searched).
+    """
+    return Mask.objects.filter(project=project, runs__status='exhausted').distinct()
+
+
 def project_coverage(project):
-    """Coverage-by-length summary for every mask stored in a project.
+    """Coverage-by-length summary for a project's exhausted-run masks.
 
     Returns a sorted list of row dicts ready for templating, each with:
     length, masks, covered, total, remaining, percent.
     """
     wmap = project_wildcard_map()
     parsed = []
-    for m in project.masks.all():
+    for m in covered_masks(project):
         try:
             parsed.append(mask_positions(m, wmap))
         except cov.MaskParseError:
@@ -70,7 +79,7 @@ def evaluate_candidate(project, pattern, custom_charsets=None):
     except cov.MaskParseError as exc:
         return {'error': str(exc)}
     existing = []
-    for m in project.masks.all():
+    for m in covered_masks(project):
         try:
             existing.append(mask_positions(m, wmap))
         except cov.MaskParseError:

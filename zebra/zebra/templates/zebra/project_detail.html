@@ -7,7 +7,8 @@
 <div class="card">
   <strong>{{ cracked }}/{{ total_hashes }}</strong> hashes cracked
   ({{ cracked_pct|floatformat:1 }}%)
-  &nbsp;·&nbsp; <a class="btn" href="{% url 'mask_new' project.pk %}">Plan a mask</a>
+  &nbsp;·&nbsp; <a class="btn" href="{% url 'mask_new' project.pk %}">Record an attack</a>
+  <a class="btn secondary" href="{% url 'hashes_add' project.pk %}">Add hashes</a>
   <a class="btn secondary" href="{% url 'import_results' project.pk %}">Import results</a>
 </div>
 
@@ -29,35 +30,35 @@
   </tr>
   {% endfor %}
 </table>
-<p class="muted">Totals use {% if project.universe %}the project universe
+<p class="muted">Covered = keyspace exhausted. Totals use
+  {% if project.universe %}the project universe
   <code>{{ project.universe }}</code>{% else %}a fallback per-position universe
   (set <em>universe</em> on the project for a fixed denominator){% endif %}.</p>
 {% else %}
-<p class="muted">No masks recorded yet. <a href="{% url 'mask_new' project.pk %}">Plan the first one.</a></p>
+<p class="muted">No exhausted keyspace yet. <a href="{% url 'mask_new' project.pk %}">Record the first attack.</a></p>
 {% endif %}
 
-<h2>Masks tried ({{ masks|length }})</h2>
-{% if masks %}
+<h2>Attacks ({{ runs|length }})</h2>
+{% if runs %}
 <table>
-  <tr><th>Mask</th><th>Length</th><th>Keyspace</th><th>Comment</th></tr>
-  {% for m in masks %}
-  <tr><td><code>{{ m.pattern }}</code></td><td>{{ m.length }}</td>
-      <td>{{ m.keyspace|default:"—" }}</td>
-      <td class="muted">{{ m.comment|default:"" }}</td></tr>
+  <tr><th>Mask</th><th>Status</th><th>Hashtype</th><th>Hashes</th><th>Cracks</th><th>Keyspace</th><th>When</th></tr>
+  {% for r in runs %}
+  <tr>
+    <td><code>{{ r.mask.pattern|default:"—" }}</code></td>
+    <td>
+      {% if r.status == 'exhausted' or r.status == 'cracked' %}<span class="pill ok">{{ r.status }}</span>
+      {% elif r.status == 'aborted' or r.status == 'error' %}<span class="pill warn">{{ r.status }}</span>
+      {% else %}<span class="muted">{{ r.status }}</span>{% endif %}
+    </td>
+    <td class="muted">{{ r.hashtype.name|default:"—" }}</td>
+    <td>{{ r.hashes.count }}</td>
+    <td>{{ r.cracks.count }}</td>
+    <td>{{ r.mask.keyspace|default:"—" }}</td>
+    <td class="muted">{{ r.created_at }}</td>
+  </tr>
   {% endfor %}
 </table>
 {% else %}
-<p class="muted">No masks tried yet. <a href="{% url 'mask_new' project.pk %}">Plan the first one.</a></p>
+<p class="muted">No attacks recorded yet. <a href="{% url 'mask_new' project.pk %}">Record the first one.</a></p>
 {% endif %}
-
-<h2>Recent runs</h2>
-{% if runs %}
-<table>
-  <tr><th>Mask</th><th>Status</th><th>Progress</th><th>Created</th></tr>
-  {% for r in runs %}
-  <tr><td><code>{{ r.mask.pattern|default:"—" }}</code></td><td>{{ r.status }}</td>
-      <td>{{ r.progress|floatformat:2 }}</td><td class="muted">{{ r.created_at }}</td></tr>
-  {% endfor %}
-</table>
-{% else %}<p class="muted">No runs recorded.</p>{% endif %}
 {% endblock %}

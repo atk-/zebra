@@ -1,25 +1,51 @@
 {% extends "zebra/base.html" %}
-{% block title %}Plan a mask — {{ project.name }}{% endblock %}
+{% block title %}Record an attack — {{ project.name }}{% endblock %}
 {% block content %}
-<h1>Plan a mask</h1>
+<h1>Record an attack</h1>
 <p class="muted"><a href="{% url 'project_detail' project.pk %}">← {{ project.name }}</a></p>
 
+{% if error %}<div class="note warn">{{ error }}</div>{% endif %}
+
+{% if not hashtypes %}
+  <div class="note warn">
+    This project has no hashes yet, so there's no hashtype to attack.
+    Add a hashlist first from the
+    <a href="{% url 'project_detail' project.pk %}">project page</a>.
+  </div>
+{% else %}
 <form method="post" class="card">
   {% csrf_token %}
   <label>Mask pattern</label>
   <input type="text" name="pattern" value="{{ pattern|default:'' }}"
          placeholder="?u?l?l?l?d?d" autofocus>
+
   <label>Custom charsets <span class="muted">(optional, one <code>key=def</code> per line, e.g. <code>1=?l?d</code>)</span></label>
   <textarea name="custom_charsets" rows="2">{{ custom_charsets_raw|default:'' }}</textarea>
-  <label>Hashcat module (-m)</label>
-  <input type="text" name="module" value="{{ module|default:'0' }}">
+
+  <label>Hashtype <span class="muted">(the run targets this type's hashes; sets -m)</span></label>
+  {% include "zebra/_hashtype_combobox.html" with selected=hashtype_id %}
+
+  <label>Status</label>
+  <select name="status">
+    {% for value, label in statuses %}
+    <option value="{{ value }}"
+      {% if status == value or not status and value == default_status %}selected{% endif %}>
+      {{ label }}{% if value == 'exhausted' %} (counts as covered){% endif %}
+    </option>
+    {% endfor %}
+  </select>
+
+  <label>Device <span class="muted">(optional, free text)</span></label>
+  <input type="text" name="device" value="{{ device|default:'' }}" placeholder="RTX 4090">
+
   <div style="margin-top:14px">
     <button class="btn secondary" name="action" value="preview" type="submit">Evaluate</button>
     {% if evaluation and not evaluation.error %}
-    <button class="btn" name="action" value="save" type="submit">Save mask</button>
+    <button class="btn" name="action" value="record" type="submit">Record attack</button>
     {% endif %}
   </div>
 </form>
+{% endif %}
 
 {% if evaluation %}
   {% if evaluation.error %}
@@ -31,13 +57,13 @@
        candidate keyspace <strong>{{ evaluation.keyspace }}</strong></p>
     {% if evaluation.subsumed %}
       <div class="note warn"><strong>Redundant.</strong> This mask is already fully
-        covered by masks you've run — it would add no new keyspace.</div>
+        covered by keyspace you've exhausted — it would add nothing new.</div>
     {% elif evaluation.overlap %}
       <div class="note warn"><strong>Partial overlap.</strong>
         {{ evaluation.overlap }} of {{ evaluation.keyspace }} candidates are already
-        covered; only <strong>{{ evaluation.marginal }}</strong> would be new.</div>
+        exhausted; only <strong>{{ evaluation.marginal }}</strong> would be new.</div>
     {% else %}
-      <div class="note ok"><strong>All new.</strong> No overlap with existing masks —
+      <div class="note ok"><strong>All new.</strong> No overlap with exhausted keyspace —
         adds {{ evaluation.marginal }} candidates.</div>
     {% endif %}
     {% if command %}

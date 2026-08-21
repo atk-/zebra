@@ -24,14 +24,7 @@
   <input type="text" name="description" value="{{ description|default:'' }}">
 
   <label>Hashtype</label>
-  <select name="hashtype">
-    <option value="">— choose —</option>
-    {% for ht in hashtypes %}
-    <option value="{{ ht.pk }}" {% if hashtype_id == ht.pk|stringformat:'s' %}selected{% endif %}>
-      {{ ht.name }} ({{ ht.hashcat_module }})
-    </option>
-    {% endfor %}
-  </select>
+  {% include "zebra/_hashtype_combobox.html" with selected=hashtype_id %}
 
   <label>Universe <span class="muted">(optional — the character set used as the
     coverage-% denominator; leave blank to use a per-position fallback)</span></label>

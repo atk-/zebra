@@ -41,10 +41,78 @@
   .warn { background:var(--warn-bg); color:var(--warn); }
   .ok { background:var(--ok-bg); color:var(--ok); }
   .note { padding:12px; border-radius:8px; margin:12px 0; }
+  .combobox { position:relative; }
+  .combobox-list { position:absolute; z-index:20; left:0; right:0; margin:2px 0 0;
+         padding:4px; list-style:none; max-height:260px; overflow-y:auto;
+         background:var(--card); border:1px solid var(--line); border-radius:8px;
+         box-shadow:0 6px 20px rgba(0,0,0,.12); }
+  .combobox-option { padding:6px 8px; border-radius:6px; cursor:pointer;
+         font:14px ui-monospace,monospace; }
+  .combobox-option.active, .combobox-option:hover { background:var(--accent); color:#fff; }
+  .combobox-option.active .muted, .combobox-option:hover .muted { color:#dbe4ff; }
+  .combobox-empty { padding:6px 8px; }
 </style>
 </head>
 <body>
 <header><a href="{% url 'index' %}">🦓 zebra</a> <span class="muted">hashcat mask coverage</span></header>
 <main>{% block content %}{% endblock %}</main>
+<script>
+// Searchable combobox: filter options by substring of name or module number,
+// keep the chosen id in a hidden input. Progressive enhancement over a text field.
+document.querySelectorAll('[data-combobox]').forEach(function (box) {
+  var hidden = box.querySelector('input[type=hidden]');
+  var input = box.querySelector('[data-combobox-input]');
+  var list = box.querySelector('[data-combobox-list]');
+  var empty = box.querySelector('[data-combobox-empty]');
+  var options = Array.prototype.slice.call(list.querySelectorAll('.combobox-option'));
+  var active = -1;
+
+  function labelFor(val) {
+    for (var i = 0; i < options.length; i++) {
+      if (options[i].dataset.value === val) return options[i].dataset.label;
+    }
+    return '';
+  }
+  if (hidden.value) input.value = labelFor(hidden.value);
+
+  function visible() { return options.filter(function (o) { return !o.hidden; }); }
+  function filter() {
+    var q = input.value.trim().toLowerCase();
+    options.forEach(function (o) {
+      o.hidden = q !== '' && o.dataset.search.indexOf(q) === -1;
+    });
+    if (empty) empty.hidden = visible().length !== 0;
+    active = -1; highlight();
+  }
+  function open() { filter(); list.hidden = false; }
+  function close() { list.hidden = true; active = -1; highlight(); }
+  function highlight() {
+    var vis = visible();
+    options.forEach(function (o) { o.classList.remove('active'); });
+    if (active >= 0 && active < vis.length) {
+      vis[active].classList.add('active');
+      vis[active].scrollIntoView({ block: 'nearest' });
+    }
+  }
+  function choose(o) { hidden.value = o.dataset.value; input.value = o.dataset.label; close(); }
+
+  input.addEventListener('focus', open);
+  input.addEventListener('input', function () { hidden.value = ''; open(); });
+  input.addEventListener('keydown', function (e) {
+    var vis = visible();
+    if (e.key === 'ArrowDown') { e.preventDefault(); active = Math.min(active + 1, vis.length - 1); highlight(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); active = Math.max(active - 1, 0); highlight(); }
+    else if (e.key === 'Enter' && !list.hidden && active >= 0 && vis[active]) { e.preventDefault(); choose(vis[active]); }
+    else if (e.key === 'Escape') { close(); }
+  });
+  options.forEach(function (o) {
+    o.addEventListener('mousedown', function (e) { e.preventDefault(); choose(o); });
+  });
+  input.addEventListener('blur', function () {
+    // Snap text back to the selected label (or clear) so it can't mismatch the id.
+    setTimeout(function () { input.value = hidden.value ? labelFor(hidden.value) : ''; close(); }, 120);
+  });
+});
+</script>
 </body>
 </html>

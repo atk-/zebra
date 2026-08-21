@@ -1,0 +1,21 @@
+{% comment %}
+Searchable hashtype picker. Requires `hashtypes` in context; pass `selected` (pk)
+via {% include "zebra/_hashtype_combobox.html" with selected=hashtype_id %}.
+Submits the chosen hashtype pk as the `hashtype` field; degrades to a plain text
+field (typing a module number still works if you match an option) without JS.
+{% endcomment %}
+<div class="combobox" data-combobox>
+  <input type="hidden" name="hashtype" value="{{ selected|default:'' }}">
+  <input type="text" class="combobox-input" autocomplete="off" spellcheck="false"
+         data-combobox-input placeholder="Type a name or module number…">
+  <ul class="combobox-list" data-combobox-list hidden>
+    {% for ht in hashtypes %}
+    <li class="combobox-option" data-value="{{ ht.pk }}"
+        data-label="{{ ht.name }} ({{ ht.hashcat_module }})"
+        data-search="{{ ht.name|lower }} {{ ht.hashcat_module }}">
+      {{ ht.name }} <span class="muted">({{ ht.hashcat_module }})</span>
+    </li>
+    {% endfor %}
+    <li class="combobox-empty muted" data-combobox-empty hidden>No matching hashtype.</li>
+  </ul>
+</div>
