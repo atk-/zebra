@@ -41,10 +41,11 @@
 <h2>Attacks ({{ runs|length }})</h2>
 {% if runs %}
 <table>
-  <tr><th>Mask</th><th>Status</th><th>Hashtype</th><th>Hashes</th><th>Cracks</th><th>Keyspace</th><th>When</th></tr>
+  <tr><th>Type</th><th>Spec</th><th>Status</th><th>Hashtype</th><th>Hashes</th><th>Cracks</th><th>Keyspace</th><th>When</th></tr>
   {% for r in runs %}
   <tr>
-    <td><code>{{ r.mask.pattern|default:"—" }}</code></td>
+    <td class="muted">-a{{ r.attack_mode }} {{ r.attack_mode_label }}</td>
+    <td><code>{{ r.describe }}</code></td>
     <td>
       {% if r.status == 'exhausted' or r.status == 'cracked' %}<span class="pill ok">{{ r.status }}</span>
       {% elif r.status == 'aborted' or r.status == 'error' %}<span class="pill warn">{{ r.status }}</span>
@@ -53,7 +54,7 @@
     <td class="muted">{{ r.hashtype.name|default:"—" }}</td>
     <td>{{ r.hashes.count }}</td>
     <td>{{ r.cracks.count }}</td>
-    <td>{{ r.mask.keyspace|default:"—" }}</td>
+    <td>{% if r.mask %}{{ r.mask.keyspace|default:"—" }}{% else %}—{% endif %}</td>
     <td class="muted">{{ r.created_at }}</td>
   </tr>
   {% endfor %}

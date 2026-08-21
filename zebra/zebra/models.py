@@ -85,12 +85,44 @@ class Mask(models.Model):
         return self.pattern
 
 
+class Wordlist(models.Model):
+    """A dictionary file referenced by wordlist/combinator/hybrid runs.
+
+    Global (reused across projects, like HashType). ``line_count`` is optional and
+    reserved for future hybrid keyspace estimates (line_count * mask_keyspace)."""
+    name = models.CharField(max_length=300, unique=True)
+    path = models.CharField(max_length=1024, blank=True, null=True)
+    line_count = models.BigIntegerField(null=True, blank=True)
+    comment = models.CharField(max_length=1024, null=True, blank=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
+class RuleSet(models.Model):
+    """A hashcat rule file (-r) referenced by wordlist/hybrid runs. Global."""
+    name = models.CharField(max_length=300, unique=True)
+    path = models.CharField(max_length=1024, blank=True, null=True)
+    rule_count = models.BigIntegerField(null=True, blank=True)
+    comment = models.CharField(max_length=1024, null=True, blank=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
 class Run(models.Model):
     """One execution of an attack against a set of hashes.
 
-    Only mask attacks (attack_mode 3) are modelled today, but the schema and
-    the ``status`` state machine already carry the fields a future active
-    launcher needs (running/progress/speed), so it can be added without rework.
+    Mask runs (attack_mode 3) carry a ``Mask`` and feed the exact coverage engine.
+    Non-mask runs (straight/combinator/hybrid) can't have their keyspace computed,
+    so they instead reference ``Wordlist``/``RuleSet`` (+ ``params`` scalars) and are
+    compared with the similarity engine to catch repeated / near-duplicate work.
     """
     STATUS_CHOICES = [
         ('planned', 'Planned'),
@@ -100,10 +132,29 @@ class Run(models.Model):
         ('cracked', 'Cracked'),
         ('error', 'Error'),
     ]
+    # hashcat attack modes zebra records
+    ATTACK_MODES = [
+        (0, 'Straight'),
+        (1, 'Combinator'),
+        (3, 'Mask'),
+        (6, 'Hybrid WL+Mask'),
+        (7, 'Hybrid Mask+WL'),
+    ]
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, null=True,
+                                blank=True, related_name='runs')
     hashes = models.ManyToManyField(Hash)
+    # attack_mode 3 only: the mask feeding the exact coverage engine.
     mask = models.ForeignKey(Mask, on_delete=models.SET_NULL, null=True, blank=True,
                              related_name='runs')
-    attack_mode = models.IntegerField(default=3)  # 3 = brute-force / mask
+    attack_mode = models.IntegerField(default=3, choices=ATTACK_MODES)
+    # Non-mask components (straight/combinator/hybrid).
+    wordlists = models.ManyToManyField(Wordlist, blank=True, related_name='runs')
+    rules = models.ManyToManyField(RuleSet, blank=True, related_name='runs')
+    # Mode-specific scalars: combinator {"order":[l,r],"left_rule","right_rule"};
+    # hybrid {"mask","custom_charsets"}. (Pure mode-3 uses the mask FK, not params.)
+    params = models.JSONField(default=dict, blank=True)
+    # Canonical dedup key set on record (see services.similarity.signature).
+    signature = models.CharField(max_length=512, blank=True, default='', db_index=True)
     hashtype = models.ForeignKey(HashType, on_delete=models.SET_NULL, null=True, blank=True)
     device = models.CharField(max_length=200, null=True, blank=True)
     command = models.CharField(max_length=4096, null=True, blank=True)
@@ -118,8 +169,43 @@ class Run(models.Model):
     class Meta:
         ordering = ['-created_at']
 
+    @property
+    def attack_mode_label(self):
+        return dict(self.ATTACK_MODES).get(self.attack_mode, str(self.attack_mode))
+
+    def describe(self):
+        """Human-readable one-line summary of what this run searched."""
+        m, p = self.attack_mode, (self.params or {})
+        if m == 3:
+            return self.mask.pattern if self.mask else '(no mask)'
+        wls = list(self.wordlists.all())
+        wl_names = [w.name for w in wls]
+        rule_names = [r.name for r in self.rules.all()]
+        if m == 0:
+            s = ' + '.join(wl_names) or '(no wordlist)'
+            if rule_names:
+                s += '  | rules: ' + ', '.join(rule_names)
+            return s
+        if m == 1:
+            by_id = {w.id: w.name for w in wls}
+            pair = [by_id.get(i, '?') for i in (p.get('order') or [])] or wl_names
+            s = ' × '.join(pair) if pair else '(combinator)'
+            extra = []
+            if p.get('left_rule'):
+                extra.append('-j ' + p['left_rule'])
+            if p.get('right_rule'):
+                extra.append('-k ' + p['right_rule'])
+            if extra:
+                s += ' [' + ' '.join(extra) + ']'
+            return s
+        if m in (6, 7):
+            wl = wl_names[0] if wl_names else '(no wordlist)'
+            mask = p.get('mask', '(no mask)')
+            return '%s + %s' % ((wl, mask) if m == 6 else (mask, wl))
+        return '(attack %s)' % m
+
     def __str__(self):
-        return '%s [%s]' % (self.mask.pattern if self.mask else '(no mask)', self.status)
+        return '%s [%s]' % (self.describe(), self.status)
 
 
 class Crack(models.Model):

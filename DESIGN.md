@@ -108,6 +108,28 @@ dimension = password length (small, ~6–12) and atoms per position are few, so
 inclusion–exclusion with pruning is fine in practice. This is a deliberate,
 documented trade-off.
 
+## 3b. Similarity engine (`services/similarity.py`)
+
+Non-mask attacks (straight `-a 0`, combinator `-a 1`, hybrids `-a 6`/`-a 7`) have no
+computable keyspace, so instead of exact coverage zebra detects **duplicate /
+near-duplicate** runs — the same "don't repeat work" value applied to attacks it can
+only track, not measure. Like `coverage.py`, this module is **pure and DB-free**
+(operates on plain spec dicts) and unit-tested without a database; `run_helpers.py`
+is the DB glue (mirroring `coverage_helpers.py`).
+
+- File references are normalized to **basename + lowercase**
+  (`/usr/share/wordlists/rockyou.txt` ≡ `rockyou.txt`).
+- `signature(spec)` is a canonical dedup key stored on each `Run`.
+- `similarity(a, b)` compares only compatible modes and returns
+  `{exact, score, reasons}` with per-mode rules: straight — same wordlist(s) with
+  equal / subset-or-superset / disjoint rules; combinator — reversed pair or
+  same-pair-different-`-j`/`-k`; hybrid — same wordlist different mask, same mask
+  different wordlist, or 6↔7 direction swap.
+- `find_similar(candidate, existing, threshold)` ranks matches, exact first.
+
+The **mask coverage engine is untouched**: only mode-3 runs carry a `Mask`, so hybrid
+masks (stored in `Run.params`) never leak into coverage-by-length.
+
 ## 4. Data model (`models.py`)
 
 - **`Project`** — `name` (unique), `description`, `universe` (optional in-scope
@@ -122,11 +144,18 @@ documented trade-off.
   `custom_charsets` (JSON), derived `length`, cached `keyspace` (Decimal). A mask
   counts as **covered only when it has an `exhausted` run** (see
   `coverage_helpers.covered_masks`), not merely by existing.
-- **`Run`** — one attack execution: `mask` FK (nullable, for future non-mask
-  attacks), `attack_mode`, `hashtype`, `device`, generated `command`, `status`
-  (`planned/running/exhausted/aborted/cracked/error`), `speed_hs`, `progress`,
-  timing, `hashes` M2M. Runs are M2M to individual hashes so new hashes added to a
-  project are naturally flagged as not-yet-covered.
+- **`Wordlist` / `RuleSet`** — global reusable references (name, path, optional
+  line/rule count) for non-mask attacks; enable usage stats and future hybrid
+  keyspace. Identity is the normalized basename.
+- **`Run`** — one attack execution: `project` FK (direct link so non-mask runs
+  belong to a project — backfilled from `mask.project` in migration 0007), `mask` FK
+  (mode-3 only; feeds coverage), `attack_mode` (0/1/3/6/7), `wordlists`/`rules` M2M,
+  `params` JSON (combinator order + inline `-j`/`-k`; hybrid mask + charsets),
+  `signature` (canonical dedup key), `hashtype`, `device`, generated `command`,
+  `status` (`planned/running/exhausted/aborted/cracked/error`), `speed_hs`,
+  `progress`, timing, `hashes` M2M. Runs are M2M to individual hashes so new hashes
+  added to a project are naturally flagged as not-yet-covered. `describe()` renders a
+  per-mode one-line spec for the dashboard.
 - **`Crack`** — recovered plaintext for a hash (`hash` FK, `plaintext`, `run` FK,
   `found_at`); richer than the bare `cracked` bool, which is kept as a fast flag.
 - **`Benchmark`** — measured `speed_hs` per `hashtype`/`device`; grounds runtime

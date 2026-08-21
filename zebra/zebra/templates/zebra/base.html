@@ -57,6 +57,22 @@
 <header><a href="{% url 'index' %}">🦓 zebra</a> <span class="muted">hashcat mask coverage</span></header>
 <main>{% block content %}{% endblock %}</main>
 <script>
+// Attack-type toggle: show only the field groups whose data-modes contains the
+// currently selected attack mode.
+(function () {
+  var sel = document.querySelector('[data-attack-select]');
+  if (!sel) return;
+  function sync() {
+    var m = sel.value;
+    document.querySelectorAll('[data-modes]').forEach(function (el) {
+      el.hidden = el.getAttribute('data-modes').split(' ').indexOf(m) === -1;
+    });
+  }
+  sel.addEventListener('change', sync);
+  sync();
+})();
+</script>
+<script>
 // Searchable combobox: filter options by substring of name or module number,
 // keep the chosen id in a hidden input. Progressive enhancement over a text field.
 document.querySelectorAll('[data-combobox]').forEach(function (box) {

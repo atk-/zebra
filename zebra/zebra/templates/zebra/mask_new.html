@@ -15,12 +15,53 @@
 {% else %}
 <form method="post" class="card">
   {% csrf_token %}
-  <label>Mask pattern</label>
-  <input type="text" name="pattern" value="{{ pattern|default:'' }}"
-         placeholder="?u?l?l?l?d?d" autofocus>
 
-  <label>Custom charsets <span class="muted">(optional, one <code>key=def</code> per line, e.g. <code>1=?l?d</code>)</span></label>
-  <textarea name="custom_charsets" rows="2">{{ custom_charsets_raw|default:'' }}</textarea>
+  <label>Attack type</label>
+  <select name="attack_mode" data-attack-select>
+    {% for value, label in attack_modes %}
+    <option value="{{ value }}"{% if attack_mode == value %} selected{% endif %}>-a {{ value }} · {{ label }}</option>
+    {% endfor %}
+  </select>
+
+  {# ---- mask / hybrid mask field (modes 3, 6, 7) ---- #}
+  <div data-modes="3 6 7">
+    <label>Mask pattern</label>
+    <input type="text" name="pattern" value="{{ pattern|default:'' }}" placeholder="?u?l?l?l?d?d">
+    <label>Custom charsets <span class="muted">(optional, one <code>key=def</code> per line, e.g. <code>1=?l?d</code>)</span></label>
+    <textarea name="custom_charsets" rows="2">{{ custom_charsets_raw|default:'' }}</textarea>
+  </div>
+
+  {# ---- single wordlist (modes 0, 6, 7) ---- #}
+  <div data-modes="0 6 7">
+    <label>Wordlist</label>
+    <input type="text" name="wordlist" value="{{ wordlist|default:'' }}"
+           list="wordlist-options" placeholder="rockyou.txt or /path/to/list">
+  </div>
+
+  {# ---- rules files (mode 0) ---- #}
+  <div data-modes="0">
+    <label>Rule files <span class="muted">(optional, one per line, -r)</span></label>
+    <textarea name="rules" rows="3" placeholder="best64.rule&#10;d3ad0ne.rule">{{ rules_raw|default:'' }}</textarea>
+  </div>
+
+  {# ---- combinator (mode 1) ---- #}
+  <div data-modes="1">
+    <label>Left wordlist</label>
+    <input type="text" name="left_wordlist" value="{{ left_wordlist|default:'' }}"
+           list="wordlist-options" placeholder="left.txt">
+    <label>Right wordlist</label>
+    <input type="text" name="right_wordlist" value="{{ right_wordlist|default:'' }}"
+           list="wordlist-options" placeholder="right.txt">
+    <label>Inline rules <span class="muted">(optional: -j left, -k right)</span></label>
+    <div style="display:flex; gap:8px">
+      <input type="text" name="left_rule" value="{{ left_rule|default:'' }}" placeholder="-j e.g. c">
+      <input type="text" name="right_rule" value="{{ right_rule|default:'' }}" placeholder="-k e.g. $1">
+    </div>
+  </div>
+
+  <datalist id="wordlist-options">
+    {% for n in wordlist_names %}<option value="{{ n }}">{% endfor %}
+  </datalist>
 
   <label>Hashtype <span class="muted">(the run targets this type's hashes; sets -m)</span></label>
   {% include "zebra/_hashtype_combobox.html" with selected=hashtype_id %}
@@ -30,7 +71,7 @@
     {% for value, label in statuses %}
     <option value="{{ value }}"
       {% if status == value or not status and value == default_status %}selected{% endif %}>
-      {{ label }}{% if value == 'exhausted' %} (counts as covered){% endif %}
+      {{ label }}{% if value == 'exhausted' %} (mask attacks count as covered){% endif %}
     </option>
     {% endfor %}
   </select>
@@ -40,37 +81,55 @@
 
   <div style="margin-top:14px">
     <button class="btn secondary" name="action" value="preview" type="submit">Evaluate</button>
-    {% if evaluation and not evaluation.error %}
+    {% if can_record %}
     <button class="btn" name="action" value="record" type="submit">Record attack</button>
     {% endif %}
   </div>
 </form>
 {% endif %}
 
-{% if evaluation %}
-  {% if evaluation.error %}
-    <div class="note warn">Parse error: {{ evaluation.error }}</div>
+{# ---- Mask evaluation (mode 3) ---- #}
+{% if evaluation and not evaluation.error and attack_mode == 3 %}
+<div class="card">
+  <h2 style="margin-top:0">Evaluation</h2>
+  <p>Length <strong>{{ evaluation.length }}</strong> ·
+     candidate keyspace <strong>{{ evaluation.keyspace }}</strong></p>
+  {% if evaluation.subsumed %}
+    <div class="note warn"><strong>Redundant.</strong> Already fully covered by
+      exhausted keyspace — it would add nothing new.</div>
+  {% elif evaluation.overlap %}
+    <div class="note warn"><strong>Partial overlap.</strong>
+      {{ evaluation.overlap }} of {{ evaluation.keyspace }} candidates are already
+      exhausted; only <strong>{{ evaluation.marginal }}</strong> would be new.</div>
   {% else %}
-  <div class="card">
-    <h2 style="margin-top:0">Evaluation</h2>
-    <p>Length <strong>{{ evaluation.length }}</strong> ·
-       candidate keyspace <strong>{{ evaluation.keyspace }}</strong></p>
-    {% if evaluation.subsumed %}
-      <div class="note warn"><strong>Redundant.</strong> This mask is already fully
-        covered by keyspace you've exhausted — it would add nothing new.</div>
-    {% elif evaluation.overlap %}
-      <div class="note warn"><strong>Partial overlap.</strong>
-        {{ evaluation.overlap }} of {{ evaluation.keyspace }} candidates are already
-        exhausted; only <strong>{{ evaluation.marginal }}</strong> would be new.</div>
-    {% else %}
-      <div class="note ok"><strong>All new.</strong> No overlap with exhausted keyspace —
-        adds {{ evaluation.marginal }} candidates.</div>
-    {% endif %}
-    {% if command %}
-      <p class="muted" style="margin-bottom:4px">Generated command:</p>
-      <code class="cmd">{{ command }}</code>
-    {% endif %}
-  </div>
+    <div class="note ok"><strong>All new.</strong> No overlap with exhausted keyspace —
+      adds {{ evaluation.marginal }} candidates.</div>
   {% endif %}
+  {% if command %}<p class="muted" style="margin-bottom:4px">Generated command:</p>
+    <code class="cmd">{{ command }}</code>{% endif %}
+</div>
+{% endif %}
+{% if evaluation.error %}<div class="note warn">Parse error: {{ evaluation.error }}</div>{% endif %}
+
+{# ---- Similarity results (non-mask modes) ---- #}
+{% if ran_similarity %}
+<div class="card">
+  <h2 style="margin-top:0">Similarity check</h2>
+  {% if similar %}
+    {% for run, result in similar %}
+      <div class="note {% if result.exact %}warn{% else %}warn{% endif %}">
+        {% if result.exact %}<strong>Duplicate.</strong>{% else %}<strong>Near-duplicate
+          ({{ result.score|floatformat:2 }}).</strong>{% endif %}
+        Matches an existing {{ run.status }} run: <code>{{ run.describe }}</code>
+        {% if result.reasons %}<br><span class="muted">{{ result.reasons|join:"; " }}</span>{% endif %}
+      </div>
+    {% endfor %}
+  {% else %}
+    <div class="note ok"><strong>No similar runs.</strong> Nothing comparable recorded
+      in this project.</div>
+  {% endif %}
+  {% if command %}<p class="muted" style="margin-bottom:4px">Generated command:</p>
+    <code class="cmd">{{ command }}</code>{% endif %}
+</div>
 {% endif %}
 {% endblock %}

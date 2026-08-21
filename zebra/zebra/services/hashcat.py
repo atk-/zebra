@@ -90,6 +90,48 @@ class HashcatRunner:
         parts += [hashfile, mask]
         return ' '.join(parts)
 
+    def plan_run(self, attack_mode, module, hashfile='HASHFILE', wordlists=None,
+                 rules=None, params=None, device=None):
+        """Build (but do not run) a hashcat command for any supported attack mode.
+
+        ``wordlists``/``rules`` are lists of path-or-name strings.
+        """
+        params = params or {}
+        wordlists = [str(w) for w in (wordlists or [])]
+        rules = [str(r) for r in (rules or [])]
+        parts = [self.binary, '-m', str(module), '-a', str(attack_mode)]
+        if device:
+            parts += ['-d', str(device)]
+        if self.potfile_path:
+            parts += ['--potfile-path', self.potfile_path]
+
+        if attack_mode == 3:
+            parts += _charset_flags(params.get('custom_charsets'))
+            parts += [hashfile, params.get('mask', '')]
+        elif attack_mode == 0:
+            for r in rules:
+                parts += ['-r', r]
+            parts += [hashfile] + wordlists
+        elif attack_mode == 1:
+            if params.get('left_rule'):
+                parts += ['-j', params['left_rule']]
+            if params.get('right_rule'):
+                parts += ['-k', params['right_rule']]
+            parts += [hashfile,
+                      wordlists[0] if len(wordlists) > 0 else 'LEFT',
+                      wordlists[1] if len(wordlists) > 1 else 'RIGHT']
+        elif attack_mode == 6:  # wordlist + mask
+            parts += _charset_flags(params.get('custom_charsets'))
+            parts += [hashfile, wordlists[0] if wordlists else 'WORDLIST',
+                      params.get('mask', '')]
+        elif attack_mode == 7:  # mask + wordlist
+            parts += _charset_flags(params.get('custom_charsets'))
+            parts += [hashfile, params.get('mask', ''),
+                      wordlists[0] if wordlists else 'WORDLIST']
+        else:
+            parts += [hashfile]
+        return ' '.join(str(p) for p in parts)
+
     # -- future active launcher (seam) --------------------------------------
     def launch(self, *a, **k):  # pragma: no cover - future work
         raise NotImplementedError('active launching is a future phase')

@@ -198,3 +198,163 @@ class AddHashesViewTests(TestCase):
         r = self.client.post(url, {'hashtype': '', 'hashlist': 'x'})
         self.assertContains(r, 'choose a hashtype')
         self.assertFalse(self.project.hash_set.filter(hashstring='x').exists())
+
+
+from .services import similarity as sim
+
+
+def _spec(mode, wl=None, rules=None, **kw):
+    return dict(attack_mode=mode, wordlists=wl or [], rules=rules or [], **kw)
+
+
+class SimilarityEngineTests(SimpleTestCase):
+    def test_basename_normalization(self):
+        self.assertEqual(sim.normalize_ref('/usr/share/wordlists/rockyou.txt'),
+                         'rockyou.txt')
+        r = sim.similarity(_spec(0, ['/x/rockyou.txt'], ['BEST64.rule']),
+                           _spec(0, ['rockyou.txt'], ['/r/best64.rule']))
+        self.assertTrue(r['exact'])
+
+    def test_straight_subset_rules_is_near_redundant(self):
+        r = sim.similarity(_spec(0, ['rockyou.txt'], ['best64.rule']),
+                           _spec(0, ['rockyou.txt'], ['best64.rule', 'd3ad0ne.rule']))
+        self.assertFalse(r['exact'])
+        self.assertIn('subset', r['reasons'][0])
+        self.assertGreaterEqual(r['score'], 0.5)
+
+    def test_straight_same_wordlist_different_rules(self):
+        r = sim.similarity(_spec(0, ['rockyou.txt'], ['best64.rule']),
+                           _spec(0, ['rockyou.txt'], ['toggle5.rule']))
+        self.assertAlmostEqual(r['score'], 0.5)
+        self.assertIn('different rules', r['reasons'][0])
+
+    def test_combinator_reversed_pair(self):
+        r = sim.similarity(_spec(1, ['a.txt', 'b.txt']), _spec(1, ['b.txt', 'a.txt']))
+        self.assertIn('reversed', r['reasons'][0])
+
+    def test_hybrid_direction_swap(self):
+        r = sim.similarity(dict(attack_mode=6, wordlists=['rockyou.txt'], rules=[], mask='?d?d'),
+                           dict(attack_mode=7, wordlists=['rockyou.txt'], rules=[], mask='?d?d'))
+        self.assertIn('direction swapped', r['reasons'][0])
+
+    def test_incompatible_modes_not_comparable(self):
+        self.assertIsNone(sim.similarity(_spec(0, ['a']), _spec(1, ['a', 'b'])))
+
+    def test_find_similar_orders_exact_first(self):
+        cand = _spec(0, ['rockyou.txt'], ['best64.rule'])
+        existing = [
+            ('near', _spec(0, ['rockyou.txt'], ['toggle5.rule'])),
+            ('exact', _spec(0, ['rockyou.txt'], ['best64.rule'])),
+            ('unrelated', _spec(1, ['a.txt', 'b.txt'])),
+        ]
+        self.assertEqual([ref for ref, _ in sim.find_similar(cand, existing)],
+                         ['exact', 'near'])
+
+
+from .models import Wordlist, RuleSet
+
+
+class RecordNonMaskViewTests(TestCase):
+    def setUp(self):
+        self.ht = HashType.objects.create(name='N-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='NONMASK')
+        Hash.objects.create(hashstring='nh1', hashtype=self.ht,
+                            project=self.project, cracked=False)
+        self.url = '/zebra/project/%d/mask/new/' % self.project.pk
+
+    def _record_straight(self, wordlist, rules):
+        return self.client.post(self.url, {
+            'attack_mode': '0', 'hashtype': str(self.ht.pk), 'status': 'exhausted',
+            'wordlist': wordlist, 'rules': rules, 'action': 'record'})
+
+    def test_record_straight_creates_run_with_refs_and_project(self):
+        r = self._record_straight('/usr/share/wordlists/rockyou.txt', 'best64.rule')
+        self.assertEqual(r.status_code, 302)
+        run = Run.objects.get(project=self.project)
+        self.assertEqual(run.attack_mode, 0)
+        self.assertEqual(run.project_id, self.project.pk)
+        self.assertEqual([w.name for w in run.wordlists.all()], ['rockyou.txt'])
+        self.assertEqual([x.name for x in run.rules.all()], ['best64.rule'])
+        self.assertEqual(run.hashes.count(), 1)  # targeted the hashtype's hashes
+        # dashboard shows it with the spec + type
+        d = self.client.get('/zebra/project/%d/' % self.project.pk)
+        self.assertContains(d, 'Straight')
+        self.assertContains(d, 'rockyou.txt')
+
+    def test_exact_duplicate_is_flagged_on_preview(self):
+        self._record_straight('rockyou.txt', 'best64.rule')
+        r = self.client.post(self.url, {
+            'attack_mode': '0', 'hashtype': str(self.ht.pk), 'status': 'exhausted',
+            'wordlist': 'rockyou.txt', 'rules': 'best64.rule', 'action': 'preview'})
+        self.assertContains(r, 'Duplicate')
+
+    def test_superset_rules_flagged_near_duplicate(self):
+        self._record_straight('rockyou.txt', 'best64.rule')
+        r = self.client.post(self.url, {
+            'attack_mode': '0', 'hashtype': str(self.ht.pk), 'status': 'planned',
+            'wordlist': 'rockyou.txt', 'rules': 'best64.rule\nd3ad0ne.rule',
+            'action': 'preview'})
+        self.assertContains(r, 'Near-duplicate')
+        self.assertContains(r, 'subset')
+
+    def test_combinator_records_ordered_pair(self):
+        r = self.client.post(self.url, {
+            'attack_mode': '1', 'hashtype': str(self.ht.pk), 'status': 'exhausted',
+            'left_wordlist': 'left.txt', 'right_wordlist': 'right.txt', 'action': 'record'})
+        self.assertEqual(r.status_code, 302)
+        run = Run.objects.get(project=self.project, attack_mode=1)
+        order_names = [Wordlist.objects.get(pk=i).name for i in run.params['order']]
+        self.assertEqual(order_names, ['left.txt', 'right.txt'])
+        self.assertEqual(run.describe(), 'left.txt × right.txt')
+
+    def test_hybrid_records_wordlist_and_mask(self):
+        r = self.client.post(self.url, {
+            'attack_mode': '6', 'hashtype': str(self.ht.pk), 'status': 'exhausted',
+            'wordlist': 'rockyou.txt', 'pattern': '?d?d?d', 'action': 'record'})
+        self.assertEqual(r.status_code, 302)
+        run = Run.objects.get(project=self.project, attack_mode=6)
+        self.assertEqual(run.params.get('mask'), '?d?d?d')
+        self.assertEqual(run.describe(), 'rockyou.txt + ?d?d?d')
+        # hybrid mask must NOT pollute exact mask coverage
+        self.assertEqual(ch.covered_masks(self.project).count(), 0)
+
+    def test_missing_wordlist_rejected(self):
+        r = self.client.post(self.url, {
+            'attack_mode': '0', 'hashtype': str(self.ht.pk), 'status': 'exhausted',
+            'wordlist': '', 'rules': '', 'action': 'record'})
+        self.assertContains(r, 'needs a wordlist')
+        self.assertFalse(Run.objects.filter(project=self.project).exists())
+
+    def test_mask_mode_still_gets_exact_coverage(self):
+        # regression: mode 3 unchanged
+        r = self.client.post(self.url, {
+            'attack_mode': '3', 'hashtype': str(self.ht.pk), 'status': 'exhausted',
+            'pattern': '?d?d', 'custom_charsets': '', 'action': 'record'})
+        self.assertEqual(r.status_code, 302)
+        run = Run.objects.get(project=self.project, attack_mode=3)
+        self.assertIsNotNone(run.mask)
+        self.assertEqual(ch.covered_masks(self.project).count(), 1)
+
+
+class AttackModeSelectRegressionTests(TestCase):
+    """Regression: -a 0 (a falsy value) must stay selected after a preview
+    re-render, instead of the select snapping back to the -a 3 default."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='S-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='SELREG')
+        Hash.objects.create(hashstring='s1', hashtype=self.ht,
+                            project=self.project, cracked=False)
+        self.url = '/zebra/project/%d/mask/new/' % self.project.pk
+
+    def test_preview_keeps_mode_zero_selected(self):
+        r = self.client.post(self.url, {
+            'attack_mode': '0', 'hashtype': str(self.ht.pk), 'status': 'exhausted',
+            'wordlist': 'rockyou.txt', 'rules': 'best64.rule', 'action': 'preview'})
+        self.assertContains(r, '<option value="0" selected>')
+        self.assertNotContains(r, '<option value="3" selected>')
+
+    def test_get_defaults_to_mask_mode(self):
+        r = self.client.get(self.url)
+        self.assertContains(r, '<option value="3" selected>')
+        self.assertNotContains(r, '<option value="0" selected>')

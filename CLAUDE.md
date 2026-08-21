@@ -21,12 +21,15 @@ mask keyspace, not just a list of commands.
 - **Projects & hashlists** — create a project with a hashlist and hashtype (seeded
   with all 590 Hashcat modules), and add more hashlists (of any hashtype) to an
   existing project at any time; duplicates are skipped.
-- **Record attacks** — enter a candidate mask; see its exact keyspace and whether it's
-  redundant / partially overlapping / all-new against already-**exhausted** keyspace,
-  plus a generated `hashcat` command; record it as a `Run` (mask + targeted
-  hashtype's hashes + status).
+- **Record attacks (all common modes)** — mask (`-a 3`), straight/wordlist (`-a 0`,
+  with rule files), combinator (`-a 1`), and hybrids (`-a 6`/`-a 7`). Mask attacks get
+  exact keyspace + overlap; the others (whose keyspace can't be computed) are checked
+  for **duplicate / near-duplicate** runs (same wordlist+rules, subset rules, reversed
+  combinator pair, hybrid direction swap). Each is saved as a `Run` with a generated
+  `hashcat` command.
 - **Coverage dashboard** — per password length: candidate space covered (from
-  exhausted runs), total, remaining, and % covered; plus an Attacks log.
+  exhausted mask runs), total, remaining, and % covered; plus an Attacks log (type +
+  spec) spanning all attack modes.
 - **Result import** — paste a Hashcat potfile (`hash:plain`) to mark hashes cracked;
   parse `--status-json` output.
 
@@ -48,11 +51,14 @@ zebra/                         # git repo root (uv project: pyproject.toml, uv.l
   zebra/                       # Django project root (manage.py lives here)
     config/                    # settings, root urlconf, wsgi/asgi
     zebra/                     # the app
-      models.py                # Project, HashType, Hash, Mask, Run, Crack, Benchmark, CharacterSet, Wildcard
+      models.py                # Project, HashType, Hash, Mask, Run, Crack, Benchmark,
+                               #   Wordlist, RuleSet, CharacterSet, Wildcard
       services/
-        coverage.py            # pure exact-coverage engine (no Django imports)
-        hashcat.py             # read-only hashcat wrapper + parsers + ingest
-      coverage_helpers.py      # DB-aware glue between models and the engine
+        coverage.py            # pure exact-coverage engine for masks (no Django imports)
+        similarity.py          # pure near-duplicate engine for non-mask runs
+        hashcat.py             # read-only hashcat wrapper + parsers + ingest + command builder
+      coverage_helpers.py      # DB glue: models <-> coverage engine (masks)
+      run_helpers.py           # DB glue: models <-> similarity engine (non-mask runs)
       views.py / urls.py       # web UI (index, project_new, project_detail, mask_new, import_results)
       templates/zebra/         # server-rendered templates (theme in base.html)
       management/commands/     # seed_hashtypes

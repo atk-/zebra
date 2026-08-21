@@ -32,6 +32,18 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
 - [ ] Capture real **wall-clock/speed** on a run (timing fields exist, not filled from UI)
 - [ ] Per-run cracked-plaintext drill-down
 
+## Non-mask attack types (wordlist / combinator / rules / hybrid)
+- [x] Record straight (`-a 0`, +rule files), combinator (`-a 1`), hybrids (`-a 6/7`)
+- [x] First-class `Wordlist` / `RuleSet` refs (basename identity), admin CRUD
+- [x] Similarity engine (`services/similarity.py`) — duplicate / near-duplicate
+      detection (subset rules, reversed combinator, hybrid direction swap)
+- [x] Attacks table shows type + spec across all modes
+- [ ] **Hybrid keyspace** from `Wordlist.line_count` (× mask keyspace) — fields exist
+- [ ] Multiple wordlists per straight run (model supports M2M; form takes one)
+- [ ] Wordlist/RuleSet **usage stats** ("rockyou used in N runs") + management page
+- [ ] Capture wordlist `line_count` / rule `rule_count` (from file or hashcat)
+- [ ] Similarity threshold / weighting tuning; expose "why" more prominently
+
 ## Hashcat integration
 - [x] Read-only wrapper: `benchmark`, `keyspace`, `plan`, potfile/status parsers
 - [x] Import potfile → mark cracked + create `Crack` rows
