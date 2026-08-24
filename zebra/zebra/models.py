@@ -4,6 +4,11 @@ from django.db import models
 class Project(models.Model):
     name = models.CharField(max_length=200, unique=True)
     description = models.CharField(max_length=8192, blank=True, null=True)
+    # A project targets exactly one hash type (a hashcat run takes one -m module);
+    # its hashes and attacks inherit this. Nullable only so the schema migration and
+    # any hash-less legacy project don't break -- the create form requires it.
+    hashtype = models.ForeignKey('HashType', on_delete=models.PROTECT, null=True,
+                                 blank=True, related_name='projects')
     # Characters considered in-scope for this project when computing the
     # "remaining" search space (total per length = len(universe) ** length).
     # If blank, coverage totals fall back to the union of charsets actually used.
@@ -27,7 +32,6 @@ class HashType(models.Model):
 
 class Hash(models.Model):
     hashstring = models.CharField(max_length=65536)
-    hashtype = models.ForeignKey(HashType, on_delete=models.CASCADE)
     project = models.ForeignKey(Project, on_delete=models.CASCADE)
     cracked = models.BooleanField(default=False)
     comment = models.CharField(max_length=4096, blank=True, null=True)
@@ -155,12 +159,12 @@ class Run(models.Model):
     params = models.JSONField(default=dict, blank=True)
     # Canonical dedup key set on record (see services.similarity.signature).
     signature = models.CharField(max_length=512, blank=True, default='', db_index=True)
-    hashtype = models.ForeignKey(HashType, on_delete=models.SET_NULL, null=True, blank=True)
     device = models.CharField(max_length=200, null=True, blank=True)
     command = models.CharField(max_length=4096, null=True, blank=True)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='planned')
     speed_hs = models.DecimalField(max_digits=80, decimal_places=0, null=True, blank=True)
     progress = models.FloatField(default=0.0)  # 0..1
+    pid = models.IntegerField(null=True, blank=True)  # OS pid while running (launcher)
     started_at = models.DateTimeField(null=True, blank=True)
     ended_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, null=True)

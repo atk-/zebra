@@ -18,9 +18,11 @@ mask keyspace, not just a list of commands.
 
 ## What it does today
 
-- **Projects & hashlists** — create a project with a hashlist and hashtype (seeded
-  with all 590 Hashcat modules), and add more hashlists (of any hashtype) to an
-  existing project at any time; duplicates are skipped.
+- **Projects & hashlists** — a project targets **one hash type** (chosen once at
+  creation, from all 590 seeded Hashcat modules); its hashes and attacks inherit it.
+  Add more hashes any time — paste them or upload a text file; duplicates are
+  skipped. Multi-type dumps become one
+  project per type (a future "case" layer can group them).
 - **Record attacks (all common modes)** — mask (`-a 3`), straight/wordlist (`-a 0`,
   with rule files), combinator (`-a 1`), and hybrids (`-a 6`/`-a 7`). Mask attacks get
   exact keyspace + overlap; the others (whose keyspace can't be computed) are checked
@@ -29,7 +31,12 @@ mask keyspace, not just a list of commands.
   `hashcat` command.
 - **Coverage dashboard** — per password length: candidate space covered (from
   exhausted mask runs), total, remaining, and % covered; plus an Attacks log (type +
-  spec) spanning all attack modes.
+  spec) spanning all attack modes. Each attack links to a **detail page** with its
+  full specification and the exact hashcat command used.
+- **Run mask attacks** — from an attack's detail page, launch hashcat in the
+  background (`services/launcher.py`); the page shows live progress and settles to
+  the final status (exhausted/cracked/aborted) with cracks imported. Mask attacks
+  only for now; one run at a time. Requires the real `hashcat` binary.
 - **Result import** — paste a Hashcat potfile (`hash:plain`) to mark hashes cracked;
   parse `--status-json` output.
 

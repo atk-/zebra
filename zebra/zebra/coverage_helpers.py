@@ -28,6 +28,17 @@ def compute_and_cache_keyspace(mask):
     return mask
 
 
+def expand_universe(text):
+    """Expand a project's universe spec (hashcat shorthands or literals) to the set
+    of characters used as the coverage-% denominator, or None if unset/invalid."""
+    if not text:
+        return None
+    try:
+        return cov.expand_charset(text) or None
+    except cov.MaskParseError:
+        return None
+
+
 def covered_masks(project):
     """Masks that count as covered: those with at least one exhausted run.
 
@@ -50,8 +61,7 @@ def project_coverage(project):
             parsed.append(mask_positions(m, wmap))
         except cov.MaskParseError:
             continue  # skip malformed masks rather than break the dashboard
-    universe = project.universe or None
-    summary = cov.coverage_by_length(parsed, universe=universe)
+    summary = cov.coverage_by_length(parsed, universe=expand_universe(project.universe))
     rows = []
     for length, data in sorted(summary.items()):
         covered, total = data['covered'], data['total']

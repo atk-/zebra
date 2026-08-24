@@ -90,11 +90,14 @@ class HashcatRunner:
         parts += [hashfile, mask]
         return ' '.join(parts)
 
-    def plan_run(self, attack_mode, module, hashfile='HASHFILE', wordlists=None,
-                 rules=None, params=None, device=None):
-        """Build (but do not run) a hashcat command for any supported attack mode.
+    def build_run_args(self, attack_mode, module, hashfile='HASHFILE', wordlists=None,
+                       rules=None, params=None, device=None, extra=None):
+        """Build the hashcat **argv list** for any supported attack mode.
 
-        ``wordlists``/``rules`` are lists of path-or-name strings.
+        ``wordlists``/``rules`` are lists of path-or-name strings. Returned as a
+        list so callers can Popen it directly (no shell -> no injection);
+        ``plan_run`` joins it for display. ``extra`` are launcher flags appended
+        before the positional hashfile/attack args.
         """
         params = params or {}
         wordlists = [str(w) for w in (wordlists or [])]
@@ -104,6 +107,8 @@ class HashcatRunner:
             parts += ['-d', str(device)]
         if self.potfile_path:
             parts += ['--potfile-path', self.potfile_path]
+        if extra:
+            parts += list(extra)
 
         if attack_mode == 3:
             parts += _charset_flags(params.get('custom_charsets'))
@@ -130,7 +135,14 @@ class HashcatRunner:
                       wordlists[0] if wordlists else 'WORDLIST']
         else:
             parts += [hashfile]
-        return ' '.join(str(p) for p in parts)
+        return [str(p) for p in parts]
+
+    def plan_run(self, attack_mode, module, hashfile='HASHFILE', wordlists=None,
+                 rules=None, params=None, device=None):
+        """Build (but do not run) a hashcat command string for display."""
+        return ' '.join(self.build_run_args(
+            attack_mode, module, hashfile=hashfile, wordlists=wordlists,
+            rules=rules, params=params, device=device))
 
     # -- future active launcher (seam) --------------------------------------
     def launch(self, *a, **k):  # pragma: no cover - future work

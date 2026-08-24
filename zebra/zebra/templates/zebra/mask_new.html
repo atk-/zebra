@@ -6,15 +6,17 @@
 
 {% if error %}<div class="note warn">{{ error }}</div>{% endif %}
 
-{% if not hashtypes %}
+{% if not project.hashtype %}
   <div class="note warn">
-    This project has no hashes yet, so there's no hashtype to attack.
-    Add a hashlist first from the
-    <a href="{% url 'project_detail' project.pk %}">project page</a>.
+    This project has no hash type set. Set one in the
+    <a href="/admin/zebra/project/{{ project.pk }}/change/">admin</a> first.
   </div>
 {% else %}
 <form method="post" class="card">
   {% csrf_token %}
+  <p class="muted">Target: <strong>{{ project.hashtype.name }}
+    ({{ project.hashtype.hashcat_module }})</strong> · all {{ project.hash_set.count }}
+    hash(es) in this project.</p>
 
   <label>Attack type</label>
   <select name="attack_mode" data-attack-select>
@@ -62,9 +64,6 @@
   <datalist id="wordlist-options">
     {% for n in wordlist_names %}<option value="{{ n }}">{% endfor %}
   </datalist>
-
-  <label>Hashtype <span class="muted">(the run targets this type's hashes; sets -m)</span></label>
-  {% include "zebra/_hashtype_combobox.html" with selected=hashtype_id %}
 
   <label>Status</label>
   <select name="status">

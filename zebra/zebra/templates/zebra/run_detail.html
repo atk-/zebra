@@ -1,0 +1,87 @@
+{% extends "zebra/base.html" %}
+{% block title %}Attack #{{ run.pk }} — {{ project.name }}{% endblock %}
+{% block content %}
+<h1>Attack #{{ run.pk }}</h1>
+<p class="muted"><a href="{% url 'project_detail' project.pk %}">← {{ project.name }}</a>
+  · -a{{ run.attack_mode }} {{ run.attack_mode_label }}
+  ·
+  {% if run.status == 'exhausted' or run.status == 'cracked' %}<span class="pill ok">{{ run.status }}</span>
+  {% elif run.status == 'aborted' or run.status == 'error' %}<span class="pill warn">{{ run.status }}</span>
+  {% else %}<span class="muted">{{ run.status }}</span>{% endif %}
+</p>
+
+<form method="post" action="{% url 'run_delete' run.pk %}" style="margin:0 0 8px"
+      onsubmit="return confirm('Delete attack #{{ run.pk }}? This cannot be undone.');">
+  {% csrf_token %}
+  <button class="btn danger" type="submit">Delete attack</button>
+</form>
+
+<div class="card">
+  {% if launch_error %}<div class="note warn">{{ launch_error }}</div>{% endif %}
+  {% if run.status == 'running' %}
+    <p><strong>Running…</strong>
+      {% if run.speed_hs %}· {{ run.speed_hs }} H/s{% endif %}
+      · {% widthratio run.progress 1 100 %}%</p>
+    <div class="bar"><span style="width:{% widthratio run.progress 1 100 %}%"></span></div>
+    <form method="post" action="{% url 'run_stop' run.pk %}" style="margin-top:12px"
+          onsubmit="return confirm('Stop this attack?');">
+      {% csrf_token %}
+      <button class="btn danger" type="submit">Stop</button>
+    </form>
+    <script>setTimeout(function () { location.reload(); }, 3000);</script>
+  {% elif run.attack_mode == 3 and hashcat_available %}
+    <form method="post" action="{% url 'run_start' run.pk %}">
+      {% csrf_token %}
+      <button class="btn" type="submit">Run attack</button>
+      <span class="muted">Launches hashcat against this project's hashes and updates
+        the status when it finishes.</span>
+    </form>
+  {% elif run.attack_mode != 3 %}
+    <div class="note muted">Launching this attack type isn't supported yet — it needs
+      the wordlist/rule files on disk. Mask attacks (-a 3) can be run from here.</div>
+  {% else %}
+    <div class="note muted">hashcat is not installed on this machine, so this attack
+      can't be launched here.</div>
+  {% endif %}
+</div>
+
+<h2>Exact hashcat command</h2>
+{% if run.command %}
+<code class="cmd">{{ run.command }}</code>
+<p class="muted">Recorded when the attack was logged. <code>-m {{ project.hashtype.hashcat_module }}</code>
+  comes from the project's hash type ({{ project.hashtype.name }}).</p>
+{% else %}
+<p class="muted">No command recorded for this attack.</p>
+{% endif %}
+
+<h2>Specification</h2>
+<table>
+  <tr><th style="width:220px">Field</th><th>Value</th></tr>
+  <tr><td>Attack mode</td><td>-a {{ run.attack_mode }} · {{ run.attack_mode_label }}</td></tr>
+  <tr><td>Summary</td><td><code>{{ run.describe }}</code></td></tr>
+  {% for label, value in specs %}
+  <tr><td>{{ label }}</td><td><code>{{ value }}</code></td></tr>
+  {% endfor %}
+  <tr><td>Hash type</td><td>{{ project.hashtype.name }} ({{ project.hashtype.hashcat_module }})</td></tr>
+  <tr><td>Target hashes</td><td>{{ target_count }}</td></tr>
+  <tr><td>Cracks found</td><td>{{ cracks|length }}</td></tr>
+  <tr><td>Device</td><td class="muted">{{ run.device|default:"—" }}</td></tr>
+  <tr><td>Speed</td><td>{% if run.speed_hs %}{{ run.speed_hs }} H/s{% else %}—{% endif %}</td></tr>
+  <tr><td>Progress</td><td>{{ run.progress|floatformat:2 }}</td></tr>
+  <tr><td>Recorded</td><td class="muted">{{ run.created_at }}</td></tr>
+  <tr><td>Started</td><td class="muted">{{ run.started_at|default:"—" }}</td></tr>
+  <tr><td>Ended</td><td class="muted">{{ run.ended_at|default:"—" }}</td></tr>
+  {% if run.comment %}<tr><td>Comment</td><td>{{ run.comment }}</td></tr>{% endif %}
+</table>
+
+{% if cracks %}
+<h2>Cracks from this attack ({{ cracks|length }})</h2>
+<table>
+  <tr><th>Hash</th><th>Plaintext</th><th>When</th></tr>
+  {% for c in cracks %}
+  <tr><td><code>{{ c.hash }}</code></td><td><code>{{ c.plaintext }}</code></td>
+      <td class="muted">{{ c.found_at }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

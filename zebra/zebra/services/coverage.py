@@ -82,6 +82,17 @@ def _expand_charset_def(defn, custom_charsets, wildcard_map, _depth=0):
     return chars
 
 
+def expand_charset(text, wildcard_map=None):
+    """Expand a hashcat-style charset spec into the set of characters it covers.
+
+    Accepts literals and ?-tokens (``?l ?u ?d ?s ?a ?b ?h ?H`` plus project
+    wildcards), e.g. ``?l?u?d?s`` -> the 94 alphanumeric+special characters, or
+    ``abc012`` -> ``{a,b,c,0,1,2}``. Raises MaskParseError on an unknown token.
+    Used for the project universe (the coverage-% denominator).
+    """
+    return _expand_charset_def(text or '', {}, wildcard_map or {})
+
+
 def parse_mask(pattern, custom_charsets=None, wildcard_map=None):
     """Parse a hashcat mask string into a list of per-position character sets.
 

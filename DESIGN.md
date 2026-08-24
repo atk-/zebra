@@ -132,12 +132,15 @@ masks (stored in `Run.params`) never leak into coverage-by-length.
 
 ## 4. Data model (`models.py`)
 
-- **`Project`** — `name` (unique), `description`, `universe` (optional in-scope
-  charset used as the coverage-% denominator; falls back to a per-position union
-  when blank).
+- **`Project`** — `name` (unique), `description`, **`hashtype` FK** (the one type the
+  project targets), `universe` (optional in-scope charset used as the coverage-%
+  denominator; falls back to a per-position union when blank). The universe is stored
+  as a hashcat charset spec — a preset (`?d`, `?l?u?d`, `?a`) or a custom string that
+  may use shorthands (`?l?u?d?s`) or literals — and expanded to characters by
+  `coverage.expand_charset` at compute time.
 - **`HashType`** — `name` (unique), `hashcat_module`, `comment`. Seeded (§2.8).
-- **`Hash`** — `hashstring`, `hashtype` FK, `project` FK, `cracked` (denormalized
-  flag), `comment`.
+- **`Hash`** — `hashstring`, `project` FK, `cracked` (denormalized flag), `comment`.
+  Its type is `project.hashtype`.
 - **`CharacterSet` / `Wildcard`** — user-definable charsets and mask symbols; the
   engine consumes wildcard symbol→characters maps.
 - **`Mask`** — the central object: `project` FK, `pattern`, optional
@@ -151,8 +154,8 @@ masks (stored in `Run.params`) never leak into coverage-by-length.
   belong to a project — backfilled from `mask.project` in migration 0007), `mask` FK
   (mode-3 only; feeds coverage), `attack_mode` (0/1/3/6/7), `wordlists`/`rules` M2M,
   `params` JSON (combinator order + inline `-j`/`-k`; hybrid mask + charsets),
-  `signature` (canonical dedup key), `hashtype`, `device`, generated `command`,
-  `status` (`planned/running/exhausted/aborted/cracked/error`), `speed_hs`,
+  `signature` (canonical dedup key), `device`, generated `command` (its `-m` comes
+  from `project.hashtype`), `status` (`planned/running/exhausted/aborted/cracked/error`), `speed_hs`,
   `progress`, timing, `hashes` M2M. Runs are M2M to individual hashes so new hashes
   added to a project are naturally flagged as not-yet-covered. `describe()` renders a
   per-mode one-line spec for the dashboard.
@@ -161,10 +164,14 @@ masks (stored in `Run.params`) never leak into coverage-by-length.
 - **`Benchmark`** — measured `speed_hs` per `hashtype`/`device`; grounds runtime
   estimates now and the recommender later (`feasible = speed × time_budget`).
 
-Scope is **per (project, hashtype, length)**; there is intentionally no separate
-`Hashlist` model — a project holds its hashes directly and `Run`↔`Hash` answers
-"which hashes has this run covered". A `Hashlist` grouping is a possible future
-addition.
+**One hash type per project.** `Project.hashtype` fixes the type (a hashcat run takes
+one `-m`); `Hash` and `Run` carry no type of their own and inherit it. Coverage scope
+is therefore per **(project, length)**. Multi-type dumps (AD, mixed `/etc/shadow`)
+become **one project per type** — cleaner, since fast and slow types deserve separate
+coverage/similarity histories. This supersedes the earlier `Hashlist`-grouping idea;
+a future **case / superproject** layer can group related projects for an
+engagement-level rollup. `Run`↔`Hash` still records which hashes a run targeted (all
+current project hashes), so hashes added later are flagged as not-yet-covered.
 
 ## 5. Hashcat service (`services/hashcat.py`)
 
@@ -196,13 +203,36 @@ A thin, optional, read-only wrapper:
   "covered" means "searched to the end". (Consequence: a mask saved without an
   exhausted run does not contribute to coverage.)
 
+## 6b. Active launcher (`services/launcher.py`)
+
+Runs a recorded **mask** attack with hashcat from the attack page (first cut).
+
+- **Background thread**, not a blocking request: `start_run` spawns hashcat and a
+  daemon thread streams `--status-json` into the `Run` (progress/speed via the
+  existing `ingest_status`); the request returns immediately and the detail page
+  self-refreshes while `running`. The real work lives in a synchronous `_execute`
+  (the thread target) so it's unit-testable with a stub binary, without threads or
+  cross-thread SQLite.
+- **argv, never a shell string** — executes `HashcatRunner.build_run_args(...)`
+  as a list, so masks/paths can't inject shell.
+- **Guards:** hashcat installed, `attack_mode == 3` only (mask attacks need no
+  external files — other modes are a follow-up), project has hashes, and **one run at
+  a time** (the GPU is exclusive; refuse if any `Run` is `running`).
+- **Finalisation** from the exit code via `_final_status` (`0 cracked, 1 exhausted,
+  2/3/4 aborted, else error`); cracks are imported from the run's potfile
+  (`parse_potfile` → `ingest_cracks`). `Run.pid` + an in-process registry back the
+  **Stop** button (SIGINT = hashcat's clean checkpoint-abort).
+- **Known limitation:** a server restart orphans a `running` run (recover with Stop);
+  the robust fix is the worker/queue below.
+
 ## 7. Extensibility seams (designed, not built)
 
 - **Recommender** (`services/recommend.py`, future): rank uncovered masks by
   hit-probability from a corpus (Hashcat `masks/*.hcmask` or PACK), filter by
   `Benchmark`-derived time budget, exclude covered/subsumed masks.
-- **Active launcher:** the `Run` status/progress/speed fields and the
-  `HashcatRunner.launch/poll` stubs are the only hooks needed.
+- **Launcher, next increments:** launch wordlist/combinator/hybrid attacks (needs
+  `Wordlist.path`/`RuleSet.path` validated on disk); a **worker/queue** (RQ/Celery)
+  so runs survive restarts and can be parallelised.
 
 ## 8. Testing
 

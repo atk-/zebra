@@ -13,7 +13,7 @@
     e.g. <code>NTLM</code> / <code>1000</code>), then come back to create a project.
   </div>
 {% else %}
-<form method="post" class="card">
+<form method="post" class="card" enctype="multipart/form-data">
   {% csrf_token %}
 
   <label>Project name</label>
@@ -23,17 +23,36 @@
   <label>Description <span class="muted">(optional)</span></label>
   <input type="text" name="description" value="{{ description|default:'' }}">
 
-  <label>Hashtype</label>
+  <label>Hash type <span class="muted">(fixed for the project — all its hashes and attacks target this one <code>-m</code> module)</span></label>
   {% include "zebra/_hashtype_combobox.html" with selected=hashtype_id %}
 
-  <label>Universe <span class="muted">(optional — the character set used as the
-    coverage-% denominator; leave blank to use a per-position fallback)</span></label>
-  <input type="text" name="universe" value="{{ universe|default:'' }}"
-         placeholder="abcdefghijklmnopqrstuvwxyz0123456789">
+  <label>Universe <span class="muted">(the character set used as the coverage-%
+    denominator)</span></label>
+  <select name="universe" id="universe-select">
+    <option value="" {% if universe_choice == '' %}selected{% endif %}>— none (per-position fallback) —</option>
+    <option value="digits" {% if universe_choice == 'digits' %}selected{% endif %}>Only digits (?d)</option>
+    <option value="alnum" {% if universe_choice == 'alnum' %}selected{% endif %}>Alphanumeric (?l?u?d)</option>
+    <option value="all" {% if universe_choice == 'all' %}selected{% endif %}>All printable (?a)</option>
+    <option value="custom" {% if universe_choice == 'custom' %}selected{% endif %}>Custom…</option>
+  </select>
+  <input type="text" name="universe_custom" id="universe-custom"
+         value="{{ universe_custom|default:'' }}" style="margin-top:6px"
+         placeholder="hashcat shorthands e.g. ?l?u?d?s, or literal chars like abc012">
+  <script>
+    (function () {
+      var s = document.getElementById('universe-select'),
+          c = document.getElementById('universe-custom');
+      function sync() { c.style.display = s.value === 'custom' ? '' : 'none'; }
+      s.addEventListener('change', sync); sync();
+    })();
+  </script>
 
   <label>Hashlist <span class="muted">(one hash per line)</span></label>
   <textarea name="hashlist" rows="8"
             placeholder="5f4dcc3b5aa765d61d8327deb882cf99&#10;e10adc3949ba59abbe56e057f20f883e">{{ hashlist|default:'' }}</textarea>
+
+  <label>…or upload a file <span class="muted">(one hash per line; combined with any text above)</span></label>
+  <input type="file" name="hashfile" accept=".txt,.hash,.hashes,.lst,text/plain">
 
   <div style="margin-top:14px">
     <button class="btn" type="submit">Create project</button>

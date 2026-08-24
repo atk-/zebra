@@ -49,10 +49,14 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
 - [x] Import potfile → mark cracked + create `Crack` rows
 - [~] `--status-json` parsing exists; **wire it to update a specific `Run`** in the UI
 - [ ] **Run benchmarks from the UI** and persist `Benchmark` rows (currently no view)
-- [ ] **Active launcher** (`HashcatRunner.launch/poll`): spawn/manage jobs, stream
-      `--status-json`, auto-ingest cracks. Needs a background worker (RQ/Celery or a
-      status-file watcher) — the biggest single feature
-- [ ] File **upload** for potfiles/hashlists (currently paste-only)
+- [x] **Active launcher, first cut** (`services/launcher.py`): run a **mask** attack
+      from its page in a background thread; live progress; final status + crack import
+- [ ] Launch **wordlist/combinator/hybrid** attacks (needs `Wordlist`/`RuleSet` paths
+      validated on disk)
+- [ ] **Worker/queue** (RQ/Celery) so runs survive restarts / can run in parallel;
+      reconcile runs left `running` after a crash
+- [x] File **upload** for hashlists (New project + Add hashes; combines with paste)
+- [ ] File **upload** for potfiles / `--status-json` on the import page (paste-only)
 - [ ] Detect/validate hashtype of pasted hashes (length/format heuristics)
 
 ## Recommender (deferred, seams in place)
@@ -65,7 +69,10 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
       positions), per the original design notes
 
 ## Data model & scope
-- [ ] Optional **`Hashlist`** grouping within a project (multiple hashlists / types)
+- [x] **One hash type per project** (`Project.hashtype`); hashes/attacks inherit it;
+      coverage scope is per (project, length)
+- [ ] **Case / superproject** layer grouping related projects (e.g. all hash types
+      from one AD dump) for an engagement-level rollup
 - [ ] Per-project **wildcard/charset scoping** (wildcards are currently global)
 - [ ] Track **wordlist + rules** attacks (attack modes 0/6/7), not just masks
 - [ ] Add `hashcat_module` **uniqueness** constraint on `HashType` (seeded 1:1 today)
