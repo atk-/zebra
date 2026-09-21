@@ -1,5 +1,12 @@
 {% extends "zebra/base.html" %}
 {% block title %}{{ project.name }} — zebra{% endblock %}
+{% block breadcrumb %}
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <a href="{% url 'index' %}">Projects</a>
+  <span class="sep">&rsaquo;</span>
+  <span class="current" aria-current="page">{{ project.name }}</span>
+</nav>
+{% endblock %}
 {% block content %}
 <h1>{{ project.name }}</h1>
 {% if project.description %}<p class="muted">{{ project.description }}</p>{% endif %}

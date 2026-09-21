@@ -54,6 +54,11 @@
   .combobox-option.active, .combobox-option:hover { background:var(--accent); color:#fff; }
   .combobox-option.active .muted, .combobox-option:hover .muted { color:#dbe4ff; }
   .combobox-empty { padding:6px 8px; }
+  .breadcrumb { font-size:13px; color:var(--muted); margin:0 0 18px; }
+  .breadcrumb a { color:var(--muted); text-decoration:none; }
+  .breadcrumb a:hover { color:var(--accent); text-decoration:underline; }
+  .breadcrumb .sep { margin:0 8px; color:var(--line); }
+  .breadcrumb .current { color:var(--fg); font-weight:600; }
   /* --- search-space visualization --- */
   .cov-toggle { background:none; border:0; cursor:pointer; font-size:14px;
          color:var(--muted); padding:0 4px; line-height:1; }
@@ -84,7 +89,7 @@
 </head>
 <body>
 <header><a href="{% url 'index' %}">🦓 zebra</a> <span class="muted">hashcat mask coverage</span></header>
-<main>{% block content %}{% endblock %}</main>
+<main>{% block breadcrumb %}{% endblock %}{% block content %}{% endblock %}</main>
 <script>
 // Attack-type toggle: show only the field groups whose data-modes contains the
 // currently selected attack mode.
