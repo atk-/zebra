@@ -17,18 +17,22 @@
 <h2>Coverage by password length</h2>
 {% if coverage %}
 <table>
-  <tr><th>Length</th><th>Masks</th><th>Covered</th><th>Total</th><th>Remaining</th><th style="width:34%">Coverage</th></tr>
+  <tr><th style="width:1.5em"></th><th>Length</th><th>Masks</th><th>Covered</th><th>Total</th><th>Remaining</th><th style="width:30%">Coverage</th></tr>
   {% for row in coverage %}
   <tr>
+    <td><button class="cov-toggle" type="button" data-target="cov-panel-{{ row.length }}" aria-expanded="false" title="Show search-space breakdown">&#9656;</button></td>
     <td>{{ row.length }}</td>
     <td>{{ row.masks }}</td>
     <td>{{ row.covered }}</td>
-    <td>{% if row.total %}{{ row.total }}{% else %}—{% endif %}</td>
-    <td>{% if row.remaining is not None %}{{ row.remaining }}{% else %}—{% endif %}</td>
+    <td>{% if row.total %}{{ row.total }}{% else %}&mdash;{% endif %}</td>
+    <td>{% if row.remaining is not None %}{{ row.remaining }}{% else %}&mdash;{% endif %}</td>
     <td>
       <div class="bar"><span style="width:{{ row.percent|floatformat:4 }}%"></span></div>
       <span class="muted">{{ row.percent|floatformat:4 }}%</span>
     </td>
+  </tr>
+  <tr class="cov-detail" id="cov-panel-{{ row.length }}" hidden>
+    <td colspan="7"><div class="viz" data-viz-url="{% url 'coverage_decomposition' project.pk row.length %}"></div></td>
   </tr>
   {% endfor %}
 </table>
@@ -64,4 +68,271 @@
 {% else %}
 <p class="muted">No attacks recorded yet. <a href="{% url 'mask_new' project.pk %}">Record the first one.</a></p>
 {% endif %}
+
+<script>
+// Search-space visualization: on expanding a coverage row, lazily fetch the
+// disjoint-cell decomposition for that length and draw (1) per-position
+// marginals, (2) a joint alluvial / icicle view, (3) summary stats. Vanilla,
+// no libraries; atom colours come from CSS classes (atom-d/l/u/s/x).
+(function () {
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  var NOUN = { d:'digits', l:'lowercase', u:'uppercase', s:'symbols', x:'mixed/other' };
+
+  function el(tag, attrs) {
+    var e = document.createElementNS(SVGNS, tag);
+    if (attrs) for (var k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function tip(node, text) {
+    var t = document.createElementNS(SVGNS, 'title'); t.textContent = text;
+    node.appendChild(t); return node;
+  }
+  function num(x) { return Number(x); }               // geometry only (may lose precision)
+  function fmt(x) {                                    // group digits of an integer string
+    var s = String(x), neg = s[0] === '-'; if (neg) s = s.slice(1);
+    return (neg ? '-' : '') + s.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+  function acls(d, id) { return 'atom-' + (d.atoms[id].cls || 'x'); }
+  function maskForm(d, tuple) {
+    return tuple.map(function (a) { return d.atoms[a].label; }).join(' ');
+  }
+
+  document.querySelectorAll('.cov-toggle').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var panel = document.getElementById(btn.dataset.target);
+      var showing = panel.hidden;
+      panel.hidden = !showing;
+      btn.innerHTML = showing ? '&#9662;' : '&#9656;';
+      btn.setAttribute('aria-expanded', showing ? 'true' : 'false');
+      if (showing) {
+        var viz = panel.querySelector('.viz');
+        if (!viz.dataset.loaded) { viz.dataset.loaded = '1'; load(viz); }
+      }
+    });
+  });
+
+  function load(viz) {
+    viz.innerHTML = '<p class="muted">Loading&hellip;</p>';
+    fetch(viz.dataset.vizUrl).then(function (r) { return r.json(); })
+      .then(function (d) { render(viz, d); })
+      .catch(function (e) { viz.innerHTML = '<p class="viz-note">Failed to load: ' + e + '</p>'; });
+  }
+
+  function render(viz, d) {
+    viz.innerHTML = '';
+    if (d.empty) { viz.innerHTML = '<p class="muted">No exhausted keyspace at this length.</p>'; return; }
+
+    var used = {}; d.atoms.forEach(function (a) { used[a.cls || 'x'] = true; });
+    var leg = document.createElement('div'); leg.className = 'viz-legend';
+    Object.keys(NOUN).forEach(function (c) {
+      if (!used[c]) return;
+      var sp = document.createElement('span');
+      sp.innerHTML = '<i></i>' + NOUN[c];
+      sp.querySelector('i').style.background = 'var(--atom-' + c + ')';
+      leg.appendChild(sp);
+    });
+    viz.appendChild(leg);
+
+    viz.appendChild(h4('Per character position'));
+    viz.appendChild(marginals(d));
+
+    viz.appendChild(h4('Joint coverage (whole)'));
+    if (d.truncated || !d.cells) {
+      var n = document.createElement('div'); n.className = 'viz-note';
+      n.textContent = 'Joint view omitted — the decomposition is too large to draw'
+        + (d.cell_count ? ' (' + d.cell_count + ' cells)' : '') + '. Per-position and summary are still exact.';
+      viz.appendChild(n);
+    } else {
+      viz.appendChild(joint(d));
+    }
+    viz.appendChild(summary(d));
+  }
+
+  function h4(t) { var h = document.createElement('h4'); h.textContent = t; return h; }
+
+  // --- per-position marginal strips ---------------------------------------
+  function marginals(d) {
+    var L = d.length, W = 700, rowH = 20, vgap = 10, padL = 24, padT = 2;
+    var svg = el('svg', { width: W, height: padT + L * (rowH + vgap) });
+    var wt = d.atoms.map(function (a) { return num(a.weight); });
+    var sigma = d.total ? Math.round(Math.pow(num(d.total), 1 / L)) : null;
+    var maxChars = 0, maxDens = 0, perPos = [];
+    for (var p = 0; p < L; p++) {
+      var u = d.positions[p].atoms, rest = d.positions[p].rest, chars = 0;
+      u.forEach(function (a) {
+        chars += wt[a];
+        var dens = num(d.marginals[p][a] || 0) / wt[a];
+        if (dens > maxDens) maxDens = dens;
+      });
+      if (rest != null) chars += num(rest);
+      if (chars > maxChars) maxChars = chars;
+      perPos.push({ used: u, rest: rest });
+    }
+    var scale = (W - padL - 6) / (maxChars || 1);
+    for (var p = 0; p < L; p++) {
+      var y = padT + p * (rowH + vgap);
+      var lab = el('text', { x: 0, y: y + rowH * 0.72, 'class': 'viz-axislabel' });
+      lab.textContent = (p + 1); svg.appendChild(lab);
+      var x = padL;
+      var order = perPos[p].used.slice().sort(function (a, b) {
+        var ca = d.atoms[a].cls || 'x', cb = d.atoms[b].cls || 'x';
+        return ca < cb ? -1 : ca > cb ? 1 : a - b;
+      });
+      order.forEach(function (a) {
+        var w = wt[a] * scale, m = num(d.marginals[p][a] || 0);
+        var op = maxDens ? (0.35 + 0.65 * (m / wt[a]) / maxDens) : 1;
+        var r = el('rect', { x: x, y: y, width: Math.max(w, 0.6), height: rowH,
+                             'class': acls(d, a), 'fill-opacity': op.toFixed(3) });
+        var sat = sigma ? ' · ' + (100 * m * sigma / (wt[a] * num(d.total))).toFixed(2) + '% of band covered' : '';
+        tip(r, 'pos ' + (p + 1) + ' · ' + d.atoms[a].label + ' (' + wt[a] + ' chars) · '
+              + fmt(d.marginals[p][a] || '0') + ' covered' + sat);
+        svg.appendChild(r); x += w;
+      });
+      if (perPos[p].rest != null && num(perPos[p].rest) > 0) {
+        var w = num(perPos[p].rest) * scale;
+        var r = el('rect', { x: x, y: y, width: Math.max(w, 0.6), height: rowH, 'class': 'atom-rest' });
+        tip(r, 'pos ' + (p + 1) + ' · ' + fmt(perPos[p].rest) + ' characters never tried here');
+        svg.appendChild(r);
+      }
+    }
+    return svg;
+  }
+
+  // --- joint view: alluvial / icicle toggle -------------------------------
+  function joint(d) {
+    var wrap = document.createElement('div');
+    var tabs = document.createElement('div'); tabs.className = 'viz-tabs';
+    var mount = document.createElement('div');
+    var tA = tab('Alluvial'), tI = tab('Icicle');
+    tabs.appendChild(tA); tabs.appendChild(tI);
+    wrap.appendChild(tabs); wrap.appendChild(mount);
+    var cache = {};
+    function show(which, btn) {
+      tabs.querySelectorAll('.viz-tab').forEach(function (b) { b.classList.remove('active'); });
+      btn.classList.add('active'); mount.innerHTML = '';
+      if (!cache[which]) cache[which] = which === 'a' ? alluvial(d) : icicle(d);
+      mount.appendChild(cache[which]);
+    }
+    tA.addEventListener('click', function () { show('a', tA); });
+    tI.addEventListener('click', function () { show('i', tI); });
+    show('a', tA);
+    return wrap;
+    function tab(t) { var b = document.createElement('button'); b.type = 'button'; b.className = 'viz-tab'; b.textContent = t; return b; }
+  }
+
+  function sortedCells(d) {
+    var L = d.length;
+    return d.cells.map(function (c) { return { atoms: c.atoms, size: num(c.size), raw: c.size }; })
+      .sort(function (a, b) {
+        for (var i = 0; i < L; i++) if (a.atoms[i] !== b.atoms[i]) return a.atoms[i] - b.atoms[i];
+        return 0;
+      });
+  }
+
+  function alluvial(d) {
+    var L = d.length, cells = sortedCells(d), covered = num(d.covered);
+    var W = 700, padT = 6, padB = 18, padL = 74, padR = 8, axW = 8;
+    var H = Math.max(170, Math.min(440, cells.length * 3 + 130));
+    var axisH = H - padT - padB, scale = axisH / covered;
+    var svg = el('svg', { width: W, height: H });
+    var axX = []; for (var p = 0; p < L; p++) axX.push(padL + (L > 1 ? (W - padL - padR) * p / (L - 1) : 0));
+    var yTop = cells.map(function () { return new Array(L); });
+
+    for (var p = 0; p < L; p++) {
+      var order = d.positions[p].atoms.slice().sort(function (a, b) { return a - b; });
+      var y = padT;
+      order.forEach(function (atom) {
+        var bandTop = y, bandMass = 0;
+        for (var ci = 0; ci < cells.length; ci++) {
+          if (cells[ci].atoms[p] === atom) { yTop[ci][p] = y; y += cells[ci].size * scale; bandMass += cells[ci].size; }
+        }
+        var bh = y - bandTop;
+        var r = el('rect', { x: axX[p] - axW / 2, y: bandTop, width: axW, height: Math.max(bh, 0.6), 'class': acls(d, atom) });
+        tip(r, 'pos ' + (p + 1) + ' · ' + d.atoms[atom].label + ' · ' + fmt(bandMass) + ' covered');
+        svg.appendChild(r);
+        if (p === 0 && bh > 8) {
+          var tl = el('text', { x: axX[0] - axW / 2 - 5, y: bandTop + bh / 2 + 3, 'class': 'viz-bandlabel', 'text-anchor': 'end', fill: 'var(--fg)' });
+          tl.textContent = d.atoms[atom].label; svg.appendChild(tl);
+        }
+      });
+      var al = el('text', { x: axX[p], y: H - 4, 'class': 'viz-axislabel', 'text-anchor': 'middle' });
+      al.textContent = (p + 1); svg.appendChild(al);
+    }
+
+    for (var p = 0; p < L - 1; p++) {
+      var xA = axX[p] + axW / 2, xB = axX[p + 1] - axW / 2, mx = (xA + xB) / 2;
+      for (var ci = 0; ci < cells.length; ci++) {
+        var t = Math.max(cells[ci].size * scale, 0.4);
+        var yA = yTop[ci][p], yB = yTop[ci][p + 1];
+        var dpath = 'M' + xA + ',' + yA + ' C' + mx + ',' + yA + ' ' + mx + ',' + yB + ' ' + xB + ',' + yB
+                  + ' L' + xB + ',' + (yB + t) + ' C' + mx + ',' + (yB + t) + ' ' + mx + ',' + (yA + t) + ' ' + xA + ',' + (yA + t) + ' Z';
+        var pth = el('path', { d: dpath, 'class': 'ribbon ' + acls(d, cells[ci].atoms[p]), 'fill-opacity': 0.5, 'data-cell': ci });
+        tip(pth, maskForm(d, cells[ci].atoms) + ' · ' + fmt(cells[ci].raw));
+        svg.appendChild(pth);
+      }
+    }
+
+    svg.addEventListener('mouseover', function (e) {
+      var ci = e.target.getAttribute && e.target.getAttribute('data-cell');
+      if (ci == null) return;
+      svg.querySelectorAll('.ribbon').forEach(function (r) {
+        if (r.getAttribute('data-cell') === ci) { r.setAttribute('fill-opacity', '0.92'); r.classList.add('hi'); r.classList.remove('dim'); }
+        else r.classList.add('dim');
+      });
+    });
+    svg.addEventListener('mouseout', function () {
+      svg.querySelectorAll('.ribbon').forEach(function (r) { r.setAttribute('fill-opacity', '0.5'); r.classList.remove('hi', 'dim'); });
+    });
+    return svg;
+  }
+
+  function icicle(d) {
+    var L = d.length, cells = sortedCells(d), covered = num(d.covered), total = d.total ? num(d.total) : null;
+    var W = 700, rowH = Math.max(15, Math.min(30, Math.floor(190 / L))), H = L * rowH + 4;
+    var svg = el('svg', { width: W, height: H });
+    var Wc = total ? W * covered / total : W;
+    if (total && Wc < W - 0.5) {
+      var g = el('rect', { x: Math.max(Wc, 0.6), y: 0, width: W - Wc, height: L * rowH, 'class': 'atom-rest', 'fill-opacity': 0.5 });
+      tip(g, 'never tried · ' + fmt(String(total - covered)) + ' candidates'); svg.appendChild(g);
+    }
+    var scale = Wc / covered;
+    function draw(list, level, x0) {
+      if (level >= L) return;
+      var i = 0;
+      while (i < list.length) {
+        var atom = list[i].atoms[level], j = i, sum = 0;
+        while (j < list.length && list[j].atoms[level] === atom) { sum += list[j].size; j++; }
+        var w = sum * scale;
+        var r = el('rect', { x: x0, y: level * rowH, width: Math.max(w - 0.5, 0.6), height: rowH - 0.5, 'class': acls(d, atom), 'fill-opacity': 0.85 });
+        var pl = []; for (var k = 0; k <= level; k++) pl.push(d.atoms[list[i].atoms[k]].label);
+        tip(r, pl.join(' ') + ' · ' + fmt(sum));
+        svg.appendChild(r);
+        if (w > 24) {
+          var tx = el('text', { x: x0 + 3, y: level * rowH + rowH * 0.68, 'class': 'viz-bandlabel' });
+          tx.textContent = d.atoms[atom].label; svg.appendChild(tx);
+        }
+        draw(list.slice(i, j), level + 1, x0);
+        x0 += w; i = j;
+      }
+    }
+    draw(cells, 0, 0);
+    return svg;
+  }
+
+  function summary(d) {
+    var div = document.createElement('div'); div.className = 'viz-summary';
+    var parts = [];
+    parts.push('<strong>' + fmt(d.covered) + '</strong> candidates covered'
+      + (d.total ? ' of ' + fmt(d.total) + ' (' + d.percent.toFixed(4) + '%)' : ''));
+    parts.push(d.masks + ' mask' + (d.masks !== 1 ? 's' : '')
+      + (d.cell_count != null ? ' · ' + d.cell_count + ' disjoint region' + (d.cell_count !== 1 ? 's' : '') : ''));
+    if (num(d.redundancy) > 0)
+      parts.push('<strong>' + fmt(d.redundancy) + '</strong> redundant (re-covered) candidates across overlapping masks');
+    parts.push('footprint (distinct character classes per position): ' + d.fingerprint.join(' · '));
+    div.innerHTML = parts.join('<br>');
+    return div;
+  }
+})();
+</script>
+
 {% endblock %}

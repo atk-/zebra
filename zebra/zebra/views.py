@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.shortcuts import render, get_object_or_404, redirect
 from django.urls import reverse
+from django.http import JsonResponse
 
 from .models import Project, Mask, HashType, Hash, Run, Wordlist, RuleSet
 from . import coverage_helpers as ch
@@ -386,3 +387,13 @@ def import_results(request, pk):
         except Exception as exc:  # surface parse errors to the user
             context['error'] = '%s: %s' % (type(exc).__name__, exc)
     return render(request, 'zebra/import_results.html', context)
+
+
+def coverage_decomposition_json(request, pk, length):
+    """Disjoint-cell decomposition for one password length (search-space viz).
+
+    Fetched lazily by the dashboard when a coverage row is expanded, so
+    project_detail itself stays cheap for large campaigns.
+    """
+    project = get_object_or_404(Project, pk=pk)
+    return JsonResponse(ch.project_length_decomposition(project, length))

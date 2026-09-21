@@ -712,3 +712,58 @@ class UniverseFormTests(TestCase):
         self.assertContains(d, 'Alphanumeric (?l?u?d)')
         self.assertContains(d, 'All printable (?a)')
         self.assertContains(d, 'name="universe_custom"')
+
+
+class CoverageDecompositionTests(SimpleTestCase):
+    def _sizes(self, dec):
+        return sum(c['size'] for c in dec['cells'])
+
+    def test_cells_sum_to_union_keyspace(self):
+        for pats in (['?u?l?l?d?d?d', '?a?a?a?a?a?a'],
+                     ['?a?d?d?d', '?u?l?l?s'],
+                     ['?l?l?l?l', 'abcd', 'ab?d?d']):
+            masks = [P(p) for p in pats]
+            dec = cov.coverage_decomposition(masks)
+            self.assertFalse(dec['truncated'])
+            self.assertEqual(self._sizes(dec), cov.union_keyspace(masks))
+            self.assertEqual(dec['covered'], cov.union_keyspace(masks))
+
+    def test_cells_are_disjoint(self):
+        dec = cov.coverage_decomposition([P('?a?d?d?d'), P('?u?l?l?s')])
+        tuples = [tuple(c['atoms']) for c in dec['cells']]
+        self.assertEqual(len(tuples), len(set(tuples)))
+
+    def test_dependency_is_visible_in_cells(self):
+        # Same covered count, but the covered *cells* differ: anti-diagonal vs
+        # diagonal. A per-position marginal alone could not tell these apart.
+        uni = cov.expand_charset('?l?u')
+        anti = cov.coverage_decomposition([P('?u?l'), P('?l?u')], universe=uni)
+        diag = cov.coverage_decomposition([P('?u?u'), P('?l?l')], universe=uni)
+        self.assertEqual(anti['covered'], diag['covered'])
+        anti_cells = {tuple(c['atoms']) for c in anti['cells']}
+        diag_cells = {tuple(c['atoms']) for c in diag['cells']}
+        self.assertNotEqual(anti_cells, diag_cells)
+        self.assertEqual(anti['total'], 2 * 26 * (2 * 26))  # |Sigma|=52, L=2
+
+    def test_marginals_sum_to_covered_at_every_position(self):
+        dec = cov.coverage_decomposition([P('?a?d?d?d'), P('?u?l?l?s')])
+        for mp in dec['marginals']:
+            self.assertEqual(sum(mp.values()), dec['covered'])
+
+    def test_truncation_keeps_marginals_exact(self):
+        masks = [P('?a?a?a?a'), P('?l?l?l?l')]
+        dec = cov.coverage_decomposition(masks, universe=cov.expand_charset('?a'),
+                                         cell_cap=3)
+        self.assertTrue(dec['truncated'])
+        self.assertIsNone(dec['cells'])
+        self.assertEqual(dec['covered'], cov.union_keyspace(masks))
+        for mp in dec['marginals']:
+            self.assertEqual(sum(mp.values()), dec['covered'])
+
+    def test_single_mask_is_one_cell(self):
+        dec = cov.coverage_decomposition([P('?u?l?l?d')])
+        self.assertEqual(len(dec['cells']), 1)
+        self.assertEqual(dec['cells'][0]['size'], cov.mask_keyspace(P('?u?l?l?d')))
+
+    def test_empty_masks_return_none(self):
+        self.assertIsNone(cov.coverage_decomposition([]))

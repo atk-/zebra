@@ -45,35 +45,6 @@ cross-check, benchmarks, result import) but does **not** launch or manage cracki
 jobs. The data model and run state machine are shaped so an active launcher can be
 added later without rework. See `DESIGN.md`.
 
-## Stack
-
-- Python **3.12**, Django **6.1**, SQLite (dev).
-- **uv** for environment/dependency management (`pyproject.toml` + `uv.lock`).
-- Single Django app `zebra`, project config in `config/`.
-
-## Layout
-
-```
-zebra/                         # git repo root (uv project: pyproject.toml, uv.lock)
-  zebra/                       # Django project root (manage.py lives here)
-    config/                    # settings, root urlconf, wsgi/asgi
-    zebra/                     # the app
-      models.py                # Project, HashType, Hash, Mask, Run, Crack, Benchmark,
-                               #   Wordlist, RuleSet, CharacterSet, Wildcard
-      services/
-        coverage.py            # pure exact-coverage engine for masks (no Django imports)
-        similarity.py          # pure near-duplicate engine for non-mask runs
-        hashcat.py             # read-only hashcat wrapper + parsers + ingest + command builder
-      coverage_helpers.py      # DB glue: models <-> coverage engine (masks)
-      run_helpers.py           # DB glue: models <-> similarity engine (non-mask runs)
-      views.py / urls.py       # web UI (index, project_new, project_detail, mask_new, import_results)
-      templates/zebra/         # server-rendered templates (theme in base.html)
-      management/commands/     # seed_hashtypes
-      data/hashtypes.tsv       # bundled Hashcat module list (seed source)
-      migrations/              # incl. 0006_seed_hashtypes (data migration)
-      tests.py                 # engine unit tests (SimpleTestCase, DB-free)
-```
-
 ## Running it
 
 All commands go through `uv run` (it uses the project `.venv`, ignoring any active

@@ -26,7 +26,7 @@ unit-testable without a database. All arithmetic uses native Python ints
 """
 
 from functools import reduce
-from itertools import chain
+from itertools import chain, product
 
 # --- Hashcat built-in charsets ---------------------------------------------
 # Special set is printable-ASCII punctuation, starting with space (33 chars).
@@ -252,3 +252,157 @@ def coverage_by_length(masks, universe=None):
             total = reduce(lambda a, s: a * len(s), per_pos, 1)
         out[L] = {'covered': covered, 'total': total, 'masks': len(group)}
     return out
+
+
+# --- Disjoint-cell decomposition (for the search-space visualization) -------
+#
+# coverage_by_length answers *how much* keyspace is exhausted; the decomposition
+# below answers *which* keyspace, in a form a UI can draw. Sigma^L partitions
+# into a grid of cells (one character-atom per position); every mask is a union
+# of whole cells, so the exhausted region is exactly a *disjoint* union of the
+# covered cells (a DNF). No inclusion-exclusion is needed here -- grid cells are
+# inherently disjoint, so we just enumerate each mask's cells and de-duplicate.
+# Per-position marginals and the joint (alluvial / icicle) views all derive from
+# that single cell list.
+
+def _atom_sets(charsets):
+    """Like ``atom_partition`` but also return each atom's character set.
+
+    Returns ``(atoms, bitmasks)`` where ``atoms[a]`` is the frozenset of
+    characters in atom ``a`` and ``bitmasks[i]`` is the bitmask (over atom ids)
+    of the atoms composing ``charsets[i]``.
+    """
+    charsets = [frozenset(c) for c in charsets]
+    universe = set().union(*charsets) if charsets else set()
+    groups = {}     # signature (frozenset of charset indices) -> atom id
+    order = []      # atom id -> signature
+    members = []    # atom id -> set of characters
+    for ch in universe:
+        sig = frozenset(i for i, c in enumerate(charsets) if ch in c)
+        aid = groups.get(sig)
+        if aid is None:
+            aid = len(order)
+            groups[sig] = aid
+            order.append(sig)
+            members.append(set())
+        members[aid].add(ch)
+    atoms = [frozenset(m) for m in members]
+    bitmasks = [0] * len(charsets)
+    for aid, sig in enumerate(order):
+        for idx in sig:
+            bitmasks[idx] |= (1 << aid)
+    return atoms, bitmasks
+
+
+def _atoms_in(bitmask):
+    """List of atom ids whose bit is set in ``bitmask``."""
+    out = []
+    aid = 0
+    while bitmask:
+        if bitmask & 1:
+            out.append(aid)
+        bitmask >>= 1
+        aid += 1
+    return out
+
+
+def _cell_size(cell, weights):
+    """Candidate count of a grid cell = product of its per-position atom weights."""
+    size = 1
+    for a in cell:
+        size *= weights[a]
+    return size
+
+
+def coverage_decomposition(masks, universe=None, cell_cap=20000):
+    """Disjoint-cell decomposition of the union of equal-length masks.
+
+    ``masks``    : list of parsed masks (each a list of frozensets), same length.
+    ``universe`` : characters in scope; total = len(universe)**L (else None).
+    ``cell_cap`` : safety bound on enumerated cells; beyond it the joint view is
+                   suppressed (``cells`` = None, ``truncated`` = True) but the
+                   per-position ``marginals`` are still returned exactly.
+
+    Returns None for an empty mask set, else a dict:
+      length     : int
+      covered    : int   (== sum of cell sizes; == union_keyspace(masks))
+      total      : int | None
+      atoms      : [ {"chars": sorted list, "weight": int} ]  # global vocabulary
+      positions  : [ {"atoms": [atom_id, ...], "rest": int | None} ]  # per position
+      cells      : [ {"atoms": [atom_id per pos], "size": int} ] | None
+      marginals  : [ {atom_id: covered_mass} ]  # one dict per position
+      truncated  : bool
+    """
+    masks = [m for m in masks if m]
+    if not masks:
+        return None
+    L = len(masks[0])
+    if any(len(m) != L for m in masks):
+        raise ValueError('coverage_decomposition requires masks of equal length')
+
+    distinct = list({s for m in masks for s in m})
+    atoms, bits = _atom_sets(distinct)
+    index = {s: bits[i] for i, s in enumerate(distinct)}
+    weights = [len(a) for a in atoms]
+
+    # per-mask, per-position list of the atom ids that make up that position-set
+    mask_atoms = [[_atoms_in(index[s]) for s in m] for m in masks]
+
+    covered = union_keyspace(masks)
+    uni = set(universe) if universe is not None else None
+    total = len(uni) ** L if uni is not None else None
+
+    # atoms actually used (covered) at each position, across all masks
+    used = [set() for _ in range(L)]
+    for ma in mask_atoms:
+        for p in range(L):
+            used[p].update(ma[p])
+    positions = []
+    for p in range(L):
+        rest = (len(uni) - sum(weights[a] for a in used[p])) if uni is not None else None
+        positions.append({'atoms': sorted(used[p]), 'rest': rest})
+
+    # enumerate the disjoint covered cells (product of atoms within each mask)
+    cells_set = set()
+    truncated = False
+    for ma in mask_atoms:
+        for combo in product(*ma):
+            cells_set.add(combo)
+        if len(cells_set) > cell_cap:
+            truncated = True
+            break
+
+    if truncated:
+        cells = None
+        marginals = []
+        for p in range(L):
+            mp = {}
+            for a in sorted(used[p]):
+                subset = []
+                for mi, m in enumerate(masks):
+                    if a in mask_atoms[mi][p]:
+                        mm = list(m)
+                        mm[p] = atoms[a]
+                        subset.append(mm)
+                mp[a] = union_keyspace(subset) if subset else 0
+            marginals.append(mp)
+    else:
+        cells = []
+        marginals = [dict() for _ in range(L)]
+        for c in cells_set:
+            size = _cell_size(c, weights)
+            cells.append({'atoms': list(c), 'size': size})
+            for p, a in enumerate(c):
+                marginals[p][a] = marginals[p].get(a, 0) + size
+
+    return {
+        'length': L,
+        'covered': covered,
+        'total': total,
+        'atoms': [{'chars': sorted(a), 'weight': w}
+                  for a, w in zip(atoms, weights)],
+        'positions': positions,
+        'cells': cells,
+        'marginals': marginals,
+        'truncated': truncated,
+    }

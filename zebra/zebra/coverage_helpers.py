@@ -104,3 +104,118 @@ def evaluate_candidate(project, pattern, custom_charsets=None):
         'overlap': keyspace - marginal,
         'subsumed': marginal == 0 and keyspace > 0,
     }
+
+
+# --- Search-space decomposition (visualization glue) ------------------------
+#
+# Wraps cov.coverage_decomposition with human-readable atom labels/colors and
+# JSON-safe stringification of the (arbitrary-precision) keyspace integers --
+# JS numbers lose precision past 2**53, so every keyspace count is sent as a
+# string and only coerced to float for pixel geometry on the client.
+
+# Disjoint core categories used both for atom colouring and subset labels.
+_CORE = ['d', 'l', 'u', 's']
+_NOUN = {'d': 'digits', 'l': 'lowercase', 'u': 'uppercase', 's': 'symbols',
+         'x': 'chars'}
+
+
+def _atom_label_class(chars, name_table):
+    """(label, css_class) for an atom given its sorted character list."""
+    s = frozenset(chars)
+    cls = _core_class(s)
+    exact = name_table.get(s)
+    if exact is not None:
+        return exact, cls
+    if len(chars) == 1:
+        c = chars[0]
+        return ("'%s'" % c) if c.isprintable() else ('1 %s' % _NOUN[cls]), cls
+    return '%d %s' % (len(chars), _NOUN[cls]), cls
+
+
+def _core_class(s):
+    """Colour class: the single core category that contains the atom, else 'x'."""
+    hit = None
+    for sym in _CORE:
+        if s <= frozenset(cov.BUILTIN_CHARSETS[sym]):
+            if hit is not None:
+                return 'x'  # straddles more than one core category
+            hit = sym
+    return hit or 'x'
+
+
+def _sample(chars, n=8):
+    """A short printable sample of an atom's characters for tooltips."""
+    printable = [c for c in chars if c.isprintable() and c != ' ']
+    picked = (printable or chars)[:n]
+    more = '…' if len(chars) > len(picked) else ''
+    return ''.join(picked) + more
+
+
+def _s(n):
+    """Stringify an int for JSON (preserve precision); pass through None."""
+    return None if n is None else str(n)
+
+
+def project_length_decomposition(project, length):
+    """JSON-serialisable disjoint-cell decomposition for one password length.
+
+    Feeds the embedded search-space visualization: labelled atoms, disjoint
+    covered cells, per-position marginals, and summary stats. Keyspace counts
+    are strings (JS precision-safe).
+    """
+    wmap = project_wildcard_map()
+    parsed = []
+    for m in covered_masks(project):
+        try:
+            pos = mask_positions(m, wmap)
+        except cov.MaskParseError:
+            continue
+        if len(pos) == length:
+            parsed.append(pos)
+    if not parsed:
+        return {'length': length, 'empty': True}
+
+    universe = expand_universe(project.universe)
+    dec = cov.coverage_decomposition(parsed, universe=universe)
+
+    # name table: exact-set -> display symbol (builtins + project wildcards)
+    name_table = {}
+    for sym in ('l', 'u', 'd', 's', 'a', 'h', 'H', 'b'):
+        name_table[frozenset(cov.BUILTIN_CHARSETS[sym])] = '?' + sym
+    for w in Wildcard.objects.all():
+        name_table.setdefault(frozenset(w.characters), '?' + w.symbol)
+
+    atoms = []
+    for a in dec['atoms']:
+        label, cls = _atom_label_class(a['chars'], name_table)
+        atoms.append({'label': label, 'cls': cls,
+                      'weight': _s(a['weight']), 'sample': _sample(a['chars'])})
+
+    positions = [{'atoms': p['atoms'], 'rest': _s(p['rest'])}
+                 for p in dec['positions']]
+    cells = None
+    if dec['cells'] is not None:
+        cells = sorted(({'atoms': c['atoms'], 'size': _s(c['size'])}
+                        for c in dec['cells']),
+                       key=lambda c: int(c['size']), reverse=True)
+    marginals = [{str(a): _s(v) for a, v in mp.items()} for mp in dec['marginals']]
+
+    redundancy = sum(cov.mask_keyspace(m) for m in parsed) - dec['covered']
+    total = dec['total']
+    percent = (100.0 * dec['covered'] / total) if total else None
+    return {
+        'length': length,
+        'empty': False,
+        'masks': len(parsed),
+        'covered': _s(dec['covered']),
+        'total': _s(total),
+        'percent': percent,
+        'atoms': atoms,
+        'positions': positions,
+        'cells': cells,
+        'marginals': marginals,
+        'truncated': dec['truncated'],
+        'redundancy': _s(redundancy),
+        'cell_count': (len(cells) if cells is not None else None),
+        'fingerprint': [len(p['atoms']) for p in positions],
+    }
