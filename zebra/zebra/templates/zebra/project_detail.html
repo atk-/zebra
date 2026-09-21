@@ -17,11 +17,12 @@
   &nbsp; <strong>{{ cracked }}/{{ total_hashes }}</strong> hashes cracked
   ({{ cracked_pct|floatformat:1 }}%)
   &nbsp;·&nbsp; <a class="btn" href="{% url 'mask_new' project.pk %}">Record an attack</a>
+  <button class="btn secondary" type="button" data-open-reco>Suggest mask</button>
   <a class="btn secondary" href="{% url 'hashes_add' project.pk %}">Add hashes</a>
   <a class="btn secondary" href="{% url 'import_results' project.pk %}">Import results</a>
 </div>
 
-<div class="card">
+<div class="card" id="benchmark">
   <h2 style="margin-top:0">Benchmark</h2>
   <p class="muted" style="margin-top:0">Hashes of this project's type
     (<code>-m {{ project.hashtype.hashcat_module|default:"?" }}</code>) that hashcat
@@ -50,7 +51,7 @@
     </div>
     <button class="btn secondary" type="submit" name="action" value="save">Save</button>
     {% if hashcat_available %}
-      <button class="btn" type="submit" name="action" value="run"
+      <button class="btn" type="submit" name="action" value="run" data-run-benchmark
               {% if not project.hashtype %}disabled{% endif %}>Run benchmark</button>
     {% endif %}
   </form>
@@ -382,6 +383,158 @@
     div.innerHTML = parts.join('<br>');
     return div;
   }
+})();
+</script>
+
+<div class="modal-backdrop" id="reco-modal" hidden
+     data-url="{% url 'recommend' project.pk %}"
+     data-benchurl="{% url 'project_detail' project.pk %}">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="reco-title">
+    <div class="modal-head">
+      <h3 id="reco-title">Suggest a mask</h3>
+      <button class="modal-close" type="button" data-close-reco aria-label="Close">&times;</button>
+    </div>
+    <p class="muted" style="margin:6px 0 0">Pick roughly how long you want the next
+      run to take. zebra suggests a mask of about that size that overlaps as little
+      as possible with what you've already run.</p>
+    <div class="seg" id="reco-durations">
+      {% for label, seconds in reco_durations %}
+      <button type="button" data-seconds="{{ seconds }}">{{ label }}</button>
+      {% endfor %}
+    </div>
+    <form id="reco-custom" style="display:flex; gap:8px; align-items:center; margin:8px 0 2px;">
+      <label for="reco-minutes" style="margin:0; font-weight:400; color:var(--muted); font-size:13px;">or</label>
+      <input type="number" id="reco-minutes" min="1" step="1" placeholder="minutes"
+             style="flex:1; min-width:0; padding:8px; border:1px solid var(--line);
+                    border-radius:8px; font:14px ui-monospace,monospace;">
+      <button type="submit" class="btn secondary" style="flex:none;">Suggest</button>
+    </form>
+    <div id="reco-body"></div>
+  </div>
+</div>
+
+<script>
+// Recommender popup: on choosing a duration, fetch ranked mask suggestions and
+// render them. Keyspace counts arrive as strings (JS integer precision) and are
+// only grouped for display; all sizing/overlap math was done server-side.
+(function () {
+  var modal = document.getElementById('reco-modal');
+  if (!modal) return;
+  var body = document.getElementById('reco-body');
+  var segs = modal.querySelectorAll('#reco-durations button');
+  var customForm = document.getElementById('reco-custom');
+  var minutesInput = document.getElementById('reco-minutes');
+  var benchUrl = modal.dataset.benchurl;
+
+  function open() { modal.hidden = false; }
+  function close() {
+    modal.hidden = true;
+    segs.forEach(function (b) { b.classList.remove('active'); });
+    minutesInput.value = '';
+    body.innerHTML = '';
+  }
+  document.querySelectorAll('[data-open-reco]').forEach(function (b) {
+    b.addEventListener('click', open);
+  });
+  modal.querySelectorAll('[data-close-reco]').forEach(function (b) {
+    b.addEventListener('click', close);
+  });
+  modal.addEventListener('click', function (e) { if (e.target === modal) close(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !modal.hidden) close();
+  });
+
+  function grp(s) { return String(s).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
+  // Fetch and render suggestions for a duration in seconds.
+  function run(seconds) {
+    body.innerHTML = '<p class="muted">Computing&hellip;</p>';
+    fetch(modal.dataset.url + '?seconds=' + encodeURIComponent(seconds))
+      .then(function (r) { return r.json(); })
+      .then(render)
+      .catch(function (e) { body.innerHTML = '<p class="viz-note">Failed: ' + esc(e) + '</p>'; });
+  }
+
+  segs.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      segs.forEach(function (b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      minutesInput.value = '';
+      run(btn.dataset.seconds);
+    });
+  });
+
+  customForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var minutes = parseInt(minutesInput.value, 10);
+    if (!(minutes > 0)) {
+      body.innerHTML = '<p class="viz-note">Enter a whole number of minutes.</p>';
+      return;
+    }
+    segs.forEach(function (b) { b.classList.remove('active'); });
+    run(minutes * 60);
+  });
+
+  function render(d) {
+    if (!d.ok) {
+      if (d.error === 'no-benchmark') {
+        body.innerHTML = '<div class="note warn">Set a <a href="' + benchUrl
+          + '#benchmark">benchmark</a> first — the recommendation scales the mask'
+          + ' size to your machine\'s speed.</div>';
+      } else {
+        body.innerHTML = '<div class="note warn">' + esc(d.error) + '</div>';
+      }
+      return;
+    }
+    var recs = d.recommendations || [];
+    var html = '<p class="muted" style="margin:12px 0 4px">At <b>' + esc(d.benchmark_h)
+      + 'H/s</b>, a <b>' + esc(d.budget_label) + '</b> run covers about <b>' + esc(d.target_h)
+      + '</b> candidates. Suggested masks:</p>';
+    if (!recs.length) {
+      html += '<p class="muted">No mask fits — try a different duration or widen the'
+        + ' project universe.</p>';
+      body.innerHTML = html;
+      return;
+    }
+    recs.forEach(function (r, i) {
+      var ov = r.zero_overlap
+        ? '<span class="pill ok">no overlap</span>'
+        : '<span class="pill warn">' + r.overlap_pct.toFixed(2) + '% already covered</span>';
+      html += '<div class="reco' + (i === 0 ? ' top' : '') + '">'
+        + '<div class="reco-pattern">' + esc(r.pattern) + ' ' + ov + '</div>'
+        + '<div class="reco-meta">'
+        + 'keyspace <b>' + esc(r.keyspace_h) + '</b> (' + grp(r.keyspace) + ' candidates)'
+        + ' &middot; length <b>' + r.length + '</b>'
+        + ' &middot; est. runtime <b>~' + esc(r.est_label) + '</b>'
+        + '</div>'
+        + '<a class="btn" href="' + r.record_url + '">Record this attack</a>'
+        + '</div>';
+    });
+    body.innerHTML = html;
+  }
+})();
+</script>
+
+<script>
+// Benchmark can block the request for up to 180s (synchronous). Swap the button
+// to a throbber while we wait for the redirect. The swap is deferred to the next
+// tick so the form still submits this button's name/value (a disabled button is
+// excluded from the POST), then it is disabled to prevent a double run.
+(function () {
+  var btn = document.querySelector('[data-run-benchmark]');
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    if (btn.disabled) return;
+    setTimeout(function () {
+      btn.innerHTML = '<span class="throbber"></span>Benchmarking&hellip;';
+      btn.disabled = true;
+    }, 0);
+  });
 })();
 </script>
 

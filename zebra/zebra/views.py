@@ -19,19 +19,47 @@ def index(request):
     return render(request, 'zebra/index.html', {'projects': projects})
 
 
-def _format_hashrate(value):
-    """Render an H/s integer as a compact human string, e.g. '12.34 GH/s'.
+# Duration magnitudes offered by the recommender popup (label -> seconds).
+RECO_DURATIONS = [
+    ('5 minutes', 300),
+    ('1 hour', 3600),
+    ('1 day', 86400),
+    ('1 week', 604800),
+]
+_RECO_SECONDS = {s for _, s in RECO_DURATIONS}
+
+
+def _format_duration(seconds):
+    """Human 'about N units' string for a (possibly fractional) second count."""
+    seconds = float(seconds)
+    for unit, size in (('week', 604800), ('day', 86400), ('hour', 3600),
+                       ('minute', 60), ('second', 1)):
+        if seconds >= size or unit == 'second':
+            n = seconds / size
+            return '%s %s%s' % (('%.1f' % n).rstrip('0').rstrip('.'),
+                                unit, '' if 0.95 <= n < 1.05 else 's')
+
+
+def _humanize_count(value):
+    """Compact SI-suffixed magnitude for a big number, e.g. 12340000 -> '12.34 M'.
 
     Returns None for a falsy/None value so templates can branch on it.
     """
     if not value:
         return None
     n = float(value)
-    for suffix in ('', 'K', 'M', 'G', 'T', 'P'):
-        if abs(n) < 1000 or suffix == 'P':
-            return ('%.0f %sH/s' % (n, suffix) if suffix == '' or n >= 100
-                    else '%.2f %sH/s' % (n, suffix))
+    for suffix in ('', 'K', 'M', 'G', 'T', 'P', 'E'):
+        if abs(n) < 1000 or suffix == 'E':
+            unit = (suffix + ' ') if suffix else ''
+            return ('%.0f %s' % (n, unit) if suffix == '' or n >= 100
+                    else '%.2f %s' % (n, unit)).strip()
         n /= 1000.0
+
+
+def _format_hashrate(value):
+    """Render an H/s integer as a compact human string, e.g. '12.34 M H/s'."""
+    human = _humanize_count(value)
+    return None if human is None else human + ' H/s'
 
 
 # Predefined project universes (value -> hashcat charset spec stored on the project).
@@ -111,6 +139,7 @@ def project_detail(request, pk):
         'hashcat_available': hc.HashcatRunner().available(),
         'bench_message': request.GET.get('bench_msg'),
         'bench_error': request.GET.get('bench_error'),
+        'reco_durations': RECO_DURATIONS,
     }
     return render(request, 'zebra/project_detail.html', context)
 
@@ -154,7 +183,8 @@ def project_benchmark(request, pk):
             return redirect(detail + '?bench_error='
                             + quote('hashcat is not installed on this machine.'))
         try:
-            speed, _raw = runner.benchmark(project.hashtype.hashcat_module)
+            speed, _raw = runner.benchmark(project.hashtype.hashcat_module,
+                                           timeout=180)
         except hc.HashcatError as exc:
             return redirect(detail + '?bench_error='
                             + quote('Benchmark failed: %s' % exc))
@@ -217,6 +247,25 @@ def run_detail(request, pk):
         'launch_error': request.GET.get('error'),
     }
     return render(request, 'zebra/run_detail.html', context)
+
+
+def run_status_json(request, pk):
+    """Live status of a run (polled by the detail page instead of full reloads).
+
+    Returns the fields that change while a mask attack runs, so the page can
+    update the progress bar / speed in place and only do a single full reload
+    once ``running`` flips false (to render cracks, controls, final status).
+    """
+    run = get_object_or_404(Run, pk=pk)
+    return JsonResponse({
+        'status': run.status,
+        'running': run.status == 'running',
+        'progress': run.progress,
+        'percent': 100.0 * (run.progress or 0.0),
+        'speed_hs': str(run.speed_hs) if run.speed_hs else None,
+        'speed_h': _format_hashrate(run.speed_hs),
+        'cracks': run.cracks.count(),
+    })
 
 
 def run_start(request, pk):
@@ -335,6 +384,9 @@ def mask_new(request, pk):
         'rule_names': list(RuleSet.objects.values_list('name', flat=True)),
     }
     if request.method != 'POST' or project.hashtype is None:
+        # Prefill the mask from a query param (e.g. the recommender's "Record"
+        # link) so the form opens ready to evaluate/record.
+        context['pattern'] = (request.GET.get('pattern') or '').strip()
         return render(request, 'zebra/mask_new.html', context)
 
     # --- common inputs (echoed back for re-render) ---
@@ -461,6 +513,56 @@ def import_results(request, pk):
         except Exception as exc:  # surface parse errors to the user
             context['error'] = '%s: %s' % (type(exc).__name__, exc)
     return render(request, 'zebra/import_results.html', context)
+
+
+def recommend_json(request, pk):
+    """Mask suggestions for a time budget (JSON; feeds the recommender popup).
+
+    Query param ``seconds`` = the chosen duration magnitude. Needs the project's
+    benchmark (target keyspace = benchmark_hs * seconds) and hash type. Keyspace
+    counts are sent as strings (JS loses integer precision past 2**53); durations
+    ride along both as raw seconds and a preformatted label.
+    """
+    project = get_object_or_404(Project, pk=pk)
+    try:
+        seconds = int(request.GET.get('seconds') or 0)
+    except ValueError:
+        seconds = 0
+    if seconds <= 0:
+        return JsonResponse({'ok': False, 'error': 'Choose a duration.'})
+    if project.benchmark_hs is None:
+        return JsonResponse({'ok': False, 'error': 'no-benchmark'})
+
+    rate = int(project.benchmark_hs)
+    target = rate * seconds
+    recs = ch.project_recommendations(project, target)
+    items = []
+    for r in recs:
+        est = r['keyspace'] / rate if rate else 0
+        overlap = r['overlap']
+        items.append({
+            'pattern': r['pattern'],
+            'length': r['length'],
+            'keyspace': str(r['keyspace']),
+            'keyspace_h': _humanize_count(r['keyspace']) or '0',
+            'overlap': str(overlap),
+            'overlap_pct': (100.0 * overlap / r['keyspace']) if r['keyspace'] else 0.0,
+            'zero_overlap': overlap == 0,
+            'est_seconds': est,
+            'est_label': _format_duration(est),
+            'record_url': reverse('mask_new', args=[project.pk]) + '?pattern='
+                          + quote(r['pattern']),
+        })
+    return JsonResponse({
+        'ok': True,
+        'seconds': seconds,
+        'budget_label': _format_duration(seconds),
+        'benchmark_hs': str(rate),
+        'benchmark_h': _humanize_count(rate),
+        'target': str(target),
+        'target_h': _humanize_count(target),
+        'recommendations': items,
+    })
 
 
 def coverage_decomposition_json(request, pk, length):

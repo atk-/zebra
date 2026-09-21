@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from .models import Wildcard, Mask
 from .services import coverage as cov
+from .services import recommend as rec
 
 
 def project_wildcard_map():
@@ -104,6 +105,53 @@ def evaluate_candidate(project, pattern, custom_charsets=None):
         'overlap': keyspace - marginal,
         'subsumed': marginal == 0 and keyspace > 0,
     }
+
+
+# --- Mask recommender (glue) ------------------------------------------------
+
+# Character classes the recommender builds masks from. The four core classes
+# (l/u/d/s) are pairwise disjoint, so two core-only masks collide only when they
+# are the identical class-tuple. ``a`` (all 95 printable ASCII = l+u+d+s) is also
+# offered: it reaches big keyspaces in fewer positions, at the cost of overlapping
+# any core mask -- but overlap is computed exactly by the engine, so such masks
+# are simply ranked below zero-overlap ones rather than being wrong.
+_RECO_CLASSES = ['l', 'u', 'd', 's', 'a']
+
+
+def project_token_sizes(universe_chars):
+    """Usable ``{class symbol: size}`` for a project's universe.
+
+    A class is offered only when it is wholly within the universe (so masks stay
+    in scope -- e.g. ``?a`` is dropped unless every one of its 95 characters is in
+    the universe). With no universe set, every class is offered; for an exotic
+    custom universe that contains no whole class, fall back to the core four so
+    the recommender still has something to work with.
+    """
+    sizes = {}
+    for sym in _RECO_CLASSES:
+        chars = set(cov.BUILTIN_CHARSETS[sym])
+        if universe_chars is None or chars <= universe_chars:
+            sizes[sym] = len(chars)
+    if not sizes:
+        sizes = {sym: len(cov.BUILTIN_CHARSETS[sym]) for sym in ('l', 'u', 'd', 's')}
+    return sizes
+
+
+def project_recommendations(project, target, top_n=5):
+    """Ranked mask suggestions for a project given a keyspace ``target``.
+
+    Gathers the project's already-covered masks and in-scope classes, then defers
+    to the pure ``recommend`` engine. Returns its ranked list (may be empty).
+    """
+    wmap = project_wildcard_map()
+    existing = []
+    for m in covered_masks(project):
+        try:
+            existing.append(mask_positions(m, wmap))
+        except cov.MaskParseError:
+            continue
+    token_sizes = project_token_sizes(expand_universe(project.universe))
+    return rec.recommend(int(target), existing, token_sizes, top_n=top_n)
 
 
 # --- Search-space decomposition (visualization glue) ------------------------

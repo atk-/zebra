@@ -520,6 +520,42 @@ class LauncherUnitTests(TestCase):
             runner = hc.HashcatRunner(binary=_write_stub(d, 'exit 1\n'))
             self.assertIn('already running', launcher.start_run(run, runner=runner))
 
+    def test_stop_recovers_orphaned_run(self):
+        # A run left 'running' after a server restart: no thread, no live pid.
+        run = self._mask_run(status='running')
+        run.pid = 999999  # not a hashcat process (recovery must not signal it)
+        run.save(update_fields=['pid'])
+        self.assertIsNone(launcher.stop_run(run))
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'aborted')
+        self.assertIsNone(run.pid)
+        self.assertIsNotNone(run.ended_at)
+        # No longer blocks new launches.
+        self.assertFalse(Run.objects.filter(status='running').exists())
+
+    def test_stop_live_run_signals_and_leaves_status_to_thread(self):
+        import signal
+        run = self._mask_run(status='running')
+
+        class _FakeProc:
+            def __init__(self): self.signals = []
+            def send_signal(self, sig): self.signals.append(sig)
+
+        proc = _FakeProc()
+        with launcher._lock:
+            launcher._active[run.pk] = proc
+        try:
+            self.assertIsNone(launcher.stop_run(run))
+        finally:
+            with launcher._lock:
+                launcher._active.pop(run.pk, None)
+        self.assertEqual(proc.signals, [signal.SIGINT])
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'running')  # the worker thread finalises it
+
+    def test_pid_is_hashcat_false_for_bogus_pid(self):
+        self.assertFalse(launcher._pid_is_hashcat(999999))
+
 
 class LauncherExecuteTests(TransactionTestCase):
     """Drive the spawn->stream->finalise->ingest path with a stub binary,
@@ -767,3 +803,193 @@ class CoverageDecompositionTests(SimpleTestCase):
 
     def test_empty_masks_return_none(self):
         self.assertIsNone(cov.coverage_decomposition([]))
+
+
+from .services import recommend as rec
+
+
+class RecommendEngineTests(SimpleTestCase):
+    """Pure recommender: fit a keyspace budget, prefer zero overlap."""
+
+    SIZES = {'l': 26, 'u': 26, 'd': 10, 's': 33}
+
+    def test_canonical_pattern_orders_classes(self):
+        # u, l, d, s regardless of input order; keyspace is order-independent.
+        self.assertEqual(rec.canonical_pattern(['d', 'l', 'u']), '?u?l?d')
+        self.assertEqual(rec.canonical_pattern(['s', 'd', 'l', 'u']), '?u?l?d?s')
+
+    def test_picks_mask_near_target(self):
+        target = 26 ** 4 * 10 ** 2  # exactly ?u?l?l?l?d?d-sized (6 positions)
+        out = rec.recommend(target, [], self.SIZES, top_n=1)
+        self.assertEqual(len(out), 1)
+        best = out[0]
+        # closest achievable keyspace should equal the target exactly here
+        self.assertEqual(best['keyspace'], target)
+        self.assertAlmostEqual(best['log_dist'], 0.0, places=9)
+
+    def test_prefers_zero_overlap_over_covered(self):
+        # Cover ?u?l?l?l?d?d exactly; a same-size suggestion must avoid it.
+        covered = [P('?u?l?l?l?d?d')]
+        target = cov.mask_keyspace(P('?u?l?l?l?d?d'))
+        out = rec.recommend(target, covered, self.SIZES, top_n=5)
+        self.assertTrue(out)
+        self.assertEqual(out[0]['overlap'], 0)  # top suggestion is fully new
+        self.assertNotEqual(out[0]['pattern'], '?u?l?l?l?d?d')
+
+    def test_overlap_is_exact_for_identical_core_mask(self):
+        # With disjoint core classes, the only overlap is an identical class-tuple.
+        covered = [P('?u?l?l?l?d?d')]
+        ks = cov.mask_keyspace(P('?u?l?l?l?d?d'))
+        # force the identical mask to be the sole candidate via a 1-class-size dict
+        out = rec.recommend(ks, covered, self.SIZES, top_n=20)
+        same = [r for r in out if r['pattern'] == '?u?l?l?l?d?d']
+        if same:  # if it surfaces at all, its overlap must be its whole keyspace
+            self.assertEqual(same[0]['overlap'], same[0]['keyspace'])
+
+    def test_diversity_caps_equal_keyspace_variants(self):
+        target = 26 ** 6 * 10 ** 4
+        out = rec.recommend(target, [], self.SIZES, top_n=6, max_per_keyspace=2)
+        seen = {}
+        for r in out:
+            seen[r['keyspace']] = seen.get(r['keyspace'], 0) + 1
+        self.assertTrue(all(v <= 2 for v in seen.values()))
+
+    def test_empty_when_no_budget_or_tokens(self):
+        self.assertEqual(rec.recommend(0, [], self.SIZES), [])
+        self.assertEqual(rec.recommend(1000, [], {}), [])
+
+
+class RecommendViewTests(TestCase):
+    """The recommend.json endpoint and its benchmark/hashtype guards."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='reco-ht', hashcat_module=987654)
+        self.project = Project.objects.create(
+            name='reco-view', hashtype=self.ht, universe='?l?u?d',
+            benchmark_hs=10_000_000_000)
+        Hash.objects.create(hashstring='a' * 32, project=self.project)
+
+    def _get(self, seconds):
+        return self.client.get(
+            '/zebra/project/%d/recommend.json?seconds=%s' % (self.project.pk, seconds))
+
+    def test_recommendations_fit_budget_and_are_new(self):
+        d = self._get(300).json()
+        self.assertTrue(d['ok'])
+        self.assertEqual(d['seconds'], 300)
+        self.assertTrue(d['recommendations'])
+        top = d['recommendations'][0]
+        self.assertTrue(top['zero_overlap'])
+        # est. runtime within an order of magnitude of the 5-minute budget
+        self.assertLess(top['est_seconds'], 3000)
+        self.assertGreater(top['est_seconds'], 30)
+        # keyspace is a string (JS precision) and parses as a big int
+        self.assertIsInstance(top['keyspace'], str)
+        int(top['keyspace'])
+
+    def test_missing_benchmark_flagged(self):
+        self.project.benchmark_hs = None
+        self.project.save()
+        self.assertEqual(self._get(300).json()['error'], 'no-benchmark')
+
+    def test_bad_duration_rejected(self):
+        self.assertFalse(self._get(0).json()['ok'])
+        self.assertFalse(self._get('abc').json()['ok'])
+
+    def test_record_link_prefills_mask_form(self):
+        top = self._get(3600).json()['recommendations'][0]
+        r = self.client.get(top['record_url'])
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'value="%s"' % top['pattern'])
+
+
+from .services import hashcat as hcsvc
+
+
+class ParseBenchmarkTests(SimpleTestCase):
+    """Speed parsing from --machine-readable benchmark output (hashcat v6)."""
+
+    def test_single_device_takes_last_field_not_sentinel(self):
+        # Real MD5 line: last field is the ~375 MH/s speed; the 4294967295
+        # (0xFFFFFFFF) fields are placeholders and must be ignored.
+        line = '1:0:4294967295:4294967295:62.19:375777106'
+        self.assertEqual(hcsvc.parse_benchmark(line), 375777106)
+
+    def test_slow_hash_below_sentinel_is_not_clamped(self):
+        # ~95 MH/s < 0xFFFFFFFF: the old max() heuristic returned the sentinel.
+        line = '1:1400:4294967295:4294967295:79.74:95000000'
+        self.assertEqual(hcsvc.parse_benchmark(line), 95000000)
+
+    def test_multiple_devices_sum(self):
+        text = ('1:0:4294967295:4294967295:62.19:200000000\n'
+                '2:0:4294967295:4294967295:60.01:150000000\n')
+        self.assertEqual(hcsvc.parse_benchmark(text), 350000000)
+
+    def test_ignores_non_device_lines(self):
+        text = 'hashcat (v6.2.6) starting in benchmark mode\n\n1:0:0:0:1.0:12345\n'
+        self.assertEqual(hcsvc.parse_benchmark(text), 12345)
+
+    def test_empty_output(self):
+        self.assertEqual(hcsvc.parse_benchmark(''), 0)
+
+
+class RecommendTokenSizesTests(SimpleTestCase):
+    """Which character classes the recommender offers for a given universe."""
+
+    def test_all_class_offered_when_no_universe(self):
+        sizes = ch.project_token_sizes(None)
+        self.assertEqual(sizes.get("a"), 95)
+        self.assertEqual(set(sizes), {'l', 'u', 'd', 's', 'a'})
+
+    def test_all_class_dropped_when_universe_excludes_symbols(self):
+        # ?l?u?d universe: ?a (which needs symbols) is out of scope.
+        alnum = cov.expand_charset('?l?u?d')
+        sizes = ch.project_token_sizes(alnum)
+        self.assertNotIn('a', sizes)
+        self.assertNotIn('s', sizes)
+        self.assertEqual(set(sizes), {'l', 'u', 'd'})
+
+    def test_all_class_offered_for_full_ascii_universe(self):
+        sizes = ch.project_token_sizes(cov.expand_charset('?a'))
+        self.assertEqual(sizes.get("a"), 95)
+
+    def test_recommender_can_propose_an_all_mask(self):
+        sizes = ch.project_token_sizes(None)
+        target = 94 ** 5  # exactly ?a?a?a?a?a
+        out = rec.recommend(target, [], sizes, top_n=5)
+        self.assertTrue(any('?a' in r['pattern'] for r in out))
+
+
+class RunStatusJsonTests(TestCase):
+    """The live-status endpoint the running detail page polls (AJAX)."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='S-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='STATUS', hashtype=self.ht)
+        self.mask = Mask.objects.create(project=self.project, pattern='?d?d?d')
+
+    def _run(self, **kw):
+        return Run.objects.create(project=self.project, mask=self.mask,
+                                  attack_mode=3, **kw)
+
+    def test_running_payload(self):
+        from decimal import Decimal
+        run = self._run(status='running', progress=0.25, speed_hs=Decimal('395000000'))
+        d = self.client.get('/zebra/run/%d/status.json' % run.pk).json()
+        self.assertTrue(d['running'])
+        self.assertEqual(d['percent'], 25.0)
+        self.assertEqual(d['speed_hs'], '395000000')
+        self.assertIn('H/s', d['speed_h'])
+
+    def test_finished_run_reports_not_running(self):
+        run = self._run(status='exhausted', progress=1.0)
+        d = self.client.get('/zebra/run/%d/status.json' % run.pk).json()
+        self.assertFalse(d['running'])
+        self.assertEqual(d['status'], 'exhausted')
+
+    def test_running_page_polls_instead_of_reloading(self):
+        run = self._run(status='running', progress=0.1)
+        body = self.client.get('/zebra/run/%d/' % run.pk).content.decode()
+        self.assertIn('status.json', body)
+        self.assertIn('id="run-bar"', body)
+        self.assertNotIn('location.reload(); }, 3000', body)  # no blind full reload

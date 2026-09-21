@@ -204,23 +204,28 @@ def parse_status_json(text):
 
 
 def parse_benchmark(text):
-    """Best-effort total speed (H/s) from --machine-readable benchmark output.
+    """Total speed (H/s) from ``hashcat -b --machine-readable`` output.
 
-    Machine-readable lines are colon-separated numeric fields; the H/s figure
-    dwarfs device id / exec-ms / util, so we take the largest numeric field on
-    each line and sum across lines. Returns an int (0 if nothing parseable).
+    Each device line is colon-separated, e.g. (hashcat v6)::
+
+        1:0:4294967295:4294967295:62.19:375777106
+        dev  mode  <----sentinels---->  exec_ms  speed(H/s)
+
+    The **last** field is the per-device H/s; we sum it across device lines. The
+    two ``4294967295`` (0xFFFFFFFF) fields are placeholders -- an earlier "largest
+    field per line" heuristic latched onto that sentinel (2**32-1) and reported a
+    bogus ~4.29 GH/s for any hash slower than that. Returns an int (0 if none).
     """
     total = 0
     for line in text.splitlines():
-        nums = []
-        for field in line.strip().split(':'):
-            try:
-                nums.append(float(field))
-            except ValueError:
-                pass
-        if nums:
-            total += max(nums)
-    return int(total)
+        fields = line.strip().split(':')
+        if len(fields) < 3:
+            continue  # not a benchmark device line (needs at least dev:mode:...:speed)
+        try:
+            total += int(float(fields[-1]))
+        except ValueError:
+            continue  # banner / non-numeric line
+    return total
 
 
 # --- Django-side ingest -----------------------------------------------------

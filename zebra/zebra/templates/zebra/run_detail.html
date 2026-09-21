@@ -20,15 +20,42 @@
   {% if launch_error %}<div class="note warn">{{ launch_error }}</div>{% endif %}
   {% if run.status == 'running' %}
     <p><strong>Running…</strong>
-      {% if run.speed_hs %}· {{ run.speed_hs }} H/s{% endif %}
-      · {% widthratio run.progress 1 100 %}%</p>
-    <div class="bar"><span style="width:{% widthratio run.progress 1 100 %}%"></span></div>
+      <span id="run-speed">{% if run.speed_hs %}· {{ run.speed_hs }} H/s{% endif %}</span>
+      · <span id="run-pct">{% widthratio run.progress 1 100 %}</span>%</p>
+    <div class="bar"><span id="run-bar" style="width:{% widthratio run.progress 1 100 %}%"></span></div>
     <form method="post" action="{% url 'run_stop' run.pk %}" style="margin-top:12px"
           onsubmit="return confirm('Stop this attack?');">
       {% csrf_token %}
       <button class="btn danger" type="submit">Stop</button>
     </form>
-    <script>setTimeout(function () { location.reload(); }, 3000);</script>
+    <script>
+    // Poll status.json and update progress in place -- no full-page reload while
+    // running. Stand down once a form (Stop/Delete) is actually submitting, so
+    // the poll never aborts that POST navigation. Reload once when the run
+    // finishes, to render the final status, controls, and any cracks.
+    (function () {
+      var url = "{% url 'run_status' run.pk %}";
+      var bar = document.getElementById('run-bar');
+      var pct = document.getElementById('run-pct');
+      var speed = document.getElementById('run-speed');
+      var submitting = false;
+      document.addEventListener('submit', function (e) {
+        if (!e.defaultPrevented) submitting = true;  // confirm() accepted
+      });
+      function poll() {
+        if (submitting) return;
+        fetch(url).then(function (r) { return r.json(); }).then(function (d) {
+          if (submitting) return;
+          if (!d.running) { location.reload(); return; }  // finished -> full render, once
+          pct.textContent = d.percent.toFixed(0);
+          bar.style.width = d.percent + '%';
+          speed.textContent = d.speed_h ? '· ' + d.speed_h : '';
+          setTimeout(poll, 3000);
+        }).catch(function () { setTimeout(poll, 5000); });  // retry on a transient error
+      }
+      setTimeout(poll, 3000);
+    })();
+    </script>
   {% elif run.attack_mode == 3 and hashcat_available %}
     <form method="post" action="{% url 'run_start' run.pk %}">
       {% csrf_token %}

@@ -59,6 +59,30 @@
   .breadcrumb a:hover { color:var(--accent); text-decoration:underline; }
   .breadcrumb .sep { margin:0 8px; color:var(--line); }
   .breadcrumb .current { color:var(--fg); font-weight:600; }
+  /* --- modal (recommender popup) --- */
+  .modal-backdrop { position:fixed; inset:0; background:rgba(15,23,42,.45);
+         display:flex; align-items:flex-start; justify-content:center;
+         padding:40px 16px; z-index:50; overflow-y:auto; }
+  .modal-backdrop[hidden] { display:none; }
+  .modal { background:var(--card); border-radius:12px; width:100%; max-width:640px;
+         box-shadow:0 20px 60px rgba(0,0,0,.3); padding:20px 22px 22px; }
+  .modal-head { display:flex; align-items:baseline; justify-content:space-between; gap:12px; }
+  .modal-head h3 { margin:0; font-size:18px; }
+  .modal-close { background:none; border:0; font-size:22px; line-height:1;
+         color:var(--muted); cursor:pointer; padding:0 4px; }
+  .seg { display:flex; flex-wrap:wrap; gap:8px; margin:14px 0 4px; }
+  .seg button { flex:1 1 auto; min-width:80px; padding:8px 10px; border:1px solid var(--line);
+         border-radius:8px; background:var(--card); color:var(--fg); cursor:pointer; font-size:14px; }
+  .seg button.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .reco { border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin:10px 0; }
+  .reco.top { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .reco-pattern { font:15px ui-monospace,SFMono-Regular,Menlo,monospace; font-weight:600; }
+  .reco-meta { color:var(--muted); font-size:12.5px; margin:6px 0 10px; line-height:1.7; }
+  .reco-meta b { color:var(--fg); font-weight:600; }
+  .throbber { display:inline-block; width:1em; height:1em; border:2px solid rgba(255,255,255,.4);
+         border-top-color:#fff; border-radius:50%; animation:spin .6s linear infinite;
+         vertical-align:-2px; margin-right:6px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
   /* --- search-space visualization --- */
   .cov-toggle { background:none; border:0; cursor:pointer; font-size:14px;
          color:var(--muted); padding:0 4px; line-height:1; }

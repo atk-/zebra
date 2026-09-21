@@ -200,17 +200,49 @@ def _execute(run, proc, fd, workdir, pot):
         connection.close()
 
 
+def _pid_is_hashcat(pid):
+    """Best-effort check that ``pid`` is a live hashcat process (Linux /proc).
+
+    Guards the orphan-recovery path from signalling an unrelated process that has
+    since reused the recorded pid. Returns False if the pid is gone, not ours, or
+    /proc is unreadable (non-Linux)."""
+    try:
+        with open('/proc/%d/cmdline' % pid, 'rb') as f:
+            return b'hashcat' in f.read()
+    except OSError:
+        return False
+
+
 def stop_run(run):
-    """Ask a running attack to stop (SIGINT = hashcat's clean checkpoint-abort)."""
+    """Stop a running attack, or recover an orphaned one.
+
+    If a worker thread is actively managing the run (its process is in ``_active``),
+    SIGINT it and let the thread record the final status -- SIGINT is hashcat's
+    clean checkpoint-abort.
+
+    Otherwise the run is *orphaned*: its thread is gone (typically a server
+    restart), so nothing will ever move it out of ``running`` and it keeps blocking
+    new launches. We SIGINT any surviving hashcat pid (best effort), then mark the
+    run ``aborted`` here so the state machine is unstuck.
+    """
     with _lock:
         proc = _active.get(run.pk)
-    try:
-        if proc is not None:
+    if proc is not None:
+        try:
             proc.send_signal(signal.SIGINT)
-        elif run.pid:
+        except (ProcessLookupError, OSError) as exc:
+            return 'Could not stop the process: %s' % exc
+        return None
+
+    # Orphaned run: no live thread is tracking it.
+    if run.pid and _pid_is_hashcat(run.pid):
+        try:
             os.kill(run.pid, signal.SIGINT)
-        else:
-            return 'This attack is not running.'
-    except (ProcessLookupError, OSError) as exc:
-        return 'Could not stop the process: %s' % exc
+        except OSError:
+            pass  # died between the check and the signal -- fine, we abort below
+    if run.status == 'running':
+        run.status = 'aborted'
+        run.pid = None
+        run.ended_at = timezone.now()
+        run.save(update_fields=['status', 'pid', 'ended_at'])
     return None
