@@ -19,6 +19,21 @@ def index(request):
     return render(request, 'zebra/index.html', {'projects': projects})
 
 
+def _format_hashrate(value):
+    """Render an H/s integer as a compact human string, e.g. '12.34 GH/s'.
+
+    Returns None for a falsy/None value so templates can branch on it.
+    """
+    if not value:
+        return None
+    n = float(value)
+    for suffix in ('', 'K', 'M', 'G', 'T', 'P'):
+        if abs(n) < 1000 or suffix == 'P':
+            return ('%.0f %sH/s' % (n, suffix) if suffix == '' or n >= 100
+                    else '%.2f %sH/s' % (n, suffix))
+        n /= 1000.0
+
+
 # Predefined project universes (value -> hashcat charset spec stored on the project).
 UNIVERSE_PRESETS = {'digits': '?d', 'alnum': '?l?u?d', 'all': '?a'}
 
@@ -92,8 +107,67 @@ def project_detail(request, pk):
         'universe_chars': ch.expand_universe(project.universe),
         'runs': (Run.objects.filter(project=project).select_related('mask')
                  .prefetch_related('cracks', 'hashes', 'wordlists', 'rules')[:50]),
+        'benchmark_display': _format_hashrate(project.benchmark_hs),
+        'hashcat_available': hc.HashcatRunner().available(),
+        'bench_message': request.GET.get('bench_msg'),
+        'bench_error': request.GET.get('bench_error'),
     }
     return render(request, 'zebra/project_detail.html', context)
+
+
+def project_benchmark(request, pk):
+    """Set the project's benchmark (H/s): save a manual value or run ``hashcat -b``.
+
+    POST-only; both actions redirect back to the project page with a flash
+    message or error in the query string.
+    """
+    project = get_object_or_404(Project, pk=pk)
+    detail = reverse('project_detail', args=[pk])
+    if request.method != 'POST':
+        return redirect(detail)
+
+    action = request.POST.get('action')
+    if action == 'save':
+        raw = (request.POST.get('benchmark_hs') or '').strip().replace(',', '')
+        if not raw:
+            project.benchmark_hs = None
+            project.save(update_fields=['benchmark_hs'])
+            return redirect(detail + '?bench_msg=' + quote('Benchmark cleared.'))
+        try:
+            value = int(Decimal(raw))
+            if value < 0:
+                raise ValueError
+        except (ValueError, ArithmeticError):
+            return redirect(detail + '?bench_error='
+                            + quote('Enter a whole number of hashes per second.'))
+        project.benchmark_hs = value
+        project.save(update_fields=['benchmark_hs'])
+        return redirect(detail + '?bench_msg='
+                        + quote('Benchmark set to %s H/s.' % value))
+
+    if action == 'run':
+        if project.hashtype is None:
+            return redirect(detail + '?bench_error='
+                            + quote('This project has no hash type to benchmark.'))
+        runner = hc.HashcatRunner()
+        if not runner.available():
+            return redirect(detail + '?bench_error='
+                            + quote('hashcat is not installed on this machine.'))
+        try:
+            speed, _raw = runner.benchmark(project.hashtype.hashcat_module)
+        except hc.HashcatError as exc:
+            return redirect(detail + '?bench_error='
+                            + quote('Benchmark failed: %s' % exc))
+        if not speed:
+            return redirect(detail + '?bench_error='
+                            + quote('hashcat produced no parseable speed.'))
+        project.benchmark_hs = speed
+        project.save(update_fields=['benchmark_hs'])
+        return redirect(detail + '?bench_msg='
+                        + quote('Benchmarked %s at %s H/s.'
+                                % (project.hashtype.name, speed)))
+
+    return redirect(detail)
 
 
 def run_detail(request, pk):

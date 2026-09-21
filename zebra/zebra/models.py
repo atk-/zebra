@@ -13,6 +13,12 @@ class Project(models.Model):
     # "remaining" search space (total per length = len(universe) ** length).
     # If blank, coverage totals fall back to the union of charsets actually used.
     universe = models.CharField(max_length=1000, blank=True, null=True)
+    # Measured/estimated hashcat speed (H/s) for this project's hash type on the
+    # current machine -- either entered by hand or filled from ``hashcat -m N -b``.
+    # DecimalField (not BigIntegerField) because hash rates for fast modes overflow
+    # 64 bits; the engine treats it as a plain int.
+    benchmark_hs = models.DecimalField(max_digits=80, decimal_places=0,
+                                       null=True, blank=True)
 
     def __str__(self):
         return self.name

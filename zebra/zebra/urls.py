@@ -12,5 +12,6 @@ urlpatterns = [
     path("run/<int:pk>/start/", views.run_start, name="run_start"),
     path("run/<int:pk>/stop/", views.run_stop, name="run_stop"),
     path("project/<int:pk>/import/", views.import_results, name="import_results"),
+    path("project/<int:pk>/benchmark/", views.project_benchmark, name="project_benchmark"),
     path("project/<int:pk>/coverage/<int:length>.json", views.coverage_decomposition_json, name="coverage_decomposition"),
 ]

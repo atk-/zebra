@@ -21,6 +21,49 @@
   <a class="btn secondary" href="{% url 'import_results' project.pk %}">Import results</a>
 </div>
 
+<div class="card">
+  <h2 style="margin-top:0">Benchmark</h2>
+  <p class="muted" style="margin-top:0">Hashes of this project's type
+    (<code>-m {{ project.hashtype.hashcat_module|default:"?" }}</code>) that hashcat
+    tries per second on this machine. Grounds run-time estimates.</p>
+
+  {% if bench_message %}<div class="note ok">{{ bench_message }}</div>{% endif %}
+  {% if bench_error %}<div class="note warn">{{ bench_error }}</div>{% endif %}
+
+  <p>
+    {% if project.benchmark_hs %}
+      <strong>{{ benchmark_display }}</strong>
+      <span class="muted">({{ project.benchmark_hs }} H/s)</span>
+    {% else %}
+      <span class="muted">No benchmark set yet.</span>
+    {% endif %}
+  </p>
+
+  <form method="post" action="{% url 'project_benchmark' project.pk %}"
+        style="display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap;">
+    {% csrf_token %}
+    <div style="flex:1; min-width:200px;">
+      <label for="benchmark_hs" style="margin-top:0">Set manually (H/s)</label>
+      <input type="text" id="benchmark_hs" name="benchmark_hs" inputmode="numeric"
+             value="{{ project.benchmark_hs|default:'' }}"
+             placeholder="e.g. 1200000000">
+    </div>
+    <button class="btn secondary" type="submit" name="action" value="save">Save</button>
+    {% if hashcat_available %}
+      <button class="btn" type="submit" name="action" value="run"
+              {% if not project.hashtype %}disabled{% endif %}>Run benchmark</button>
+    {% endif %}
+  </form>
+  {% if hashcat_available %}
+    <p class="muted" style="margin-bottom:0">Run benchmark launches
+      <code>hashcat -m {{ project.hashtype.hashcat_module|default:"?" }} -b</code>
+      and may take a moment.</p>
+  {% else %}
+    <p class="muted" style="margin-bottom:0">hashcat is not installed on this machine,
+      so it can only be entered manually.</p>
+  {% endif %}
+</div>
+
 <h2>Coverage by password length</h2>
 {% if coverage %}
 <table>
