@@ -1,4 +1,5 @@
 {% extends "zebra/base.html" %}
+{% load humanize %}
 {% block title %}Record an attack — {{ project.name }}{% endblock %}
 {% block content %}
 <h1>Record an attack</h1>
@@ -92,17 +93,27 @@
 <div class="card">
   <h2 style="margin-top:0">Evaluation</h2>
   <p>Length <strong>{{ evaluation.length }}</strong> ·
-     candidate keyspace <strong>{{ evaluation.keyspace }}</strong></p>
+     candidate keyspace <strong>{{ evaluation.keyspace|intcomma }}</strong></p>
+  {% if duration %}
+    <p>Expected runtime <strong>~{{ duration.label }}</strong>
+      <span class="muted">at {{ duration.benchmark_h }} H/s</span></p>
+  {% else %}
+    <p class="muted">Set a <a href="{% url 'project_detail' project.pk %}#benchmark">benchmark</a>
+      to estimate this attack's runtime.</p>
+  {% endif %}
   {% if evaluation.subsumed %}
-    <div class="note warn"><strong>Redundant.</strong> Already fully covered by
-      exhausted keyspace — it would add nothing new.</div>
+    <div class="note warn"><strong>Redundant.</strong>
+      {{ evaluation.overlap|intcomma }} of {{ evaluation.keyspace|intcomma }}
+      ({{ evaluation.overlap_pct|floatformat:2 }}%) are already exhausted — it would
+      add nothing new.</div>
   {% elif evaluation.overlap %}
     <div class="note warn"><strong>Partial overlap.</strong>
-      {{ evaluation.overlap }} of {{ evaluation.keyspace }} candidates are already
-      exhausted; only <strong>{{ evaluation.marginal }}</strong> would be new.</div>
+      {{ evaluation.overlap|intcomma }} of {{ evaluation.keyspace|intcomma }}
+      ({{ evaluation.overlap_pct|floatformat:2 }}%) are already exhausted;
+      only <strong>{{ evaluation.marginal|intcomma }}</strong> would be new.</div>
   {% else %}
     <div class="note ok"><strong>All new.</strong> No overlap with exhausted keyspace —
-      adds {{ evaluation.marginal }} candidates.</div>
+      adds {{ evaluation.marginal|intcomma }} candidates.</div>
   {% endif %}
   {% if command %}<p class="muted" style="margin-bottom:4px">Generated command:</p>
     <code class="cmd">{{ command }}</code>{% endif %}

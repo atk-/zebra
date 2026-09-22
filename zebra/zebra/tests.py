@@ -993,3 +993,64 @@ class RunStatusJsonTests(TestCase):
         self.assertIn('status.json', body)
         self.assertIn('id="run-bar"', body)
         self.assertNotIn('location.reload(); }, 3000', body)  # no blind full reload
+
+
+class EvaluateDurationTests(TestCase):
+    """The Evaluate button estimates a mask attack's runtime when a benchmark is set."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='D-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='DURTEST', hashtype=self.ht)
+        Hash.objects.create(hashstring='dh1', project=self.project, cracked=False)
+
+    def _evaluate(self, pattern):
+        return self.client.post('/zebra/project/%d/mask/new/' % self.project.pk,
+                                {'pattern': pattern, 'custom_charsets': '',
+                                 'status': 'planned', 'action': 'preview'})
+
+    def test_duration_shown_when_benchmark_set(self):
+        from decimal import Decimal
+        self.project.benchmark_hs = Decimal('1000000000')  # 1 GH/s
+        self.project.save()
+        # 10**13 candidates / 1e9 = 10000 s ≈ 2.8 hours
+        r = self._evaluate('?d?d?d?d?d?d?d?d?d?d?d?d?d')
+        self.assertContains(r, 'Expected runtime')
+        self.assertContains(r, '2.8 hours')
+
+    def test_hint_shown_when_no_benchmark(self):
+        r = self._evaluate('?d?d?d')
+        self.assertNotContains(r, 'Expected runtime')
+        self.assertContains(r, 'to estimate this attack')
+
+
+class NumberFormattingTests(TestCase):
+    """Big numbers get thousands separators; overlap shows a percentage."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='N-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='NUMTEST', hashtype=self.ht,
+                                              universe='0123456789')
+        Hash.objects.create(hashstring='nh1', project=self.project, cracked=False)
+        # Cover ?d?d?d?d?d?d (1,000,000) as exhausted.
+        m = Mask.objects.create(project=self.project, pattern='?d?d?d?d?d?d')
+        ch.compute_and_cache_keyspace(m); m.save()
+        run = Run.objects.create(mask=m, project=self.project, attack_mode=3,
+                                 status='exhausted')
+        run.hashes.set(self.project.hash_set.all())
+
+    def test_evaluate_candidate_reports_overlap_pct(self):
+        # Re-evaluating the exhausted mask: fully overlapping (100%).
+        ev = ch.evaluate_candidate(self.project, '?d?d?d?d?d?d')
+        self.assertEqual(ev['overlap'], 1_000_000)
+        self.assertAlmostEqual(ev['overlap_pct'], 100.0)
+
+    def test_evaluate_page_shows_x_of_y_percent(self):
+        r = self.client.post('/zebra/project/%d/mask/new/' % self.project.pk,
+                             {'pattern': '?d?d?d?d?d?d', 'custom_charsets': '',
+                              'status': 'planned', 'action': 'preview'})
+        self.assertContains(r, '1,000,000 of 1,000,000')
+        self.assertContains(r, '100.00%')
+
+    def test_coverage_numbers_have_thousands_separators(self):
+        d = self.client.get('/zebra/project/%d/' % self.project.pk)
+        self.assertContains(d, '1,000,000')  # covered / total grouped

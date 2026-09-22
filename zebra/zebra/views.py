@@ -172,7 +172,7 @@ def project_benchmark(request, pk):
         project.benchmark_hs = value
         project.save(update_fields=['benchmark_hs'])
         return redirect(detail + '?bench_msg='
-                        + quote('Benchmark set to %s H/s.' % value))
+                        + quote('Benchmark set to {:,} H/s.'.format(value)))
 
     if action == 'run':
         if project.hashtype is None:
@@ -194,8 +194,8 @@ def project_benchmark(request, pk):
         project.benchmark_hs = speed
         project.save(update_fields=['benchmark_hs'])
         return redirect(detail + '?bench_msg='
-                        + quote('Benchmarked %s at %s H/s.'
-                                % (project.hashtype.name, speed)))
+                        + quote('Benchmarked {} at {:,} H/s.'.format(
+                            project.hashtype.name, speed)))
 
     return redirect(detail)
 
@@ -216,7 +216,7 @@ def run_detail(request, pk):
     if m == 3 and run.mask:
         specs.append(('Mask', run.mask.pattern))
         if run.mask.keyspace is not None:
-            specs.append(('Keyspace', run.mask.keyspace))
+            specs.append(('Keyspace', '{:,}'.format(int(run.mask.keyspace))))
         if run.mask.custom_charsets:
             specs.append(('Custom charsets', _charsets(run.mask.custom_charsets)))
     elif m == 0:
@@ -263,6 +263,7 @@ def run_status_json(request, pk):
         'progress': run.progress,
         'percent': 100.0 * (run.progress or 0.0),
         'speed_hs': str(run.speed_hs) if run.speed_hs else None,
+        'speed_grouped': '{:,}'.format(int(run.speed_hs)) if run.speed_hs else None,
         'speed_h': _format_hashrate(run.speed_hs),
         'cracks': run.cracks.count(),
     })
@@ -426,6 +427,16 @@ def mask_new(request, pk):
         context['evaluation'] = evaluation
         if evaluation.get('error'):
             return render(request, 'zebra/mask_new.html', context)
+        # Expected runtime = full mask keyspace / benchmark (hashcat runs the whole
+        # mask regardless of overlap). Only when a benchmark is set for the project.
+        if project.benchmark_hs and evaluation.get('keyspace'):
+            rate = int(project.benchmark_hs)
+            seconds = evaluation['keyspace'] / rate
+            context['duration'] = {
+                'seconds': seconds,
+                'label': _format_duration(seconds),
+                'benchmark_h': _humanize_count(rate),
+            }
         context['command'] = runner.plan_run(
             3, module, hashfile=hashfile,
             params={'mask': pattern, 'custom_charsets': custom})

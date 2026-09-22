@@ -1,4 +1,5 @@
 {% extends "zebra/base.html" %}
+{% load humanize %}
 {% block title %}{{ project.name }} — zebra{% endblock %}
 {% block breadcrumb %}
 <nav class="breadcrumb" aria-label="Breadcrumb">
@@ -34,7 +35,7 @@
   <p>
     {% if project.benchmark_hs %}
       <strong>{{ benchmark_display }}</strong>
-      <span class="muted">({{ project.benchmark_hs }} H/s)</span>
+      <span class="muted">({{ project.benchmark_hs|intcomma }} H/s)</span>
     {% else %}
       <span class="muted">No benchmark set yet.</span>
     {% endif %}
@@ -74,9 +75,9 @@
     <td><button class="cov-toggle" type="button" data-target="cov-panel-{{ row.length }}" aria-expanded="false" title="Show search-space breakdown">&#9656;</button></td>
     <td>{{ row.length }}</td>
     <td>{{ row.masks }}</td>
-    <td>{{ row.covered }}</td>
-    <td>{% if row.total %}{{ row.total }}{% else %}&mdash;{% endif %}</td>
-    <td>{% if row.remaining is not None %}{{ row.remaining }}{% else %}&mdash;{% endif %}</td>
+    <td>{{ row.covered|intcomma }}</td>
+    <td>{% if row.total %}{{ row.total|intcomma }}{% else %}&mdash;{% endif %}</td>
+    <td>{% if row.remaining is not None %}{{ row.remaining|intcomma }}{% else %}&mdash;{% endif %}</td>
     <td>
       <div class="bar"><span style="width:{{ row.percent|floatformat:4 }}%"></span></div>
       <span class="muted">{{ row.percent|floatformat:4 }}%</span>
@@ -111,7 +112,7 @@
     </td>
     <td>{{ r.hashes.count }}</td>
     <td>{{ r.cracks.count }}</td>
-    <td>{% if r.mask %}{{ r.mask.keyspace|default:"—" }}{% else %}—{% endif %}</td>
+    <td>{% if r.mask and r.mask.keyspace is not None %}{{ r.mask.keyspace|intcomma }}{% else %}—{% endif %}</td>
     <td class="muted">{{ r.created_at }}</td>
   </tr>
   {% endfor %}

@@ -97,12 +97,14 @@ def evaluate_candidate(project, pattern, custom_charsets=None):
             continue
     keyspace = cov.mask_keyspace(positions)
     marginal = cov.marginal_keyspace(positions, existing)
+    overlap = keyspace - marginal
     return {
         'error': None,
         'length': len(positions),
         'keyspace': keyspace,
         'marginal': marginal,
-        'overlap': keyspace - marginal,
+        'overlap': overlap,
+        'overlap_pct': (100.0 * overlap / keyspace) if keyspace else 0.0,
         'subsumed': marginal == 0 and keyspace > 0,
     }
 
