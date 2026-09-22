@@ -19,6 +19,7 @@ Limitations (by design for a local single-operator tool):
 
 import os
 import pty
+import re
 import shutil
 import signal
 import tempfile
@@ -31,6 +32,23 @@ from ..models import Run
 from . import hashcat as hc
 
 POLL_SECONDS = 10  # send hashcat an 's' keypress this often to refresh status
+
+
+def _session_name(run):
+    """Filesystem-safe hashcat ``--session`` name identifying this run.
+
+    Always starts with ``zebra`` and carries the project number + a slug of its
+    name and the attack (run) number, e.g. ``zebra-p3-ad-dump-2024-a17``, so
+    hashcat's restore/session files are recognisable and don't collide.
+    """
+    parts = ['zebra']
+    if run.project_id:
+        parts.append('p%d' % run.project_id)
+        slug = re.sub(r'[^a-z0-9]+', '-', (run.project.name or '').lower()).strip('-')
+        if slug:
+            parts.append(slug[:24])
+    parts.append('a%d' % run.pk)
+    return '-'.join(parts)
 
 # run_id -> subprocess.Popen for the currently-running attack(s).
 _active = {}
@@ -113,7 +131,7 @@ def start_run(run, runner=None):
                 'increment_max': run.mask.increment_max},
         extra=['--status', '--status-json', '--status-timer', str(POLL_SECONDS),
                '--potfile-path', pot, '--restore-disable',
-               '--session', 'zebra-%d' % run.pk])
+               '--session', _session_name(run)])
 
     # Run under a PTY so hashcat flushes status promptly and accepts 's' keypresses.
     try:
@@ -131,7 +149,15 @@ def start_run(run, runner=None):
     run.started_at = timezone.now()
     run.ended_at = None
     run.pid = proc.pid
-    run.save(update_fields=['status', 'progress', 'started_at', 'ended_at', 'pid'])
+    # Seed the increment sweep counter so "(1/N runs)" shows before the first
+    # status arrives; hashcat's live guess_base_offset/count refine it as it runs.
+    if run.mask and run.mask.is_incremental:
+        lo, hi = run.mask.increment_min, run.mask.increment_max
+        hi = min(hi, run.mask.length) if hi is not None else run.mask.length
+        run.increment_offset = 0
+        run.increment_count = max(1, hi - lo + 1)
+    run.save(update_fields=['status', 'progress', 'started_at', 'ended_at', 'pid',
+                            'increment_offset', 'increment_count'])
     with _lock:
         _active[run.pk] = proc
     threading.Thread(target=_execute, args=(run, proc, master_fd, workdir, pot),
@@ -165,7 +191,8 @@ def _execute(run, proc, fd, workdir, pot):
                 summary = hc.parse_status_json(line)
             except ValueError:
                 continue
-            live = {k: v for k, v in summary.items() if k in ('progress', 'speed_hs')}
+            live = {k: v for k, v in summary.items()
+                    if k in ('progress', 'speed_hs', 'base_offset', 'base_count')}
             if live:
                 hc.ingest_status(run, live)  # progress/speed only; status from exit code
 

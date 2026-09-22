@@ -1,5 +1,5 @@
 {% extends "zebra/base.html" %}
-{% load humanize %}
+{% load humanize zebra_extras %}
 {% block title %}{{ project.name }} — zebra{% endblock %}
 {% block breadcrumb %}
 <nav class="breadcrumb" aria-label="Breadcrumb">
@@ -67,6 +67,28 @@
 </div>
 
 <h2>Coverage by password length</h2>
+{% if coverage_total %}
+<div class="card" style="display:flex; flex-wrap:wrap; gap:8px 28px; align-items:baseline;">
+  <div>
+    <div class="muted" style="font-size:12px; text-transform:uppercase; letter-spacing:.05em;">Candidates covered</div>
+    <div style="font-size:22px; font-weight:700;">{{ coverage_total.covered|bignum }}</div>
+  </div>
+  {% if coverage_total.space %}
+  <div>
+    <div class="muted" style="font-size:12px; text-transform:uppercase; letter-spacing:.05em;">Campaign progress</div>
+    <div style="font-size:22px; font-weight:700;">{{ coverage_total.percent|floatformat:4 }}%
+      <span class="muted" style="font-size:13px; font-weight:400;">of {{ coverage_total.space|bignum }}</span></div>
+  </div>
+  <div>
+    <div class="muted" style="font-size:12px; text-transform:uppercase; letter-spacing:.05em;">Remaining</div>
+    <div style="font-size:22px; font-weight:700;">{{ coverage_total.remaining|bignum }}
+      {% if coverage_total.remaining_eta %}<span class="muted" style="font-size:13px; font-weight:400;">(~{{ coverage_total.remaining_eta }})</span>{% endif %}</div>
+  </div>
+  {% endif %}
+  <div class="muted" style="font-size:12px; align-self:flex-end;">across lengths
+    {{ coverage_total.min_length }}–{{ coverage_total.max_length }}</div>
+</div>
+{% endif %}
 {% if coverage %}
 <table>
   <tr><th style="width:1.5em"></th><th>Length</th><th>Masks</th><th>Covered</th><th>Total</th><th>Remaining</th><th style="width:30%">Coverage</th></tr>
@@ -75,9 +97,10 @@
     <td><button class="cov-toggle" type="button" data-target="cov-panel-{{ row.length }}" aria-expanded="false" title="Show search-space breakdown">&#9656;</button></td>
     <td>{{ row.length }}</td>
     <td>{{ row.masks }}</td>
-    <td>{{ row.covered|intcomma }}</td>
-    <td>{% if row.total %}{{ row.total|intcomma }}{% else %}&mdash;{% endif %}</td>
-    <td>{% if row.remaining is not None %}{{ row.remaining|intcomma }}{% else %}&mdash;{% endif %}</td>
+    <td>{{ row.covered|bignum }}</td>
+    <td>{% if row.total %}{{ row.total|bignum }}{% else %}&mdash;{% endif %}</td>
+    <td>{% if row.remaining is not None %}{{ row.remaining|bignum }}{% if row.remaining_eta %}
+        <span class="muted">(~{{ row.remaining_eta }})</span>{% endif %}{% else %}&mdash;{% endif %}</td>
     <td>
       <div class="bar"><span style="width:{{ row.percent|floatformat:4 }}%"></span></div>
       <span class="muted">{{ row.percent|floatformat:4 }}%</span>
@@ -112,7 +135,7 @@
     </td>
     <td>{{ r.hashes.count }}</td>
     <td>{{ r.cracks.count }}</td>
-    <td>{% if r.mask and r.mask.keyspace is not None %}{{ r.mask.keyspace|intcomma }}{% else %}—{% endif %}</td>
+    <td>{% if r.mask and r.mask.keyspace is not None %}{{ r.mask.keyspace|bignum }}{% else %}—{% endif %}</td>
     <td class="muted">{{ r.created_at }}</td>
   </tr>
   {% endfor %}

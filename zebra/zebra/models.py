@@ -178,7 +178,11 @@ class Run(models.Model):
     command = models.CharField(max_length=4096, null=True, blank=True)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='planned')
     speed_hs = models.DecimalField(max_digits=80, decimal_places=0, null=True, blank=True)
-    progress = models.FloatField(default=0.0)  # 0..1
+    progress = models.FloatField(default=0.0)  # 0..1 (of the current sub-run)
+    # Live position within a --increment sweep: which of how many length sub-runs
+    # hashcat is on. offset is 0-based; both null for a non-incremental run.
+    increment_offset = models.IntegerField(null=True, blank=True)
+    increment_count = models.IntegerField(null=True, blank=True)
     pid = models.IntegerField(null=True, blank=True)  # OS pid while running (launcher)
     started_at = models.DateTimeField(null=True, blank=True)
     ended_at = models.DateTimeField(null=True, blank=True)

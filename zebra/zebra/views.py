@@ -120,18 +120,52 @@ def project_new(request):
     return render(request, 'zebra/project_new.html', context)
 
 
+def _coverage_total(coverage, rate):
+    """Campaign-wide rollup across the per-length coverage rows.
+
+    Candidate sets of different lengths are disjoint, so covered/total add across
+    lengths. Returns None when nothing is covered yet. ``space`` / ``percent`` /
+    ``remaining`` are filled only when every attacked length has a known total
+    (i.e. a fixed project universe); ``remaining_eta`` also needs a benchmark.
+    """
+    if not coverage:
+        return None
+    covered = sum(r['covered'] for r in coverage)
+    totals = [r['total'] for r in coverage]
+    lengths = [r['length'] for r in coverage]
+    known = all(t is not None for t in totals)
+    space = sum(totals) if known else None
+    remaining = max(space - covered, 0) if known else None
+    percent = min(100.0 * covered / space, 100.0) if space else None
+    eta = _format_duration(remaining / rate) if rate and remaining else None
+    return {
+        'covered': covered, 'space': space, 'remaining': remaining,
+        'percent': percent, 'remaining_eta': eta,
+        'min_length': min(lengths), 'max_length': max(lengths),
+    }
+
+
 def project_detail(request, pk):
     project = get_object_or_404(Project, pk=pk)
     hashes = project.hash_set.all()
     cracked = hashes.filter(cracked=True).count()
     total_hashes = hashes.count()
+    coverage = ch.project_coverage(project)
+    # Annotate each length's remaining keyspace with an approximate time to
+    # exhaust it (remaining / benchmark), when a benchmark is set.
+    rate = int(project.benchmark_hs) if project.benchmark_hs else 0
+    for row in coverage:
+        rem = row['remaining']
+        row['remaining_eta'] = (_format_duration(rem / rate)
+                                if rate and rem else None)
     context = {
+        'coverage_total': _coverage_total(coverage, rate),
         'project': project,
         'hashes': hashes,
         'cracked': cracked,
         'total_hashes': total_hashes,
         'cracked_pct': (100.0 * cracked / total_hashes) if total_hashes else 0.0,
-        'coverage': ch.project_coverage(project),
+        'coverage': coverage,
         'universe_chars': ch.expand_universe(project.universe),
         'runs': (Run.objects.filter(project=project).select_related('mask')
                  .prefetch_related('cracks', 'hashes', 'wordlists', 'rules')[:50]),
@@ -269,6 +303,9 @@ def run_status_json(request, pk):
         'speed_grouped': '{:,}'.format(int(run.speed_hs)) if run.speed_hs else None,
         'speed_h': _format_hashrate(run.speed_hs),
         'cracks': run.cracks.count(),
+        # --increment sweep position: 1-based current sub-run and the total.
+        'run_index': (run.increment_offset + 1) if run.increment_offset is not None else None,
+        'run_total': run.increment_count,
     })
 
 

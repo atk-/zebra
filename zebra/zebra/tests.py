@@ -1228,3 +1228,200 @@ class IncrementViewTests(TestCase):
         self.assertTrue(incr)                              # a sweep suggestion is offered
         self.assertIn('increment=1', incr[0]['record_url'])
         self.assertIn('increment_max=', incr[0]['record_url'])
+
+
+class CoverageDisplayClampTests(TestCase):
+    """?b/?c can exceed the universe; the dashboard clamps remaining >=0, %<=100."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='CLAMP-MD5', hashcat_module=0)
+        # Universe is digits only, but we search ?b (256 bytes) -> covered > total.
+        self.project = Project.objects.create(name='CLAMP', hashtype=self.ht,
+                                              universe='0123456789')
+        Hash.objects.create(hashstring='ch1', project=self.project, cracked=False)
+
+    def test_remaining_and_percent_are_clamped(self):
+        mask = Mask.objects.create(project=self.project, pattern='?b?b')  # 256*256
+        ch.compute_and_cache_keyspace(mask); mask.save()
+        run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                                 status='exhausted')
+        run.hashes.set(self.project.hash_set.all())
+        row = next(r for r in ch.project_coverage(self.project) if r['length'] == 2)
+        self.assertGreater(row['covered'], row['total'])  # genuinely over-covered
+        self.assertEqual(row['remaining'], 0)             # not negative
+        self.assertEqual(row['percent'], 100.0)           # not >100
+
+
+class IncrementProgressTests(TestCase):
+    """The (X/Y runs) counter for an incremental sweep."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='IP-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='IPROG', hashtype=self.ht)
+        Hash.objects.create(hashstring='ip1', project=self.project, cracked=False)
+
+    def test_parse_status_json_extracts_increment_position(self):
+        line = ('{"status":3,"guess":{"guess_base":"?a?a?a?a?a?a",'
+                '"guess_base_offset":1,"guess_base_count":3},'
+                '"progress":[133693440,735091890625]}')
+        s = hcsvc.parse_status_json(line)
+        self.assertEqual(s['base_offset'], 1)
+        self.assertEqual(s['base_count'], 3)
+
+    def test_ingest_status_stores_position_on_run(self):
+        mask = Mask.objects.create(project=self.project, pattern='?d?d?d',
+                                   increment_min=1, increment_max=3)
+        run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                                 status='running')
+        hcsvc.ingest_status(run, {'base_offset': 2, 'base_count': 3, 'progress': 0.5})
+        run.refresh_from_db()
+        self.assertEqual(run.increment_offset, 2)
+        self.assertEqual(run.increment_count, 3)
+
+    def test_status_json_view_reports_1based_counter(self):
+        mask = Mask.objects.create(project=self.project, pattern='?d?d?d',
+                                   increment_min=1, increment_max=3)
+        run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                                 status='running', increment_offset=1, increment_count=3)
+        d = self.client.get('/zebra/run/%d/status.json' % run.pk).json()
+        self.assertEqual(d['run_index'], 2)   # offset 1 -> "2/3"
+        self.assertEqual(d['run_total'], 3)
+
+    def test_non_incremental_run_has_no_counter(self):
+        mask = Mask.objects.create(project=self.project, pattern='?d?d?d')
+        run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                                 status='running')
+        d = self.client.get('/zebra/run/%d/status.json' % run.pk).json()
+        self.assertIsNone(d['run_index'])
+        self.assertIsNone(d['run_total'])
+
+
+from .templatetags.zebra_extras import bignum
+
+
+class BignumFilterTests(SimpleTestCase):
+    def test_commas_up_to_12_digits(self):
+        self.assertEqual(bignum(1000), '1,000')
+        self.assertEqual(bignum(999_999_999_999), '999,999,999,999')  # 12 digits
+
+    def test_scientific_past_12_digits(self):
+        self.assertEqual(bignum(1_000_000_000_000), '1.00 × 10¹²')    # 13 digits
+        self.assertEqual(bignum(68_987_765_456_789), '6.90 × 10¹³')
+        self.assertEqual(bignum(95 ** 12), '5.40 × 10²³')
+
+    def test_passthrough_non_numeric(self):
+        self.assertIsNone(bignum(None))
+        self.assertEqual(bignum('—'), '—')
+
+
+class RemainingEtaTests(TestCase):
+    """The Remaining column shows an approximate time-to-exhaust when benchmarked."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='ETA-MD5', hashcat_module=0)
+        # alnum universe (62), so a digits-only exhausted mask leaves lots remaining
+        self.project = Project.objects.create(name='ETA', hashtype=self.ht,
+                                              universe='?l?u?d',
+                                              benchmark_hs=10_000_000_000)  # 10 GH/s
+        Hash.objects.create(hashstring='eh1', project=self.project, cracked=False)
+
+    def _cover(self, pattern, custom_charsets=None):
+        mask = Mask.objects.create(project=self.project, pattern=pattern,
+                                   custom_charsets=custom_charsets or {})
+        ch.compute_and_cache_keyspace(mask); mask.save()
+        run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                                 status='exhausted')
+        run.hashes.set(self.project.hash_set.all())
+
+    def test_eta_present_when_remaining_positive(self):
+        self._cover('?d?d?d?d?d?d?d?d')          # 10^8 covered; total 62^8, big remainder
+        resp = self.client.get('/zebra/project/%d/' % self.project.pk)
+        row = next(r for r in resp.context['coverage'] if r['length'] == 8)
+        self.assertGreater(row['remaining'], 0)
+        self.assertIsNotNone(row['remaining_eta'])
+        # remaining ~2.18e14 / 1e10 ~ 6 hours
+        self.assertIn('hour', row['remaining_eta'])
+        self.assertContains(resp, '(~' + row['remaining_eta'] + ')')
+        self.assertContains(resp, '× 10')           # remaining shown as n × 10ᵏ
+
+    def test_no_eta_when_fully_covered(self):
+        # ?1?1?1 with 1=?l?u?d == 62^3, the whole length-3 universe -> remaining 0
+        self._cover('?1?1?1', custom_charsets={'1': '?l?u?d'})
+        resp = self.client.get('/zebra/project/%d/' % self.project.pk)
+        row = next(r for r in resp.context['coverage'] if r['length'] == 3)
+        self.assertEqual(row['remaining'], 0)
+        self.assertIsNone(row['remaining_eta'])
+
+    def test_no_eta_without_benchmark(self):
+        self.project.benchmark_hs = None
+        self.project.save()
+        self._cover('?d?d?d?d?d?d?d?d')
+        resp = self.client.get('/zebra/project/%d/' % self.project.pk)
+        row = next(r for r in resp.context['coverage'] if r['length'] == 8)
+        self.assertIsNone(row['remaining_eta'])
+
+
+class CoverageTotalTests(TestCase):
+    """Grand-total (cross-length) coverage rollup on the dashboard."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='GT-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='GT', hashtype=self.ht,
+                                              universe='0123456789',  # digits
+                                              benchmark_hs=1_000_000)  # 1 MH/s
+        Hash.objects.create(hashstring='gh1', project=self.project, cracked=False)
+
+    def _cover(self, pattern):
+        mask = Mask.objects.create(project=self.project, pattern=pattern)
+        ch.compute_and_cache_keyspace(mask); mask.save()
+        run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                                 status='exhausted')
+        run.hashes.set(self.project.hash_set.all())
+
+    def test_rollup_sums_across_lengths(self):
+        self._cover('?d?d')     # len 2: covered 100, total 100
+        self._cover('?d?d?d')   # len 3: covered 1000, total 1000
+        resp = self.client.get('/zebra/project/%d/' % self.project.pk)
+        tot = resp.context['coverage_total']
+        self.assertEqual(tot['covered'], 1100)          # 100 + 1000
+        self.assertEqual(tot['space'], 1100)            # digits universe, fully covered
+        self.assertEqual(tot['percent'], 100.0)
+        self.assertEqual(tot['remaining'], 0)
+        self.assertEqual((tot['min_length'], tot['max_length']), (2, 3))
+        self.assertContains(resp, 'Candidates covered')
+
+    def test_rollup_none_without_coverage(self):
+        resp = self.client.get('/zebra/project/%d/' % self.project.pk)
+        self.assertIsNone(resp.context['coverage_total'])
+        self.assertNotContains(resp, 'Candidates covered')
+
+    def test_rollup_percent_clamped_when_over_universe(self):
+        # ?b?b (65536) exhausted but universe is digits: covered > total per length,
+        # so the rollup percent must clamp to 100 and remaining to 0.
+        self._cover('?b?b')
+        tot = self.client.get('/zebra/project/%d/' % self.project.pk).context['coverage_total']
+        self.assertEqual(tot['percent'], 100.0)
+        self.assertEqual(tot['remaining'], 0)
+
+
+class SessionNameTests(TestCase):
+    """hashcat --session names identify the project and attack."""
+
+    def test_session_name_has_zebra_project_and_attack(self):
+        ht = HashType.objects.create(name='SN-MD5', hashcat_module=0)
+        project = Project.objects.create(name='AD Dump 2024!', hashtype=ht)
+        mask = Mask.objects.create(project=project, pattern='?d?d')
+        run = Run.objects.create(mask=mask, project=project, attack_mode=3, status='planned')
+        name = launcher._session_name(run)
+        self.assertTrue(name.startswith('zebra-'))
+        self.assertIn('p%d' % project.pk, name)         # project number
+        self.assertIn('a%d' % run.pk, name)             # attack number
+        self.assertIn('ad-dump-2024', name)             # slugified project name
+        # filesystem-safe: only lowercase alnum and dashes
+        self.assertRegex(name, r'^[a-z0-9-]+$')
+
+    def test_session_name_without_project_name(self):
+        ht = HashType.objects.create(name='SN2-MD5', hashcat_module=0)
+        project = Project.objects.create(name='X', hashtype=ht)
+        run = Run.objects.create(project=project, attack_mode=3, status='planned')
+        self.assertRegex(launcher._session_name(run), r'^zebra-p\d+-x-a\d+$')

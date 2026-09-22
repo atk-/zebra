@@ -90,8 +90,12 @@ def project_coverage(project):
             'masks': data['masks'],
             'covered': covered,
             'total': total,
-            'remaining': (total - covered) if total else None,
-            'percent': percent,
+            # Clamp for display: ?b/?c can search beyond the project universe, so
+            # covered may exceed total. Cap remaining at 0 and coverage at 100%
+            # rather than showing negatives / >100% (the underlying mismatch is a
+            # separate, deferred issue).
+            'remaining': max(total - covered, 0) if total else None,
+            'percent': min(percent, 100.0),
         })
     return rows
 

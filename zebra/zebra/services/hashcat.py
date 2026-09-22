@@ -256,7 +256,9 @@ def parse_status_json(text):
     """Parse hashcat ``--status-json`` output into a small summary dict.
 
     Returns keys: status (int), progress (float 0..1), speed_hs (int),
-    recovered (int), recovered_total (int). Missing fields are omitted.
+    recovered (int), recovered_total (int), and for --increment runs
+    base_offset (0-based current length sub-run) / base_count (total sub-runs).
+    Missing fields are omitted.
     """
     data = json.loads(text)
     out = {}
@@ -273,6 +275,13 @@ def parse_status_json(text):
     rec = data.get('recovered_hashes')
     if isinstance(rec, list) and len(rec) == 2:
         out['recovered'], out['recovered_total'] = rec[0], rec[1]
+    guess = data.get('guess')
+    if isinstance(guess, dict):
+        # --increment sweep position: which length sub-run of how many.
+        if guess.get('guess_base_offset') is not None:
+            out['base_offset'] = guess['guess_base_offset']
+        if guess.get('guess_base_count') is not None:
+            out['base_count'] = guess['guess_base_count']
     return out
 
 
@@ -334,6 +343,12 @@ def ingest_status(run, summary):
     if 'speed_hs' in summary:
         run.speed_hs = summary['speed_hs']
         fields.append('speed_hs')
+    if 'base_offset' in summary:
+        run.increment_offset = summary['base_offset']
+        fields.append('increment_offset')
+    if 'base_count' in summary:
+        run.increment_count = summary['base_count']
+        fields.append('increment_count')
     # hashcat status: 5 = exhausted, 6 = cracked, 7 = aborted (best-effort map)
     status_map = {5: 'exhausted', 6: 'cracked', 7: 'aborted'}
     if summary.get('status') in status_map:
