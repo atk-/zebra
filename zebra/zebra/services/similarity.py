@@ -59,7 +59,11 @@ def signature(spec):
         return '%d|w=%s|m=%s|c=%s' % (
             m, wl[0] if wl else '', (spec.get('mask') or '').strip(), csig)
     if m == 3:
-        return '3|m=%s' % (spec.get('mask') or '').strip()
+        sig = '3|m=%s' % (spec.get('mask') or '').strip()
+        inc = spec.get('increment')  # (min, max) for a --increment run
+        if inc:
+            sig += '|i=%s-%s' % (inc[0], inc[1])
+        return sig
     return '%s|?' % m
 
 

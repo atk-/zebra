@@ -85,11 +85,20 @@ class Mask(models.Model):
     # Optional hashcat custom charset definitions: {"1": "?l?d", "2": "abc", ...}
     custom_charsets = models.JSONField(default=dict, blank=True)
     length = models.IntegerField(default=0)  # number of positions, derived on save
+    # hashcat --increment: when increment_min is set, the mask is run at every length
+    # from increment_min to increment_max (the mask truncated to k positions), so it
+    # covers the union of its length-prefixes. Null means a plain single-length mask.
+    increment_min = models.IntegerField(null=True, blank=True)
+    increment_max = models.IntegerField(null=True, blank=True)
     keyspace = models.DecimalField(max_digits=80, decimal_places=0, null=True, blank=True)
     comment = models.CharField(max_length=1024, null=True, blank=True)
 
     class Meta:
         ordering = ['length', 'pattern']
+
+    @property
+    def is_incremental(self):
+        return self.increment_min is not None
 
     def __str__(self):
         return self.pattern
@@ -187,7 +196,12 @@ class Run(models.Model):
         """Human-readable one-line summary of what this run searched."""
         m, p = self.attack_mode, (self.params or {})
         if m == 3:
-            return self.mask.pattern if self.mask else '(no mask)'
+            if not self.mask:
+                return '(no mask)'
+            if self.mask.is_incremental:
+                return '%s (increment %d–%d)' % (
+                    self.mask.pattern, self.mask.increment_min, self.mask.increment_max)
+            return self.mask.pattern
         wls = list(self.wordlists.all())
         wl_names = [w.name for w in wls]
         rule_names = [r.name for r in self.rules.all()]

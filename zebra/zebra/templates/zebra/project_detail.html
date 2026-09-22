@@ -506,11 +506,16 @@
       var ov = r.zero_overlap
         ? '<span class="pill ok">no overlap</span>'
         : '<span class="pill warn">' + r.overlap_pct.toFixed(2) + '% already covered</span>';
+      var inc = r.incremental
+        ? ' <span class="pill" style="background:var(--accent);color:#fff">--increment</span>' : '';
+      var lengthMeta = r.incremental
+        ? 'sweeps lengths <b>' + esc(r.covers) + '</b> in one run'
+        : 'length <b>' + r.length + '</b>';
       html += '<div class="reco' + (i === 0 ? ' top' : '') + '">'
-        + '<div class="reco-pattern">' + esc(r.pattern) + ' ' + ov + '</div>'
+        + '<div class="reco-pattern">' + esc(r.pattern) + ' ' + ov + inc + '</div>'
         + '<div class="reco-meta">'
         + 'keyspace <b>' + esc(r.keyspace_h) + '</b> (' + grp(r.keyspace) + ' candidates)'
-        + ' &middot; length <b>' + r.length + '</b>'
+        + ' &middot; ' + lengthMeta
         + ' &middot; est. runtime <b>~' + esc(r.est_label) + '</b>'
         + '</div>'
         + '<a class="btn" href="' + r.record_url + '">Record this attack</a>'

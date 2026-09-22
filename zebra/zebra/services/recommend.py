@@ -68,8 +68,11 @@ def recommend(target, existing, token_sizes, max_len=16, per_len=12, top_n=8):
     fitting masks are all fully covered simply drops out, trading a little length
     coverage for only-useful suggestions.
 
-    Returns a list of dicts (pattern, length, keyspace, marginal, overlap,
-    log_dist), ordered by length for a readable short-to-long progression.
+    One incremental (``--increment``) "sweep" suggestion is added when applicable --
+    a single mask that covers lengths 1..N in one run -- presented first.
+
+    Returns a list of dicts (pattern, length, keyspace, marginal, overlap, log_dist,
+    incremental, increment_min, increment_max, covers); singles are ordered by length.
     """
     if target <= 0 or not token_sizes:
         return []
@@ -98,7 +101,8 @@ def recommend(target, existing, token_sizes, max_len=16, per_len=12, top_n=8):
             results.append({
                 'pattern': pattern, 'length': length, 'keyspace': keyspace,
                 'marginal': marginal, 'overlap': keyspace - marginal,
-                'log_dist': log_dist,
+                'log_dist': log_dist, 'incremental': False,
+                'increment_min': None, 'increment_max': None, 'covers': str(length),
             })
         results.sort(key=_rank_key)
         if results:
@@ -116,16 +120,43 @@ def recommend(target, existing, token_sizes, max_len=16, per_len=12, top_n=8):
     if band:
         # More applicable lengths than slots -> sample evenly across [M, N] so the
         # spread still reaches both ends of the band.
-        chosen = _even_sample(band, top_n) if len(band) > top_n else band
+        singles = _even_sample(band, top_n) if len(band) > top_n else list(band)
     else:
         # Target unreachable at any length within max_len: fall back to the
         # closest lengths so we still return something useful.
-        chosen = sorted((rs[0] for rs in scored_by_len.values()),
-                        key=_rank_key)[:top_n]
+        singles = sorted((rs[0] for rs in scored_by_len.values()),
+                         key=_rank_key)[:top_n]
 
-    # 3. Present short-to-long so the length spread reads at a glance.
-    chosen.sort(key=lambda r: (r['length'], r['log_dist']))
-    return chosen
+    # 3. Add one incremental "sweep" suggestion covering lengths 1..N in a single
+    #    --increment run (N = the longest chosen length). It reaches the same budget
+    #    while also sweeping every shorter length; presented first as the headline.
+    incremental = []
+    if singles:
+        top = max(singles, key=lambda r: r['length'])
+        entry = _incremental_entry(top['pattern'], top['length'], existing, log_target)
+        if entry is not None:
+            incremental = [entry]
+
+    # 4. Present short-to-long singles, with the sweep option first.
+    singles.sort(key=lambda r: (r['length'], r['log_dist']))
+    return (incremental + singles)[:top_n]
+
+
+def _incremental_entry(pattern, n_top, existing, log_target):
+    """An ``--increment`` sweep of ``pattern`` over lengths 1..n_top, or None if it
+    would be fully redundant. Keyspace/overlap are summed over the length-prefixes."""
+    segments = cov.mask_prefixes(cov.parse_mask(pattern), 1, n_top)
+    keyspace = sum(cov.mask_keyspace(s) for s in segments)
+    marginal = sum(cov.marginal_keyspace(s, existing) for s in segments)
+    if marginal == 0:
+        return None  # everything it sweeps is already exhausted
+    return {
+        'pattern': pattern, 'length': n_top, 'keyspace': keyspace,
+        'marginal': marginal, 'overlap': keyspace - marginal,
+        'log_dist': abs(math.log(keyspace) - log_target),
+        'incremental': True, 'increment_min': 1, 'increment_max': n_top,
+        'covers': '1-%d' % n_top,
+    }
 
 
 def _even_sample(items, k):

@@ -34,6 +34,19 @@
     <textarea name="custom_charsets" rows="2">{{ custom_charsets_raw|default:'' }}</textarea>
   </div>
 
+  {# ---- increment (mask mode 3 only) ---- #}
+  <div data-modes="3">
+    <label style="display:flex; align-items:center; gap:8px; font-weight:600;">
+      <input type="checkbox" name="increment" value="1" style="width:auto;"
+             {% if increment %}checked{% endif %}>
+      <span>Incremental (<code>--increment</code>)</span>
+    </label>
+    <span class="muted" style="font-size:13px;">Run every length from 1 up to the max
+      below (blank = the mask's length). Covers all those lengths in one run.</span>
+    <input type="text" name="increment_max" value="{{ increment_max|default:'' }}"
+           inputmode="numeric" placeholder="max length (blank = mask length)">
+  </div>
+
   {# ---- single wordlist (modes 0, 6, 7) ---- #}
   <div data-modes="0 6 7">
     <label>Wordlist</label>
@@ -93,7 +106,10 @@
 <div class="card">
   <h2 style="margin-top:0">Evaluation</h2>
   <p>Length <strong>{{ evaluation.length }}</strong> ·
-     candidate keyspace <strong>{{ evaluation.keyspace|intcomma }}</strong></p>
+     candidate keyspace <strong>{{ evaluation.keyspace|intcomma }}</strong>
+     {% if evaluation.incremental %}<br><span class="muted">Incremental
+       (<code>--increment</code>): sweeps lengths {{ evaluation.increment_min }}–{{ evaluation.increment_max }};
+       keyspace is the sum over those lengths.</span>{% endif %}</p>
   {% if duration %}
     <p>Expected runtime <strong>~{{ duration.label }}</strong>
       <span class="muted">at {{ duration.benchmark_h }} H/s</span></p>

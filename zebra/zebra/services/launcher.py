@@ -108,7 +108,9 @@ def start_run(run, runner=None):
 
     argv = runner.build_run_args(
         3, run.project.hashtype.hashcat_module, hashfile=hashpath,
-        params={'mask': run.mask.pattern, 'custom_charsets': run.mask.custom_charsets or {}},
+        params={'mask': run.mask.pattern, 'custom_charsets': run.mask.custom_charsets or {},
+                'increment_min': run.mask.increment_min,
+                'increment_max': run.mask.increment_max},
         extra=['--status', '--status-json', '--status-timer', str(POLL_SECONDS),
                '--potfile-path', pot, '--restore-disable',
                '--session', 'zebra-%d' % run.pk])

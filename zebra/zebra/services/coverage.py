@@ -132,6 +132,26 @@ def mask_keyspace(positions):
     return reduce(lambda a, s: a * len(s), positions, 1)
 
 
+def mask_prefixes(positions, inc_min, inc_max):
+    """Length-prefixes of a mask for a hashcat ``--increment`` run.
+
+    An incremental run tries the mask truncated to its first k positions (tokens)
+    for every k in ``[inc_min, inc_max]``, so it covers the union of these prefix
+    masks. Bounds are clamped to ``[1, len(positions)]``. Returns a list of parsed
+    masks (each a list of frozensets)."""
+    n = len(positions)
+    lo = max(1, inc_min)
+    hi = min(n, inc_max if inc_max is not None else n)
+    return [positions[:k] for k in range(lo, hi + 1)]
+
+
+def incremental_keyspace(positions, inc_min, inc_max):
+    """Total candidate count of an incremental mask = sum over its length-prefixes.
+
+    (Different lengths are disjoint candidate sets, so the total is a plain sum.)"""
+    return sum(mask_keyspace(p) for p in mask_prefixes(positions, inc_min, inc_max))
+
+
 # --- Atom decomposition -----------------------------------------------------
 
 def atom_partition(charsets):

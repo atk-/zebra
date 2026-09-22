@@ -215,6 +215,9 @@ def run_detail(request, pk):
     m = run.attack_mode
     if m == 3 and run.mask:
         specs.append(('Mask', run.mask.pattern))
+        if run.mask.is_incremental:
+            specs.append(('Increment', '%d–%d (--increment)' % (
+                run.mask.increment_min, run.mask.increment_max)))
         if run.mask.keyspace is not None:
             specs.append(('Keyspace', '{:,}'.format(int(run.mask.keyspace))))
         if run.mask.custom_charsets:
@@ -385,9 +388,11 @@ def mask_new(request, pk):
         'rule_names': list(RuleSet.objects.values_list('name', flat=True)),
     }
     if request.method != 'POST' or project.hashtype is None:
-        # Prefill the mask from a query param (e.g. the recommender's "Record"
+        # Prefill the mask from query params (e.g. the recommender's "Record"
         # link) so the form opens ready to evaluate/record.
         context['pattern'] = (request.GET.get('pattern') or '').strip()
+        context['increment'] = bool(request.GET.get('increment'))
+        context['increment_max'] = (request.GET.get('increment_max') or '').strip()
         return render(request, 'zebra/mask_new.html', context)
 
     # --- common inputs (echoed back for re-render) ---
@@ -402,6 +407,14 @@ def mask_new(request, pk):
     pattern = (request.POST.get('pattern') or '').strip()
     custom_raw = request.POST.get('custom_charsets', '')
     custom = _parse_custom_charsets(custom_raw)
+    # --increment (mask mode only): a checkbox + optional max; min defaults to 1.
+    increment_on = bool(request.POST.get('increment'))
+    increment_max_raw = (request.POST.get('increment_max') or '').strip()
+    try:
+        inc_max_in = int(increment_max_raw) if increment_max_raw else None
+    except ValueError:
+        inc_max_in = None
+    inc_min = 1 if increment_on else None
     wordlist = (request.POST.get('wordlist') or '').strip()
     left_wl = (request.POST.get('left_wordlist') or '').strip()
     right_wl = (request.POST.get('right_wordlist') or '').strip()
@@ -415,20 +428,26 @@ def mask_new(request, pk):
         'pattern': pattern, 'custom_charsets_raw': custom_raw,
         'wordlist': wordlist, 'left_wordlist': left_wl, 'right_wordlist': right_wl,
         'left_rule': left_rule, 'right_rule': right_rule, 'rules_raw': rules_raw,
+        'increment': increment_on, 'increment_max': increment_max_raw,
     })
 
     module = project.hashtype.hashcat_module
     runner = hc.HashcatRunner()
     hashfile = '%s.hashes' % project.name
 
-    # --- Mask (attack mode 3): exact coverage path (unchanged behaviour) ---
+    # --- Mask (attack mode 3): exact coverage path ---
     if attack_mode == 3:
-        evaluation = ch.evaluate_candidate(project, pattern, custom)
+        evaluation = ch.evaluate_candidate(project, pattern, custom,
+                                           increment_min=inc_min, increment_max=inc_max_in)
         context['evaluation'] = evaluation
         if evaluation.get('error'):
             return render(request, 'zebra/mask_new.html', context)
-        # Expected runtime = full mask keyspace / benchmark (hashcat runs the whole
-        # mask regardless of overlap). Only when a benchmark is set for the project.
+        # Concrete max (evaluate defaults a blank increment-max to the mask length).
+        inc_max = evaluation.get('increment_max')
+        mask_params = {'mask': pattern, 'custom_charsets': custom,
+                       'increment_min': inc_min, 'increment_max': inc_max}
+        # Expected runtime = keyspace / benchmark (for an incremental run, keyspace is
+        # the sum over swept lengths). Only when a benchmark is set for the project.
         if project.benchmark_hs and evaluation.get('keyspace'):
             rate = int(project.benchmark_hs)
             seconds = evaluation['keyspace'] / rate
@@ -438,18 +457,21 @@ def mask_new(request, pk):
                 'benchmark_h': _humanize_count(rate),
             }
         context['command'] = runner.plan_run(
-            3, module, hashfile=hashfile,
-            params={'mask': pattern, 'custom_charsets': custom})
+            3, module, hashfile=hashfile, params=mask_params)
         context['can_record'] = True
         if action == 'record':
             mask, _ = Mask.objects.get_or_create(
-                project=project, pattern=pattern, custom_charsets=custom)
+                project=project, pattern=pattern, custom_charsets=custom,
+                increment_min=inc_min, increment_max=inc_max)
             ch.compute_and_cache_keyspace(mask)
             mask.save()
+            sig_spec = {'attack_mode': 3, 'mask': pattern}
+            if inc_min is not None:
+                sig_spec['increment'] = [inc_min, inc_max]
             run = Run.objects.create(
                 mask=mask, project=project, attack_mode=3,
                 device=device or None, status=status, command=context['command'],
-                signature=sim.signature({'attack_mode': 3, 'mask': pattern}))
+                signature=sim.signature(sig_spec))
             run.hashes.set(project.hash_set.all())
             return redirect(reverse('project_detail', args=[project.pk]))
         return render(request, 'zebra/mask_new.html', context)
@@ -551,6 +573,9 @@ def recommend_json(request, pk):
     for r in recs:
         est = r['keyspace'] / rate if rate else 0
         overlap = r['overlap']
+        record_url = reverse('mask_new', args=[project.pk]) + '?pattern=' + quote(r['pattern'])
+        if r.get('incremental'):
+            record_url += '&increment=1&increment_max=%d' % r['increment_max']
         items.append({
             'pattern': r['pattern'],
             'length': r['length'],
@@ -559,10 +584,11 @@ def recommend_json(request, pk):
             'overlap': str(overlap),
             'overlap_pct': (100.0 * overlap / r['keyspace']) if r['keyspace'] else 0.0,
             'zero_overlap': overlap == 0,
+            'incremental': bool(r.get('incremental')),
+            'covers': r.get('covers', str(r['length'])),
             'est_seconds': est,
             'est_label': _format_duration(est),
-            'record_url': reverse('mask_new', args=[project.pk]) + '?pattern='
-                          + quote(r['pattern']),
+            'record_url': record_url,
         })
     return JsonResponse({
         'ok': True,

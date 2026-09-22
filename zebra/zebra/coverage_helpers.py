@@ -21,11 +21,29 @@ def mask_positions(mask, wildcard_map=None):
                           wildcard_map=wildcard_map)
 
 
+def mask_expansion(mask, wildcard_map=None):
+    """The parsed masks a Mask contributes to coverage (list of lists of frozensets).
+
+    A plain mask contributes just itself; an incremental (``--increment``) mask
+    contributes one prefix per swept length. This is the single place mask/increment
+    is turned into engine masks, so coverage, overlap and the recommender all agree."""
+    positions = mask_positions(mask, wildcard_map)
+    if mask.is_incremental:
+        return cov.mask_prefixes(positions, mask.increment_min, mask.increment_max)
+    return [positions]
+
+
 def compute_and_cache_keyspace(mask):
-    """Set mask.length / mask.keyspace from the engine (does not save)."""
+    """Set mask.length / mask.keyspace from the engine (does not save).
+
+    For an incremental mask, keyspace is the sum over its swept length-prefixes."""
     positions = mask_positions(mask)
     mask.length = len(positions)
-    mask.keyspace = Decimal(cov.mask_keyspace(positions))
+    if mask.is_incremental:
+        mask.keyspace = Decimal(cov.incremental_keyspace(
+            positions, mask.increment_min, mask.increment_max))
+    else:
+        mask.keyspace = Decimal(cov.mask_keyspace(positions))
     return mask
 
 
@@ -59,7 +77,7 @@ def project_coverage(project):
     parsed = []
     for m in covered_masks(project):
         try:
-            parsed.append(mask_positions(m, wmap))
+            parsed.extend(mask_expansion(m, wmap))  # incremental masks -> prefixes
         except cov.MaskParseError:
             continue  # skip malformed masks rather than break the dashboard
     summary = cov.coverage_by_length(parsed, universe=expand_universe(project.universe))
@@ -78,10 +96,25 @@ def project_coverage(project):
     return rows
 
 
-def evaluate_candidate(project, pattern, custom_charsets=None):
+def project_covered_expansion(project, wmap=None):
+    """Flattened parsed masks already covered (incremental masks -> prefixes)."""
+    wmap = wmap or project_wildcard_map()
+    existing = []
+    for m in covered_masks(project):
+        try:
+            existing.extend(mask_expansion(m, wmap))
+        except cov.MaskParseError:
+            continue
+    return existing
+
+
+def evaluate_candidate(project, pattern, custom_charsets=None,
+                       increment_min=None, increment_max=None):
     """Assess a candidate mask against a project's existing masks.
 
-    Returns a dict: keyspace, length, overlap, marginal, subsumed, error.
+    ``increment_min`` set marks a ``--increment`` candidate: its keyspace/overlap are
+    summed over the swept length-prefixes. Returns a dict: keyspace, length, overlap,
+    marginal, overlap_pct, subsumed, incremental, increment_min, increment_max, error.
     """
     wmap = project_wildcard_map()
     try:
@@ -89,14 +122,16 @@ def evaluate_candidate(project, pattern, custom_charsets=None):
                                    wildcard_map=wmap)
     except cov.MaskParseError as exc:
         return {'error': str(exc)}
-    existing = []
-    for m in covered_masks(project):
-        try:
-            existing.append(mask_positions(m, wmap))
-        except cov.MaskParseError:
-            continue
-    keyspace = cov.mask_keyspace(positions)
-    marginal = cov.marginal_keyspace(positions, existing)
+    incremental = increment_min is not None
+    if incremental and increment_max is None:
+        increment_max = len(positions)  # hashcat default: sweep up to the mask length
+    if incremental:
+        segments = cov.mask_prefixes(positions, increment_min, increment_max)
+    else:
+        segments = [positions]
+    existing = project_covered_expansion(project, wmap)
+    keyspace = sum(cov.mask_keyspace(s) for s in segments)
+    marginal = sum(cov.marginal_keyspace(s, existing) for s in segments)
     overlap = keyspace - marginal
     return {
         'error': None,
@@ -106,6 +141,9 @@ def evaluate_candidate(project, pattern, custom_charsets=None):
         'overlap': overlap,
         'overlap_pct': (100.0 * overlap / keyspace) if keyspace else 0.0,
         'subsumed': marginal == 0 and keyspace > 0,
+        'incremental': incremental,
+        'increment_min': increment_min,
+        'increment_max': increment_max if incremental else None,
     }
 
 
@@ -145,13 +183,7 @@ def project_recommendations(project, target, top_n=8):
     Gathers the project's already-covered masks and in-scope classes, then defers
     to the pure ``recommend`` engine. Returns its ranked list (may be empty).
     """
-    wmap = project_wildcard_map()
-    existing = []
-    for m in covered_masks(project):
-        try:
-            existing.append(mask_positions(m, wmap))
-        except cov.MaskParseError:
-            continue
+    existing = project_covered_expansion(project)  # incremental masks -> prefixes
     token_sizes = project_token_sizes(expand_universe(project.universe))
     return rec.recommend(int(target), existing, token_sizes, top_n=top_n)
 
@@ -217,11 +249,10 @@ def project_length_decomposition(project, length):
     parsed = []
     for m in covered_masks(project):
         try:
-            pos = mask_positions(m, wmap)
+            segments = mask_expansion(m, wmap)  # incremental masks -> prefixes
         except cov.MaskParseError:
             continue
-        if len(pos) == length:
-            parsed.append(pos)
+        parsed.extend(pos for pos in segments if len(pos) == length)
     if not parsed:
         return {'length': length, 'empty': True}
 

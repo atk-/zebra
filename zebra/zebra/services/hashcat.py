@@ -112,7 +112,7 @@ class HashcatRunner:
 
         if attack_mode == 3:
             flags, mask = _mask_charset_args(params)
-            parts += flags + [hashfile, mask]
+            parts += flags + _increment_flags(params) + [hashfile, mask]
         elif attack_mode == 0:
             for r in rules:
                 parts += ['-r', r]
@@ -219,6 +219,18 @@ def _mask_charset_args(params):
     mask, custom = substitute_c(params.get('mask', ''),
                                 params.get('custom_charsets'), c_complement_path())
     return _charset_flags(custom), mask
+
+
+def _increment_flags(params):
+    """['-i', '--increment-min', M, '--increment-max', N] when increment is set."""
+    imin = params.get('increment_min')
+    if imin is None:
+        return []
+    imax = params.get('increment_max')
+    flags = ['-i', '--increment-min', str(imin)]
+    if imax is not None:
+        flags += ['--increment-max', str(imax)]
+    return flags
 
 
 # --- pure parsers -----------------------------------------------------------

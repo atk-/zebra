@@ -830,12 +830,12 @@ class RecommendEngineTests(SimpleTestCase):
 
     def test_picks_mask_near_target(self):
         target = 26 ** 4 * 10 ** 2  # exactly ?u?l?l?l?d?d-sized (6 positions)
-        out = rec.recommend(target, [], self.SIZES, top_n=1)
-        self.assertEqual(len(out), 1)
-        best = out[0]
-        # closest achievable keyspace should equal the target exactly here
-        self.assertEqual(best['keyspace'], target)
-        self.assertAlmostEqual(best['log_dist'], 0.0, places=9)
+        out = rec.recommend(target, [], self.SIZES, top_n=8)
+        # the length-6 single is the exact-fit multiset (4 letters + 2 digits)
+        six = [r for r in out if not r['incremental'] and r['length'] == 6]
+        self.assertTrue(six)
+        self.assertEqual(six[0]['keyspace'], target)
+        self.assertAlmostEqual(six[0]['log_dist'], 0.0, places=9)
 
     def test_prefers_zero_overlap_over_covered(self):
         # Cover ?u?l?l?l?d?d exactly; a same-size suggestion must avoid it.
@@ -857,17 +857,23 @@ class RecommendEngineTests(SimpleTestCase):
         self.assertTrue(all(r['overlap'] < r['keyspace'] for r in out))  # none 100%
 
     def test_spans_distinct_lengths(self):
-        # ~3.1e14 is reachable across several lengths (band M..N); the suggestions
+        # reachable across several lengths (band M..N); the single-mask suggestions
         # should cover distinct lengths, not cluster on the single closest one.
         target = 26 ** 6 * 10 ** 4
         out = rec.recommend(target, [], self.SIZES, top_n=6)
-        lengths = [r['length'] for r in out]
+        singles = [r for r in out if not r['incremental']]
+        lengths = [r['length'] for r in singles]
         self.assertGreaterEqual(len(set(lengths)), 4)
-        self.assertEqual(len(set(lengths)), len(out))  # every pick a distinct length
-        self.assertEqual(lengths, sorted(lengths))     # presented short-to-long
-        # and each suggestion actually fits the budget (near the target keyspace)
-        for r in out:
-            self.assertLess(r['log_dist'], 1.0)
+        self.assertEqual(len(set(lengths)), len(singles))  # each single a distinct length
+        self.assertEqual(lengths, sorted(lengths))         # presented short-to-long
+        for r in singles:
+            self.assertLess(r['log_dist'], 1.0)            # each fits the budget
+        # at most one incremental "sweep" suggestion, flagged and covering 1..N
+        incr = [r for r in out if r['incremental']]
+        self.assertLessEqual(len(incr), 1)
+        if incr:
+            self.assertEqual(incr[0]['increment_min'], 1)
+            self.assertTrue(incr[0]['covers'].startswith('1-'))
 
     def test_empty_when_no_budget_or_tokens(self):
         self.assertEqual(rec.recommend(0, [], self.SIZES), [])
@@ -1102,3 +1108,123 @@ class CComplementCommandTests(SimpleTestCase):
 
     def test_substitute_c_is_noop_without_c(self):
         self.assertEqual(hcsvc.substitute_c('?u?l?d', {}, '/x'), ('?u?l?d', {}))
+
+
+class IncrementEngineTests(SimpleTestCase):
+    """Pure engine: --increment covers the union of a mask's length-prefixes."""
+
+    def test_mask_prefixes(self):
+        pos = P('?u?l?d')
+        pref = cov.mask_prefixes(pos, 1, 3)
+        self.assertEqual([len(p) for p in pref], [1, 2, 3])
+        # bounds clamp to [1, len]
+        self.assertEqual(len(cov.mask_prefixes(pos, 2, 99)), 2)  # lengths 2,3
+
+    def test_incremental_keyspace_is_sum_of_prefixes(self):
+        # ?d?d?d incremental 1..3 = 10 + 100 + 1000
+        self.assertEqual(cov.incremental_keyspace(P('?d?d?d'), 1, 3), 1110)
+        # 2..3 = 100 + 1000
+        self.assertEqual(cov.incremental_keyspace(P('?d?d?d'), 2, 3), 1100)
+
+
+class IncrementCoverageTests(TestCase):
+    """One exhausted incremental run covers every swept length."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='I-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='INC', hashtype=self.ht,
+                                              universe='0123456789')
+        Hash.objects.create(hashstring='ih1', project=self.project, cracked=False)
+
+    def _record_incremental(self, pattern, inc_min, inc_max, status='exhausted'):
+        mask = Mask.objects.create(project=self.project, pattern=pattern,
+                                   increment_min=inc_min, increment_max=inc_max)
+        ch.compute_and_cache_keyspace(mask); mask.save()
+        run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                                 status=status)
+        run.hashes.set(self.project.hash_set.all())
+        return mask, run
+
+    def test_cached_keyspace_is_incremental_sum(self):
+        mask, _ = self._record_incremental('?d?d?d', 1, 3)
+        self.assertEqual(int(mask.keyspace), 1110)  # 10+100+1000
+        self.assertTrue(mask.is_incremental)
+
+    def test_coverage_rows_for_every_swept_length(self):
+        self._record_incremental('?d?d?d', 1, 3)
+        rows = {r['length']: r for r in ch.project_coverage(self.project)}
+        self.assertEqual(set(rows), {1, 2, 3})
+        self.assertEqual(rows[1]['covered'], 10)
+        self.assertEqual(rows[2]['covered'], 100)
+        self.assertEqual(rows[3]['covered'], 1000)
+
+    def test_evaluate_incremental_candidate(self):
+        ev = ch.evaluate_candidate(self.project, '?d?d?d',
+                                   increment_min=1, increment_max=3)
+        self.assertTrue(ev['incremental'])
+        self.assertEqual(ev['keyspace'], 1110)
+        self.assertEqual(ev['increment_max'], 3)
+
+    def test_recommender_discounts_incremental_coverage(self):
+        # Sweep ?d 1..4 exhausted -> lengths 1..4 of digits fully covered. A digit
+        # mask at those lengths must be reported redundant, not suggested.
+        self._record_incremental('?d?d?d?d', 1, 4)
+        ev = ch.evaluate_candidate(self.project, '?d?d')  # length 2, all digits
+        self.assertTrue(ev['subsumed'])                    # already swept
+        self.assertEqual(ev['marginal'], 0)
+
+
+class IncrementCommandTests(SimpleTestCase):
+    """--increment flags are emitted for incremental mask runs only."""
+
+    def test_increment_flags_present(self):
+        argv = hcsvc.HashcatRunner().build_run_args(
+            3, 0, hashfile='H',
+            params={'mask': '?a?a?a', 'increment_min': 1, 'increment_max': 3})
+        self.assertIn('-i', argv)
+        self.assertIn('--increment-min', argv)
+        self.assertIn('--increment-max', argv)
+        self.assertEqual(argv[argv.index('--increment-max') + 1], '3')
+
+    def test_no_increment_flags_for_plain_mask(self):
+        argv = hcsvc.HashcatRunner().build_run_args(
+            3, 0, hashfile='H', params={'mask': '?a?a?a'})
+        self.assertNotIn('-i', argv)
+        self.assertNotIn('--increment-min', argv)
+
+
+class IncrementViewTests(TestCase):
+    """Recording, prefill, and the recommender JSON for incremental masks."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='IV-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='IVIEW', hashtype=self.ht,
+                                              universe='?l?u?d', benchmark_hs=10_000_000_000)
+        Hash.objects.create(hashstring='ivh1', project=self.project, cracked=False)
+
+    def test_record_incremental_mask_sets_fields_and_command(self):
+        url = '/zebra/project/%d/mask/new/' % self.project.pk
+        r = self.client.post(url, {'pattern': '?l?l?l', 'custom_charsets': '',
+                                   'increment': '1', 'increment_max': '3',
+                                   'status': 'planned', 'action': 'record'})
+        self.assertEqual(r.status_code, 302)
+        mask = Mask.objects.get(project=self.project)
+        self.assertEqual((mask.increment_min, mask.increment_max), (1, 3))
+        run = Run.objects.get(mask=mask)
+        self.assertIn('--increment-min', run.command)
+        self.assertIn('--increment-max 3', run.command)
+
+    def test_mask_new_prefills_increment_from_query(self):
+        r = self.client.get('/zebra/project/%d/mask/new/?pattern=%%3Fl%%3Fl&increment=1&increment_max=5'
+                            % self.project.pk)
+        self.assertContains(r, 'name="increment"')
+        self.assertContains(r, 'checked')
+        self.assertContains(r, 'value="5"')
+
+    def test_recommend_json_includes_incremental_entry(self):
+        d = self.client.get('/zebra/project/%d/recommend.json?seconds=300' % self.project.pk).json()
+        self.assertTrue(d['ok'])
+        incr = [r for r in d['recommendations'] if r['incremental']]
+        self.assertTrue(incr)                              # a sweep suggestion is offered
+        self.assertIn('increment=1', incr[0]['record_url'])
+        self.assertIn('increment_max=', incr[0]['record_url'])
