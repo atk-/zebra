@@ -12,6 +12,10 @@ Design
   enumerate class multisets per length (cheap: combinations-with-replacement),
   keep the ones whose keyspace lands nearest the target, and only then spend the
   (more expensive) exact-overlap computation on that short list.
+* We diversify by **length**: the best mask for each length is chosen, and the
+  result is filled with the best-fitting distinct lengths first, so the top
+  suggestions span the whole band of lengths that can approximate the budget
+  (a short, character-rich mask vs a longer, simpler one, same runtime).
 * Each chosen multiset is laid out in a canonical order that mirrors a typical
   human password -- uppercase, lowercase, digits, symbols (``?u?l?l?d?d?s``) --
   which is both a sensible default shape and keeps the suggestion deterministic.
@@ -37,71 +41,99 @@ def canonical_pattern(symbols):
     return ''.join('?' + s for s in ordered)
 
 
-def recommend(target, existing, token_sizes, max_len=16, max_eval=300, top_n=5,
-              max_per_keyspace=2):
-    """Rank candidate masks for a keyspace ``target`` against ``existing`` masks.
+def _rank_key(r):
+    """Sort key: fully-new masks first, then closest to the budget, then adds most."""
+    return (r['overlap'] > 0, r['log_dist'], -r['marginal'])
 
-    ``target``           : desired candidate count (rate * seconds), positive int.
-    ``existing``         : parsed masks already covered (list of lists of frozensets).
-    ``token_sizes``      : usable classes as ``{symbol: size}`` (e.g. ``{'l':26,...}``).
-    ``max_len``          : longest mask (number of positions) to consider.
-    ``max_eval``         : how many nearest-by-keyspace candidates to score exactly.
-    ``top_n``            : how many ranked suggestions to return.
-    ``max_per_keyspace`` : cap on suggestions sharing one keyspace value, so the
-                           list spans a range of shapes instead of returning many
-                           same-size variants (upper/lower splits are equal size).
 
-    Returns a list of dicts sorted best-first, each with: pattern, length,
-    keyspace, marginal (new keyspace added), overlap, and log_dist (distance to
-    target in natural log; 0 == exact match).
+def recommend(target, existing, token_sizes, max_len=16, per_len=12, top_n=8):
+    """Suggest masks fitting a keyspace ``target``, spanning as many lengths as it can.
+
+    ``target``      : desired candidate count (rate * seconds), a positive int.
+    ``existing``    : parsed masks already covered (list of lists of frozensets).
+    ``token_sizes`` : usable classes as ``{symbol: size}`` (e.g. ``{'l':26,...}``).
+    ``max_len``     : longest mask (number of positions) to consider.
+    ``per_len``     : how many nearest-by-keyspace candidates to score per length.
+    ``top_n``       : how many suggestions to return.
+
+    A length ``L`` can approximate the target when ``min_size**L <= target <=
+    max_size**L``; those lengths form a contiguous band ``[M, N]`` in which some
+    class mix hits the budget almost exactly. To let the user trade a short,
+    character-rich mask against a longer, simpler one, we return the best mask for
+    each length in that band (evenly sampled if there are more lengths than
+    ``top_n``), so the suggestions span the applicable lengths.
+
+    Masks that are 100% overlapping (fully redundant -- every candidate already
+    exhausted) are dropped, since suggesting them is worthless; a length whose
+    fitting masks are all fully covered simply drops out, trading a little length
+    coverage for only-useful suggestions.
+
+    Returns a list of dicts (pattern, length, keyspace, marginal, overlap,
+    log_dist), ordered by length for a readable short-to-long progression.
     """
     if target <= 0 or not token_sizes:
         return []
     syms = sorted(token_sizes)
     log_target = math.log(target)
 
-    # 1. Enumerate class multisets per length; keep those nearest the target
-    #    keyspace (ranking on |ln(keyspace) - ln(target)| so a 2x-too-big and a
-    #    2x-too-small candidate are judged equally close).
-    candidates = []
+    # 1. Per length, score the `per_len` multisets whose keyspace is nearest the
+    #    target (|ln(keyspace) - ln(target)|, so 2x-over and 2x-under tie), with
+    #    exact overlap against the existing masks. Every length gets a shot, so
+    #    the whole applicable band is represented rather than just the closest.
+    scored_by_len = {}
     for length in range(1, max_len + 1):
+        cands = []
         for combo in combinations_with_replacement(syms, length):
             keyspace = 1
             for s in combo:
                 keyspace *= token_sizes[s]
-            log_dist = abs(math.log(keyspace) - log_target)
-            candidates.append((log_dist, keyspace, combo))
-    candidates.sort(key=lambda c: c[0])
-    candidates = candidates[:max_eval]
+            cands.append((abs(math.log(keyspace) - log_target), keyspace, combo))
+        cands.sort(key=lambda c: c[0])
+        results = []
+        for log_dist, keyspace, combo in cands[:per_len]:
+            pattern = canonical_pattern(combo)
+            marginal = cov.marginal_keyspace(cov.parse_mask(pattern), existing)
+            if marginal == 0:
+                continue  # 100% overlap -- fully redundant, worth nothing to suggest
+            results.append({
+                'pattern': pattern, 'length': length, 'keyspace': keyspace,
+                'marginal': marginal, 'overlap': keyspace - marginal,
+                'log_dist': log_dist,
+            })
+        results.sort(key=_rank_key)
+        if results:
+            scored_by_len[length] = results
 
-    # 2. Score the short list with exact overlap against the existing masks.
-    results = []
-    for log_dist, keyspace, combo in candidates:
-        pattern = canonical_pattern(combo)
-        positions = cov.parse_mask(pattern)
-        marginal = cov.marginal_keyspace(positions, existing)
-        results.append({
-            'pattern': pattern,
-            'length': len(combo),
-            'keyspace': keyspace,
-            'marginal': marginal,
-            'overlap': keyspace - marginal,
-            'log_dist': log_dist,
-        })
+    # 2. The lengths that can *fit* the budget form a contiguous band [M, N]:
+    #    min_size**L <= target <= max_size**L. Cover one best mask per length in
+    #    that band, so the suggestions span every applicable length rather than
+    #    clustering on the single closest one.
+    smin, smax = min(token_sizes.values()), max(token_sizes.values())
+    M = max(1, math.ceil(log_target / math.log(smax)))
+    N = min(max_len, math.floor(log_target / math.log(smin)))
+    band = [scored_by_len[L][0] for L in range(M, N + 1) if L in scored_by_len]
 
-    # 3. Rank: fully-new masks first, then closeness to the budget, then the ones
-    #    that add the most previously-untested keyspace.
-    results.sort(key=lambda r: (r['overlap'] > 0, r['log_dist'], -r['marginal']))
+    if band:
+        # More applicable lengths than slots -> sample evenly across [M, N] so the
+        # spread still reaches both ends of the band.
+        chosen = _even_sample(band, top_n) if len(band) > top_n else band
+    else:
+        # Target unreachable at any length within max_len: fall back to the
+        # closest lengths so we still return something useful.
+        chosen = sorted((rs[0] for rs in scored_by_len.values()),
+                        key=_rank_key)[:top_n]
 
-    # 4. Diversify: keep the list from filling with equal-keyspace variants (e.g.
-    #    ?u?l?l vs ?l?u?l), so the user sees a spread of shapes and sizes.
-    chosen, seen = [], {}
-    for r in results:
-        n = seen.get(r['keyspace'], 0)
-        if n >= max_per_keyspace:
-            continue
-        seen[r['keyspace']] = n + 1
-        chosen.append(r)
-        if len(chosen) >= top_n:
-            break
+    # 3. Present short-to-long so the length spread reads at a glance.
+    chosen.sort(key=lambda r: (r['length'], r['log_dist']))
     return chosen
+
+
+def _even_sample(items, k):
+    """Pick ``k`` items evenly spread across ``items`` (both ends included)."""
+    n = len(items)
+    if k >= n:
+        return items
+    if k == 1:
+        return [items[0]]
+    idx = sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+    return [items[i] for i in idx]

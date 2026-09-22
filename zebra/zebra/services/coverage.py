@@ -41,7 +41,13 @@ BUILTIN_CHARSETS = {
 }
 BUILTIN_CHARSETS['a'] = (BUILTIN_CHARSETS['l'] + BUILTIN_CHARSETS['u']
                          + BUILTIN_CHARSETS['d'] + BUILTIN_CHARSETS['s'])
+# ?b = any byte (0x00-0xFF); ?c = its perfect complement to ?a, i.e. every byte
+# NOT in ?a (the 161 non-printable / high bytes: 0x00-0x1F, 0x7F-0xFF). ?c is a
+# zebra extension -- hashcat has no native ?c, so runs express it via a custom
+# charset file (see services.hashcat and b_complement.hcchr).
 BUILTIN_CHARSETS['b'] = ''.join(chr(i) for i in range(256))
+BUILTIN_CHARSETS['c'] = ''.join(c for c in BUILTIN_CHARSETS['b']
+                                if c not in set(BUILTIN_CHARSETS['a']))
 
 
 class MaskParseError(ValueError):

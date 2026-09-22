@@ -139,7 +139,7 @@ def project_token_sizes(universe_chars):
     return sizes
 
 
-def project_recommendations(project, target, top_n=5):
+def project_recommendations(project, target, top_n=8):
     """Ranked mask suggestions for a project given a keyspace ``target``.
 
     Gathers the project's already-covered masks and in-scope classes, then defers

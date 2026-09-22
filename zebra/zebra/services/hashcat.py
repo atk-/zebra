@@ -111,8 +111,8 @@ class HashcatRunner:
             parts += list(extra)
 
         if attack_mode == 3:
-            parts += _charset_flags(params.get('custom_charsets'))
-            parts += [hashfile, params.get('mask', '')]
+            flags, mask = _mask_charset_args(params)
+            parts += flags + [hashfile, mask]
         elif attack_mode == 0:
             for r in rules:
                 parts += ['-r', r]
@@ -126,13 +126,11 @@ class HashcatRunner:
                       wordlists[0] if len(wordlists) > 0 else 'LEFT',
                       wordlists[1] if len(wordlists) > 1 else 'RIGHT']
         elif attack_mode == 6:  # wordlist + mask
-            parts += _charset_flags(params.get('custom_charsets'))
-            parts += [hashfile, wordlists[0] if wordlists else 'WORDLIST',
-                      params.get('mask', '')]
+            flags, mask = _mask_charset_args(params)
+            parts += flags + [hashfile, wordlists[0] if wordlists else 'WORDLIST', mask]
         elif attack_mode == 7:  # mask + wordlist
-            parts += _charset_flags(params.get('custom_charsets'))
-            parts += [hashfile, params.get('mask', ''),
-                      wordlists[0] if wordlists else 'WORDLIST']
+            flags, mask = _mask_charset_args(params)
+            parts += flags + [hashfile, mask, wordlists[0] if wordlists else 'WORDLIST']
         else:
             parts += [hashfile]
         return [str(p) for p in parts]
@@ -158,6 +156,69 @@ def _charset_flags(custom_charsets):
     for key in sorted((custom_charsets or {}).keys()):
         flags += ['-' + str(key), str(custom_charsets[key])]
     return flags
+
+
+def c_complement_path():
+    """Absolute path to the ?c-complement charset file (b_complement.hcchr).
+
+    Read from the ``ZEBRA_C_COMPLEMENT_PATH`` setting when Django is configured,
+    else fall back to the copy shipped at the repo root."""
+    try:
+        from django.conf import settings
+        path = getattr(settings, 'ZEBRA_C_COMPLEMENT_PATH', None)
+        if path:
+            return str(path)
+    except Exception:
+        pass
+    import os
+    return os.path.abspath(os.path.join(
+        os.path.dirname(__file__), '..', '..', '..', 'b_complement.hcchr'))
+
+
+def substitute_c(mask, custom_charsets, c_path):
+    """Rewrite ``?c`` tokens to a custom -1..-4 slot bound to the complement file.
+
+    hashcat has no native ``?c``; we bind a free custom-charset slot to ``c_path``
+    (hashcat's ``-N`` accepts a filename) and rewrite each ``?c`` token to ``?N``.
+    A no-op when the mask has no ``?c``. Tokens are scanned so a literal ``??`` is
+    never mistaken for a ``?c`` token. Returns ``(mask, custom_charsets)``; if all
+    four custom slots are taken, ``?c`` is left as-is (best effort).
+    """
+    custom = dict(custom_charsets or {})
+
+    def has_c_token(m):
+        i, n = 0, len(m)
+        while i < n:
+            if m[i] == '?' and i + 1 < n:
+                if m[i + 1] == 'c':
+                    return True
+                i += 2  # skip the whole ?-token (so a literal ?? never matches)
+            else:
+                i += 1
+        return False
+
+    if not has_c_token(mask):
+        return mask, custom
+    slot = next((s for s in ('1', '2', '3', '4') if s not in custom), None)
+    if slot is None:
+        return mask, custom
+    custom[slot] = str(c_path)
+    out, i, n = [], 0, len(mask)
+    while i < n:
+        if mask[i] == '?' and i + 1 < n:
+            out.append('?' + (slot if mask[i + 1] == 'c' else mask[i + 1]))
+            i += 2
+        else:
+            out.append(mask[i])
+            i += 1
+    return ''.join(out), custom
+
+
+def _mask_charset_args(params):
+    """(custom-charset flags, mask string) for a mask, with ``?c`` translated."""
+    mask, custom = substitute_c(params.get('mask', ''),
+                                params.get('custom_charsets'), c_complement_path())
+    return _charset_flags(custom), mask
 
 
 # --- pure parsers -----------------------------------------------------------

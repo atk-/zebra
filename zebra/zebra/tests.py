@@ -23,8 +23,18 @@ class MaskKeyspaceTests(SimpleTestCase):
     def test_custom_charsets_and_wildcards(self):
         self.assertEqual(
             cov.mask_keyspace(P('?1?1', custom_charsets={'1': '?l?d'})), 36 * 36)
+        # 'w' is not a builtin, so a project wildcard defines it (unlike 'c', which
+        # is now the builtin ?a-complement and takes precedence over any wildcard).
         self.assertEqual(
-            cov.mask_keyspace(P('?c?c', wildcard_map={'c': 'abcABC'})), 36)
+            cov.mask_keyspace(P('?w?w', wildcard_map={'w': 'abcABC'})), 36)
+
+    def test_b_and_c_builtins(self):
+        self.assertEqual(cov.mask_keyspace(P('?b')), 256)          # any byte
+        self.assertEqual(cov.mask_keyspace(P('?c')), 256 - 95)     # complement of ?a
+        # ?a and ?c partition the byte space with no overlap and full cover.
+        a, c = set(cov.BUILTIN_CHARSETS['a']), set(cov.BUILTIN_CHARSETS['c'])
+        self.assertEqual(a & c, set())
+        self.assertEqual(a | c, set(cov.BUILTIN_CHARSETS['b']))
 
     def test_bad_masks_raise(self):
         with self.assertRaises(cov.MaskParseError):
@@ -836,23 +846,28 @@ class RecommendEngineTests(SimpleTestCase):
         self.assertEqual(out[0]['overlap'], 0)  # top suggestion is fully new
         self.assertNotEqual(out[0]['pattern'], '?u?l?l?l?d?d')
 
-    def test_overlap_is_exact_for_identical_core_mask(self):
-        # With disjoint core classes, the only overlap is an identical class-tuple.
+    def test_excludes_fully_covered_masks(self):
+        # Cover ?u?l?l?l?d?d and aim right at its keyspace: the identical (100%
+        # overlapping) mask must be filtered out, not suggested.
         covered = [P('?u?l?l?l?d?d')]
-        ks = cov.mask_keyspace(P('?u?l?l?l?d?d'))
-        # force the identical mask to be the sole candidate via a 1-class-size dict
-        out = rec.recommend(ks, covered, self.SIZES, top_n=20)
-        same = [r for r in out if r['pattern'] == '?u?l?l?l?d?d']
-        if same:  # if it surfaces at all, its overlap must be its whole keyspace
-            self.assertEqual(same[0]['overlap'], same[0]['keyspace'])
+        target = cov.mask_keyspace(P('?u?l?l?l?d?d'))
+        out = rec.recommend(target, covered, self.SIZES, top_n=20)
+        self.assertTrue(out)  # still returns useful alternatives
+        self.assertFalse(any(r['pattern'] == '?u?l?l?l?d?d' for r in out))
+        self.assertTrue(all(r['overlap'] < r['keyspace'] for r in out))  # none 100%
 
-    def test_diversity_caps_equal_keyspace_variants(self):
+    def test_spans_distinct_lengths(self):
+        # ~3.1e14 is reachable across several lengths (band M..N); the suggestions
+        # should cover distinct lengths, not cluster on the single closest one.
         target = 26 ** 6 * 10 ** 4
-        out = rec.recommend(target, [], self.SIZES, top_n=6, max_per_keyspace=2)
-        seen = {}
+        out = rec.recommend(target, [], self.SIZES, top_n=6)
+        lengths = [r['length'] for r in out]
+        self.assertGreaterEqual(len(set(lengths)), 4)
+        self.assertEqual(len(set(lengths)), len(out))  # every pick a distinct length
+        self.assertEqual(lengths, sorted(lengths))     # presented short-to-long
+        # and each suggestion actually fits the budget (near the target keyspace)
         for r in out:
-            seen[r['keyspace']] = seen.get(r['keyspace'], 0) + 1
-        self.assertTrue(all(v <= 2 for v in seen.values()))
+            self.assertLess(r['log_dist'], 1.0)
 
     def test_empty_when_no_budget_or_tokens(self):
         self.assertEqual(rec.recommend(0, [], self.SIZES), [])
@@ -1054,3 +1069,36 @@ class NumberFormattingTests(TestCase):
     def test_coverage_numbers_have_thousands_separators(self):
         d = self.client.get('/zebra/project/%d/' % self.project.pk)
         self.assertContains(d, '1,000,000')  # covered / total grouped
+
+
+class CComplementCommandTests(SimpleTestCase):
+    """?c has no native hashcat token; runs bind it to the complement charset file."""
+
+    def test_c_bound_to_free_custom_slot(self):
+        r = hcsvc.HashcatRunner()
+        argv = r.build_run_args(3, 0, hashfile='H', params={'mask': '?u?c?d'})
+        self.assertIn('-1', argv)
+        self.assertTrue(any(a.endswith('b_complement.hcchr') for a in argv))
+        self.assertIn('?u?1?d', argv)          # ?c -> the bound slot
+        self.assertNotIn('?c', ' '.join(argv))  # no raw ?c reaches hashcat
+
+    def test_c_avoids_a_taken_slot(self):
+        r = hcsvc.HashcatRunner()
+        argv = r.build_run_args(3, 0, hashfile='H',
+                                params={'mask': '?1?c', 'custom_charsets': {'1': '?l?d'}})
+        self.assertIn('?1?2', argv)             # slot 1 taken -> ?c goes to slot 2
+
+    def test_literal_c_is_not_translated(self):
+        r = hcsvc.HashcatRunner()
+        argv = r.build_run_args(3, 0, hashfile='H', params={'mask': 'abc?d'})
+        self.assertNotIn('-1', argv)            # literal 'c' must not add a charset
+        self.assertIn('abc?d', argv)
+
+    def test_b_is_native_and_unchanged(self):
+        r = hcsvc.HashcatRunner()
+        argv = r.build_run_args(3, 0, hashfile='H', params={'mask': '?b?b'})
+        self.assertIn('?b?b', argv)
+        self.assertNotIn('-1', argv)
+
+    def test_substitute_c_is_noop_without_c(self):
+        self.assertEqual(hcsvc.substitute_c('?u?l?d', {}, '/x'), ('?u?l?d', {}))

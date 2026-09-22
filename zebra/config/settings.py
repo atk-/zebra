@@ -15,6 +15,11 @@ from pathlib import Path
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Charset file holding every byte of ?c (the perfect complement of ?a). hashcat
+# has no native ?c token, so mask runs that use ?c bind a custom -1..-4 slot to
+# this file. Shipped at the repo root, one level above BASE_DIR (the project dir).
+ZEBRA_C_COMPLEMENT_PATH = BASE_DIR.parent / 'b_complement.hcchr'
+
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
