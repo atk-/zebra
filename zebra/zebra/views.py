@@ -437,6 +437,28 @@ def run_move(request, pk):
     return redirect(_queue_back(request, pk))
 
 
+def _safe_next(request):
+    """A local redirect target from the POSTed ``next``, else None.
+
+    Only same-site absolute paths (a single leading '/', not '//') are allowed, so
+    the header switch can return to the page it was used from without being an open
+    redirect."""
+    nxt = request.POST.get('next') or ''
+    if nxt.startswith('/') and not nxt.startswith('//'):
+        return nxt
+    return None
+
+
+def queue_toggle(request):
+    """Flip the queue master switch (POST); return to the page it was used from."""
+    if request.method == 'POST':
+        if launcher.is_paused():
+            launcher.resume_queue()
+        else:
+            launcher.pause_queue()
+    return redirect(_safe_next(request) or reverse('queue'))
+
+
 def queue_pause(request):
     if request.method == 'POST':
         launcher.pause_queue()

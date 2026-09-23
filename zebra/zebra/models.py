@@ -12,6 +12,11 @@ class Settings(models.Model):
     # overriding any globally installed copy. Blank -> fall back to 'hashcat' on
     # PATH (services.hashcat.DEFAULT_BINARY). Resolved by hashcat.configured_binary.
     hashcat_binary = models.CharField(max_length=1024, blank=True, default='')
+    # Master switch for the attack queue. When True the queue won't auto-start the
+    # next run (a run already in progress keeps going); flip it back on to resume.
+    # Persisted (not process-local) so it survives a restart -- a deliberate global
+    # off shouldn't silently turn back on. Read via launcher.is_paused().
+    queue_paused = models.BooleanField(default=False)
 
     class Meta:
         verbose_name = 'settings'

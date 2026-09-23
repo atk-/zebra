@@ -28,7 +28,7 @@ import threading
 from django.db import connection
 from django.utils import timezone
 
-from ..models import Run
+from ..models import Run, Settings
 from . import hashcat as hc
 from . import hashfile
 
@@ -59,8 +59,6 @@ def _session_name(run):
     parts.append('a%d' % run.pk)
     return '-'.join(parts)
 
-_paused = False  # queue auto-advance paused? Process-local, like _active (resets on
-#                  restart); the queue simply won't auto-start until resumed.
 
 # run_id -> subprocess.Popen for the currently-running attack(s).
 _active = {}
@@ -363,7 +361,16 @@ def stop_run(run):
 # queue spans all projects and honours the same one-at-a-time guarantee.
 
 def is_paused():
-    return _paused
+    """Whether the queue master switch is off (persisted on the Settings row)."""
+    return Settings.load().queue_paused
+
+
+def set_queue_paused(paused):
+    """Set the persisted queue master switch without side effects."""
+    s = Settings.load()
+    if s.queue_paused != bool(paused):
+        s.queue_paused = bool(paused)
+        s.save(update_fields=['queue_paused'])
 
 
 def _next_queued():
@@ -378,7 +385,7 @@ def _advance_queue(runner=None):
     Relies on ``start_run``'s DB guard as the real gate, so it does not hold
     ``_lock`` across the call (Lock is not reentrant). Returns the started run or
     None."""
-    if _paused:
+    if is_paused():
         return None
     reconcile_stale_runs()  # don't let an orphan block the queue either
     if Run.objects.filter(status='running').exists():
@@ -470,13 +477,11 @@ def move(run, delta):
 
 
 def pause_queue():
-    """Stop the queue from auto-advancing (the active run keeps going)."""
-    global _paused
-    _paused = True
+    """Turn the queue off: stop auto-advancing (the active run keeps going)."""
+    set_queue_paused(True)
 
 
 def resume_queue():
-    """Resume auto-advance and kick off the next queued run if idle."""
-    global _paused
-    _paused = False
+    """Turn the queue on: resume auto-advance and start the next run if idle."""
+    set_queue_paused(False)
     _advance_queue()

@@ -18,6 +18,7 @@ urlpatterns = [
     path("run/<int:pk>/dequeue/", views.run_dequeue, name="run_dequeue"),
     path("run/<int:pk>/move/", views.run_move, name="run_move"),
     path("queue/", views.queue, name="queue"),
+    path("queue/toggle/", views.queue_toggle, name="queue_toggle"),
     path("queue/pause/", views.queue_pause, name="queue_pause"),
     path("queue/resume/", views.queue_resume, name="queue_resume"),
     path("project/<int:pk>/import/", views.import_results, name="import_results"),

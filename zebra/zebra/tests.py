@@ -1603,7 +1603,7 @@ class QueueTests(TestCase):
         Hash.objects.create(hashstring='q1', project=self.project, cracked=False)
 
     def tearDown(self):
-        launcher._paused = False
+        launcher.set_queue_paused(False)
         with launcher._lock:
             launcher._active.clear()
 
@@ -1627,7 +1627,7 @@ class QueueTests(TestCase):
 
     @mock.patch.object(launcher, 'start_run', return_value=None)
     def test_dequeue_restores_planned(self, _s):
-        launcher._paused = True
+        launcher.set_queue_paused(True)
         a = self._run(); launcher.enqueue(a)
         launcher.dequeue(a); a.refresh_from_db()
         self.assertEqual(a.status, 'planned')
@@ -1635,7 +1635,7 @@ class QueueTests(TestCase):
 
     @mock.patch.object(launcher, 'start_run', return_value=None)
     def test_move_reorders(self, _s):
-        launcher._paused = True
+        launcher.set_queue_paused(True)
         a, b, c = self._run(), self._run('?d?d?d'), self._run('?d?d?d?d')
         for r in (a, b, c):
             launcher.enqueue(r)
@@ -1645,24 +1645,24 @@ class QueueTests(TestCase):
         self.assertEqual(order, [a.pk, c.pk, b.pk])
 
     def test_next_queued_is_lowest_position(self):
-        launcher._paused = True
+        launcher.set_queue_paused(True)
         a, b = self._run(), self._run('?d?d?d')
         with mock.patch.object(launcher, 'start_run', return_value=None):
             launcher.enqueue(a); launcher.enqueue(b)
         self.assertEqual(launcher._next_queued().pk, a.pk)
 
     def test_advance_starts_next_when_idle(self):
-        launcher._paused = True
+        launcher.set_queue_paused(True)
         with mock.patch.object(launcher, 'start_run', return_value=None):
             a = self._run(); launcher.enqueue(a)   # queued but not started (paused)
         with mock.patch.object(launcher, 'start_run', return_value=None) as m:
-            launcher._paused = False
+            launcher.set_queue_paused(False)
             started = launcher._advance_queue()
         self.assertEqual(started.pk, a.pk)
         m.assert_called_once()
 
     def test_advance_noop_when_paused(self):
-        launcher._paused = True
+        launcher.set_queue_paused(True)
         with mock.patch.object(launcher, 'start_run', return_value=None) as m:
             launcher.enqueue(self._run())
             self.assertIsNone(launcher._advance_queue())
@@ -1692,7 +1692,7 @@ class QueueChainTests(TransactionTestCase):
         self.run.hashes.set(self.project.hash_set.all())
 
     def tearDown(self):
-        launcher._paused = False
+        launcher.set_queue_paused(False)
         with launcher._lock:
             launcher._active.clear()
 
@@ -1716,7 +1716,7 @@ class QueueViewTests(TestCase):
         Hash.objects.create(hashstring='qv1', project=self.project, cracked=False)
 
     def tearDown(self):
-        launcher._paused = False
+        launcher.set_queue_paused(False)
         with launcher._lock:
             launcher._active.clear()
 
@@ -2379,7 +2379,7 @@ class RunOrQueueTests(TestCase):
     def tearDown(self):
         with launcher._lock:
             launcher._active.clear()
-        launcher._paused = False
+        launcher.set_queue_paused(False)
 
     def _mask_run(self, status='planned', pattern='?d?d'):
         m = Mask.objects.create(project=self.project, pattern=pattern)
@@ -2422,3 +2422,99 @@ class RunOrQueueTests(TestCase):
             action, err = launcher.run_or_queue(run)
         self.assertEqual(action, 'error')
         self.assertIn('not installed', err)
+
+
+class RecommenderPipelineTests(TestCase):
+    """The recommender excludes masks already planned/queued, not just exhausted."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='RP-HT', hashcat_module=111)
+        self.project = Project.objects.create(name='recopipe', hashtype=self.ht,
+                                              universe='?l?u?d', benchmark_hs=10**10)
+        Hash.objects.create(hashstring='a' * 32, project=self.project)
+
+    def _record_mask(self, pattern, status):
+        m = Mask.objects.create(project=self.project, pattern=pattern)
+        ch.compute_and_cache_keyspace(m); m.save()
+        Run.objects.create(mask=m, project=self.project, attack_mode=3, status=status)
+        return m
+
+    def _patterns(self, seconds=3600):
+        j = self.client.get('/zebra/project/%d/recommend.json?seconds=%d'
+                            % (self.project.pk, seconds)).json()
+        return {r['pattern'] for r in j.get('recommendations', [])}
+
+    def test_planned_expansion_includes_all_non_failed_states(self):
+        for st in ('planned', 'queued', 'running', 'exhausted', 'cracked'):
+            self._record_mask('?d?d', st)
+        # aborted / error are NOT counted (can be suggested again)
+        self._record_mask('?l?l', 'aborted')
+        got = {m.pattern for m in ch.planned_masks(self.project)}
+        self.assertIn('?d?d', got)
+        self.assertNotIn('?l?l', got)
+
+    def test_queued_mask_is_not_re_suggested(self):
+        # Find a pattern the recommender would offer, then queue it and confirm it
+        # disappears from the suggestions (previously only 'exhausted' excluded it).
+        offered = self._patterns()
+        self.assertTrue(offered, 'expected at least one suggestion to test with')
+        target = next(iter(offered))
+        self._record_mask(target, 'queued')          # merely queued, never run
+        self.assertNotIn(target, self._patterns())
+
+    def test_coverage_still_counts_only_exhausted(self):
+        # The broader recommender set must NOT leak into coverage math.
+        self._record_mask('?d?d', 'queued')
+        self.assertEqual(ch.project_coverage(self.project), [])  # nothing exhausted
+
+
+class QueueMasterSwitchTests(TestCase):
+    """The header master switch: persistent pause, no auto-advance while off."""
+
+    def tearDown(self):
+        launcher.set_queue_paused(False)
+
+    def test_pause_state_persists_on_settings(self):
+        from zebra.models import Settings
+        launcher.pause_queue()
+        self.assertTrue(launcher.is_paused())
+        self.assertTrue(Settings.load().queue_paused)     # persisted, not process-local
+        launcher.resume_queue()
+        self.assertFalse(Settings.load().queue_paused)
+
+    def test_header_shows_switch_state(self):
+        on = self.client.get('/zebra/').content.decode()
+        self.assertIn('Queue on', on)
+        self.assertNotIn('qswitch-btn off', on)
+        launcher.pause_queue()
+        off = self.client.get('/zebra/').content.decode()
+        self.assertIn('Queue off', off)
+        self.assertIn('qswitch-btn off', off)
+
+    def test_toggle_endpoint_flips_and_returns_to_next(self):
+        with mock.patch.object(launcher, '_advance_queue', return_value=None):
+            r = self.client.post('/zebra/queue/toggle/', {'next': '/zebra/settings/'})
+            self.assertRedirects(r, '/zebra/settings/', fetch_redirect_response=False)
+            self.assertTrue(launcher.is_paused())
+            self.client.post('/zebra/queue/toggle/', {'next': '/zebra/'})
+            self.assertFalse(launcher.is_paused())
+
+    def test_toggle_rejects_offsite_next(self):
+        with mock.patch.object(launcher, '_advance_queue', return_value=None):
+            r = self.client.post('/zebra/queue/toggle/', {'next': '//evil.example'})
+        self.assertRedirects(r, '/zebra/queue/', fetch_redirect_response=False)
+
+    def test_paused_queue_does_not_auto_advance(self):
+        ht = HashType.objects.create(name='MS-MD5', hashcat_module=0)
+        p = Project.objects.create(name='MSP', hashtype=ht)
+        Hash.objects.create(hashstring='h', project=p, cracked=False)
+        mask = Mask.objects.create(project=p, pattern='?d?d')
+        run = Run.objects.create(mask=mask, project=p, attack_mode=3, status='planned')
+        run.hashes.set(p.hash_set.all())
+        launcher.pause_queue()
+        with mock.patch.object(launcher, 'start_run', return_value=None) as m:
+            launcher.enqueue(run)                 # queued, but not started (off)
+            self.assertIsNone(launcher._advance_queue())
+            m.assert_not_called()
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'queued')    # waits until switched on

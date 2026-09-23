@@ -19,6 +19,15 @@
   header .spacer { flex:1; }
   header .nav { font-size:14px; font-weight:500; opacity:.85; }
   header .nav:hover { opacity:1; text-decoration:underline; }
+  header form.qswitch { margin:0; }
+  .qswitch-btn { display:inline-flex; align-items:center; gap:6px; cursor:pointer;
+         background:#1f2937; color:#e5e7eb; border:1px solid #374151;
+         border-radius:999px; padding:3px 11px; font:500 13px system-ui,sans-serif; }
+  .qswitch-btn:hover { border-color:#4b5563; }
+  .qswitch-dot { width:8px; height:8px; border-radius:50%; background:#22c55e;
+         box-shadow:0 0 6px #22c55e; }
+  .qswitch-btn.off { color:#9ca3af; }
+  .qswitch-btn.off .qswitch-dot { background:#6b7280; box-shadow:none; }
   main { max-width:960px; margin:0 auto; padding:24px 20px 60px; }
   h1 { font-size:22px; margin:0 0 4px; }
   h2 { font-size:17px; margin:28px 0 10px; }
@@ -133,6 +142,14 @@
   <a href="{% url 'index' %}">🦓 zebra</a>
   <span class="muted">hashcat mask coverage</span>
   <span class="spacer"></span>
+  <form method="post" action="{% url 'queue_toggle' %}" class="qswitch">
+    {% csrf_token %}
+    <input type="hidden" name="next" value="{{ request.get_full_path }}">
+    <button type="submit" class="qswitch-btn{% if queue_paused %} off{% endif %}"
+            title="{% if queue_paused %}Queue is off — click to turn on and pick up queued attacks{% else %}Queue is on — click to turn off (running attack keeps going){% endif %}">
+      <span class="qswitch-dot"></span>{% if queue_paused %}Queue off{% else %}Queue on{% endif %}
+    </button>
+  </form>
   <a class="nav" href="{% url 'queue' %}">☰ Queue</a>
   <a class="nav" href="{% url 'settings' %}">⚙ Settings</a>
 </header>

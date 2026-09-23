@@ -67,6 +67,20 @@ def covered_masks(project):
     return Mask.objects.filter(project=project, runs__status='exhausted').distinct()
 
 
+# Run states that mean a mask is already spoken for -- done, in progress, or lined
+# up to run -- so the recommender shouldn't suggest it again. Broader than
+# ``covered_masks`` (exhausted only, for exact coverage math): a just-queued or
+# planned mask isn't "covered" keyspace yet, but re-suggesting it is pointless.
+# 'aborted'/'error' are omitted so an incomplete attempt can be suggested again.
+PLANNED_RUN_STATES = ('planned', 'queued', 'running', 'exhausted', 'cracked')
+
+
+def planned_masks(project):
+    """Masks with a run that is done, running, or queued/planned (see states above)."""
+    return Mask.objects.filter(
+        project=project, runs__status__in=PLANNED_RUN_STATES).distinct()
+
+
 def project_coverage(project):
     """Coverage-by-length summary for a project's exhausted-run masks.
 
@@ -100,16 +114,30 @@ def project_coverage(project):
     return rows
 
 
+def _expand_masks(masks, wmap):
+    """Flatten a queryset of masks into parsed masks (incremental -> prefixes)."""
+    out = []
+    for m in masks:
+        try:
+            out.extend(mask_expansion(m, wmap))
+        except cov.MaskParseError:
+            continue
+    return out
+
+
 def project_covered_expansion(project, wmap=None):
     """Flattened parsed masks already covered (incremental masks -> prefixes)."""
     wmap = wmap or project_wildcard_map()
-    existing = []
-    for m in covered_masks(project):
-        try:
-            existing.extend(mask_expansion(m, wmap))
-        except cov.MaskParseError:
-            continue
-    return existing
+    return _expand_masks(covered_masks(project), wmap)
+
+
+def project_planned_expansion(project, wmap=None):
+    """Flattened parsed masks already recorded/queued/run (incremental -> prefixes).
+
+    Superset of ``project_covered_expansion``; used by the recommender so it won't
+    re-suggest a mask that's already planned or queued, not just already exhausted."""
+    wmap = wmap or project_wildcard_map()
+    return _expand_masks(planned_masks(project), wmap)
 
 
 def evaluate_candidate(project, pattern, custom_charsets=None,
@@ -205,10 +233,11 @@ def project_token_sizes(universe_chars):
 def project_recommendations(project, target, top_n=8):
     """Ranked mask suggestions for a project given a keyspace ``target``.
 
-    Gathers the project's already-covered masks and in-scope classes, then defers
-    to the pure ``recommend`` engine. Returns its ranked list (may be empty).
+    Gathers the project's already-recorded masks (planned/queued/running/done, so a
+    just-queued mask isn't suggested again) and in-scope classes, then defers to the
+    pure ``recommend`` engine. Returns its ranked list (may be empty).
     """
-    existing = project_covered_expansion(project)  # incremental masks -> prefixes
+    existing = project_planned_expansion(project)  # incremental masks -> prefixes
     token_sizes = project_token_sizes(expand_universe(project.universe))
     return rec.recommend(int(target), existing, token_sizes, top_n=top_n)
 
