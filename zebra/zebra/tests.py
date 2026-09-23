@@ -1282,10 +1282,24 @@ class IncrementProgressTests(TestCase):
         mask = Mask.objects.create(project=self.project, pattern='?d?d?d',
                                    increment_min=1, increment_max=3)
         run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
-                                 status='running', increment_offset=1, increment_count=3)
+                                 status='running', increment_offset=2, increment_count=3)
         d = self.client.get('/zebra/run/%d/status.json' % run.pk).json()
-        self.assertEqual(d['run_index'], 2)   # offset 1 -> "2/3"
+        # increment_offset is hashcat's 1-based guess_base_offset -> shown as-is.
+        self.assertEqual(d['run_index'], 2)   # offset 2 -> "2/3"
         self.assertEqual(d['run_total'], 3)
+
+    def test_final_subrun_does_not_overflow_counter(self):
+        # Regression: a 6-length sweep's last sub-run is guess_base_offset 6 of 6.
+        # It must read "6/6", not "7/6" (an earlier off-by-one added 1 to hashcat's
+        # already-1-based offset).
+        mask = Mask.objects.create(project=self.project, pattern='?a?a?a?a?a?a',
+                                   increment_min=1, increment_max=6)
+        run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                                 status='running')
+        hcsvc.ingest_status(run, {'base_offset': 6, 'base_count': 6, 'progress': 0.26})
+        run.refresh_from_db()
+        d = self.client.get('/zebra/run/%d/status.json' % run.pk).json()
+        self.assertEqual((d['run_index'], d['run_total']), (6, 6))
 
     def test_non_incremental_run_has_no_counter(self):
         mask = Mask.objects.create(project=self.project, pattern='?d?d?d')

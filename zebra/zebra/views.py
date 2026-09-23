@@ -305,7 +305,8 @@ def run_status_json(request, pk):
         'speed_h': _format_hashrate(run.speed_hs),
         'cracks': run.cracks.count(),
         # --increment sweep position: 1-based current sub-run and the total.
-        'run_index': (run.increment_offset + 1) if run.increment_offset is not None else None,
+        # increment_offset is already 1-based (hashcat's guess_base_offset).
+        'run_index': run.increment_offset,
         'run_total': run.increment_count,
     })
 

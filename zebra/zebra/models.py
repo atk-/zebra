@@ -211,7 +211,8 @@ class Run(models.Model):
     speed_hs = models.DecimalField(max_digits=80, decimal_places=0, null=True, blank=True)
     progress = models.FloatField(default=0.0)  # 0..1 (of the current sub-run)
     # Live position within a --increment sweep: which of how many length sub-runs
-    # hashcat is on. offset is 0-based; both null for a non-incremental run.
+    # hashcat is on. offset is hashcat's 1-based guess_base_offset (1..count, as in
+    # its "Guess.Queue: X/Y"); both null for a non-incremental run.
     increment_offset = models.IntegerField(null=True, blank=True)
     increment_count = models.IntegerField(null=True, blank=True)
     # Ordering key while status == 'queued' (the machine-wide attack queue); null

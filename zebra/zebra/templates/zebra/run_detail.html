@@ -21,7 +21,7 @@
   {% if launch_error %}<div class="note warn">{{ launch_error }}</div>{% endif %}
   {% if run.status == 'running' %}
     <p><strong>Running</strong>
-      <span id="run-runs">{% if run.increment_count and run.increment_count > 1 %}({{ run.increment_offset|add:1 }}/{{ run.increment_count }} runs) {% endif %}</span><strong>…</strong>
+      <span id="run-runs">{% if run.increment_count and run.increment_count > 1 %}({{ run.increment_offset }}/{{ run.increment_count }} runs){% endif %}</span><strong>…</strong>
       <span id="run-speed">{% if run.speed_hs %}· {{ run.speed_hs|intcomma }} H/s{% endif %}</span>
       · <span id="run-pct">{% widthratio run.progress 1 100 %}</span>%</p>
     <div class="bar"><span id="run-bar" style="width:{% widthratio run.progress 1 100 %}%"></span></div>

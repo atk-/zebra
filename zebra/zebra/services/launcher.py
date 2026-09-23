@@ -157,7 +157,7 @@ def start_run(run, runner=None):
     if run.mask and run.mask.is_incremental:
         lo, hi = run.mask.increment_min, run.mask.increment_max
         hi = min(hi, run.mask.length) if hi is not None else run.mask.length
-        run.increment_offset = 0
+        run.increment_offset = 1  # 1-based, like hashcat's guess_base_offset
         run.increment_count = max(1, hi - lo + 1)
     run.save(update_fields=['status', 'progress', 'started_at', 'ended_at', 'pid',
                             'increment_offset', 'increment_count'])
