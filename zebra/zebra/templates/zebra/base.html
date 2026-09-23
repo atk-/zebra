@@ -47,6 +47,15 @@
   .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; }
   .warn { background:var(--warn-bg); color:var(--warn); }
   .ok { background:var(--ok-bg); color:var(--ok); }
+  /* Run-status badges: one distinct hue per status (planned .. error). */
+  .pill.status { text-transform:capitalize; font-weight:600; }
+  .pill.st-planned   { background:#eef1f5; color:#475569; }  /* slate  */
+  .pill.st-queued    { background:#e8eafd; color:#3b3fb5; }  /* indigo */
+  .pill.st-running   { background:#e0f2fe; color:#0369a1; }  /* sky    */
+  .pill.st-exhausted { background:var(--ok-bg); color:var(--ok); }      /* green  */
+  .pill.st-cracked   { background:#f3e8fd; color:#7c3aed; }  /* violet */
+  .pill.st-aborted   { background:var(--warn-bg); color:var(--warn); }  /* amber  */
+  .pill.st-error     { background:#fde8e8; color:#c0392b; }  /* red    */
   .note { padding:12px; border-radius:8px; margin:12px 0; }
   .combobox { position:relative; }
   .combobox-list { position:absolute; z-index:20; left:0; right:0; margin:2px 0 0;

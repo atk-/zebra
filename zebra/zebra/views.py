@@ -500,6 +500,7 @@ def mask_new(request, pk):
         'default_status': 'planned',
         'wordlist_names': list(Wordlist.objects.values_list('name', flat=True)),
         'rule_names': list(RuleSet.objects.values_list('name', flat=True)),
+        'hashcat_available': hc.configured_runner().available(),
     }
     if request.method != 'POST' or project.hashtype is None:
         # Prefill the mask from query params (e.g. the recommender's "Record"
@@ -573,7 +574,7 @@ def mask_new(request, pk):
         context['command'] = runner.plan_run(
             3, module, hashfile=hashfile, params=mask_params)
         context['can_record'] = True
-        if action == 'record':
+        if action in ('record', 'record_run'):
             mask, _ = Mask.objects.get_or_create(
                 project=project, pattern=pattern, custom_charsets=custom,
                 increment_min=inc_min, increment_max=inc_max)
@@ -587,6 +588,14 @@ def mask_new(request, pk):
                 device=device or None, status=status, command=context['command'],
                 signature=sim.signature(sig_spec))
             run.hashes.set(project.hash_set.all())
+            # "Record & run": launch straight away and land on the live run page,
+            # collapsing record -> find in list -> open -> Run into one click. A
+            # launch guard failure (no hashcat, one already running, ...) is shown
+            # as a banner on the run page, where the run can still be queued.
+            if action == 'record_run':
+                err = launcher.start_run(run)
+                dest = reverse('run_detail', args=[run.pk])
+                return redirect(dest + ('?error=' + quote(err) if err else ''))
             return redirect(reverse('project_detail', args=[project.pk]))
         return render(request, 'zebra/mask_new.html', context)
 
@@ -624,7 +633,9 @@ def mask_new(request, pk):
                              else 'a wordlist'))
         return render(request, 'zebra/mask_new.html', context)
 
-    if action == 'record':
+    # Non-mask modes can't be launched yet (launcher is mask-only), so
+    # "record_run" degrades to a plain record here.
+    if action in ('record', 'record_run'):
         wl_objs = rh.resolve_wordlists(wl_names)
         rule_objs = rh.resolve_rules(rule_names)
         if attack_mode == 1:
@@ -699,6 +710,7 @@ def recommend_json(request, pk):
             'overlap_pct': (100.0 * overlap / r['keyspace']) if r['keyspace'] else 0.0,
             'zero_overlap': overlap == 0,
             'incremental': bool(r.get('incremental')),
+            'increment_max': r['increment_max'] if r.get('incremental') else None,
             'covers': r.get('covers', str(r['length'])),
             'est_seconds': est,
             'est_label': _format_duration(est),

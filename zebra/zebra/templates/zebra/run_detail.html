@@ -6,9 +6,7 @@
 <p class="muted"><a href="{% url 'project_detail' project.pk %}">← {{ project.name }}</a>
   · -a{{ run.attack_mode }} {{ run.attack_mode_label }}
   ·
-  {% if run.status == 'exhausted' or run.status == 'cracked' %}<span class="pill ok">{{ run.status }}</span>
-  {% elif run.status == 'aborted' or run.status == 'error' %}<span class="pill warn">{{ run.status }}</span>
-  {% else %}<span class="muted">{{ run.status }}</span>{% endif %}
+  <span class="pill status st-{{ run.status }}">{{ run.status }}</span>
 </p>
 
 <form method="post" action="{% url 'run_delete' run.pk %}" style="margin:0 0 8px"
@@ -70,6 +68,10 @@
       {% csrf_token %}
       <button class="btn danger" type="submit">Remove from queue</button>
     </form>
+  {% elif run.status == 'exhausted' or run.status == 'cracked' %}
+    <div class="note muted">This attack is <strong>{{ run.status }}</strong> —
+      {% if run.status == 'exhausted' %}its keyspace has been searched to the end{% else %}its target hashes were cracked{% endif %},
+      so there's nothing left to run.</div>
   {% elif run.attack_mode == 3 and hashcat_available %}
     <form method="post" action="{% url 'run_start' run.pk %}" style="display:inline">
       {% csrf_token %}

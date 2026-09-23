@@ -104,6 +104,9 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
 - [x] Add a hashlist (any hashtype) to an existing project; duplicates skipped
 - [x] Masks-tried / Attacks list on the dashboard
 - [x] Breadcrumb trail from a project back to the dashboard
+- [x] **Record & run** in one click: from the recommender popup or the Evaluate
+      panel, record a mask attack and launch it, landing on the live run page
+      (mask mode + hashcat only; non-mask degrades to plain record)
 - [ ] **Edit/delete** projects, masks, hashes from the UI (admin-only today)
 - [ ] Mask **input validation feedback** inline (live keyspace as you type)
       (Evaluate button gives keyspace/overlap/runtime on submit; not yet live)

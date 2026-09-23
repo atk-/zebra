@@ -129,10 +129,8 @@
     <td class="muted">-a{{ r.attack_mode }} {{ r.attack_mode_label }}</td>
     <td><code>{{ r.describe }}</code></td>
     <td>
-      {% if r.status == 'exhausted' or r.status == 'cracked' %}<span class="pill ok">{{ r.status }}</span>
-      {% elif r.status == 'aborted' or r.status == 'error' %}<span class="pill warn">{{ r.status }}</span>
-      {% elif r.status == 'queued' %}<a class="pill" href="{% url 'queue' %}" style="text-decoration:none">queued</a>
-      {% else %}<span class="muted">{{ r.status }}</span>{% endif %}
+      {% if r.status == 'queued' %}<a class="pill status st-queued" href="{% url 'queue' %}" style="text-decoration:none">{{ r.status }}</a>
+      {% else %}<span class="pill status st-{{ r.status }}">{{ r.status }}</span>{% endif %}
     </td>
     <td>{{ r.hashes.count }}</td>
     <td>{{ r.cracks.count }}</td>
@@ -413,7 +411,10 @@
 
 <div class="modal-backdrop" id="reco-modal" hidden
      data-url="{% url 'recommend' project.pk %}"
-     data-benchurl="{% url 'project_detail' project.pk %}">
+     data-benchurl="{% url 'project_detail' project.pk %}"
+     data-recordurl="{% url 'mask_new' project.pk %}"
+     data-hashcat="{% if hashcat_available %}1{% endif %}"
+     data-csrf="{{ csrf_token }}">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="reco-title">
     <div class="modal-head">
       <h3 id="reco-title">Suggest a mask</h3>
@@ -505,6 +506,32 @@
     run(minutes * 60);
   });
 
+  var recordUrl = modal.dataset.recordurl;
+  var csrf = modal.dataset.csrf;
+  var hashcatOn = modal.dataset.hashcat === '1';
+
+  // Buttons under a suggestion. "Record & run" (when hashcat is present) is a
+  // one-click POST that records the mask and launches it, landing on the live run
+  // page; "Record this attack" still opens the form for review/editing first.
+  function actions(r) {
+    var review = '<a class="btn' + (hashcatOn ? ' secondary' : '')
+      + '" href="' + r.record_url + '">Record this attack</a>';
+    if (!hashcatOn) return review;
+    var incFields = r.incremental
+      ? '<input type="hidden" name="increment" value="1">'
+        + '<input type="hidden" name="increment_max" value="' + esc(r.increment_max) + '">'
+      : '';
+    return '<form method="post" action="' + recordUrl + '" style="display:inline; margin-right:8px">'
+      + '<input type="hidden" name="csrfmiddlewaretoken" value="' + esc(csrf) + '">'
+      + '<input type="hidden" name="attack_mode" value="3">'
+      + '<input type="hidden" name="status" value="planned">'
+      + '<input type="hidden" name="action" value="record_run">'
+      + '<input type="hidden" name="pattern" value="' + esc(r.pattern) + '">'
+      + incFields
+      + '<button class="btn" type="submit" title="Record and launch now">Record &amp; run</button>'
+      + '</form>' + review;
+  }
+
   function render(d) {
     if (!d.ok) {
       if (d.error === 'no-benchmark') {
@@ -542,7 +569,7 @@
         + ' &middot; ' + lengthMeta
         + ' &middot; est. runtime <b>~' + esc(r.est_label) + '</b>'
         + '</div>'
-        + '<a class="btn" href="' + r.record_url + '">Record this attack</a>'
+        + actions(r)
         + '</div>';
     });
     body.innerHTML = html;

@@ -96,6 +96,13 @@
     <button class="btn secondary" name="action" value="preview" type="submit">Evaluate</button>
     {% if can_record %}
     <button class="btn" name="action" value="record" type="submit">Record attack</button>
+    {% if hashcat_available %}
+    {# Mask attacks only: record and launch in one click, landing on the live run page. #}
+    <span data-modes="3">
+      <button class="btn" name="action" value="record_run" type="submit"
+              title="Record this attack and launch it now">Record &amp; run</button>
+    </span>
+    {% endif %}
     {% endif %}
   </div>
 </form>

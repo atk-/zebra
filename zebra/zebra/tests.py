@@ -410,6 +410,31 @@ class RunDetailViewTests(TestCase):
         self.assertContains(r, 'Keyspace')
         self.assertContains(r, '100')
 
+    def test_exhausted_mask_detail_hides_run_controls(self):
+        from unittest import mock
+        self.client.post(self.url, {'attack_mode': '3', 'pattern': '?d?d',
+                                    'custom_charsets': '', 'status': 'exhausted',
+                                    'action': 'record'})
+        run = self._last_run()
+        with mock.patch('zebra.services.hashcat.HashcatRunner.available',
+                        return_value=True):
+            r = self.client.get('/zebra/run/%d/' % run.pk)
+        self.assertNotContains(r, 'Run attack')
+        self.assertNotContains(r, 'Add to queue')
+        self.assertContains(r, 'nothing left to run')
+
+    def test_planned_mask_detail_shows_run_controls(self):
+        from unittest import mock
+        self.client.post(self.url, {'attack_mode': '3', 'pattern': '?d?d',
+                                    'custom_charsets': '', 'status': 'planned',
+                                    'action': 'record'})
+        run = self._last_run()
+        with mock.patch('zebra.services.hashcat.HashcatRunner.available',
+                        return_value=True):
+            r = self.client.get('/zebra/run/%d/' % run.pk)
+        self.assertContains(r, 'Run attack')
+        self.assertContains(r, 'Add to queue')
+
 
 class RunDeleteViewTests(TestCase):
     def setUp(self):
@@ -524,11 +549,35 @@ class LauncherUnitTests(TestCase):
             self.assertIn('Only mask attacks', launcher.start_run(run, runner=runner))
 
     def test_start_refused_when_another_running(self):
-        self._mask_run(status='running')          # occupies the GPU
-        run = self._mask_run(pattern='?d?d?d')
+        # A *genuinely live* attack (this process is tracking its proc) blocks.
+        busy = self._mask_run(status='running')
+
+        class _FakeProc:
+            pid = 4242
+        with launcher._lock:
+            launcher._active[busy.pk] = _FakeProc()
+        try:
+            run = self._mask_run(pattern='?d?d?d')
+            with tempfile.TemporaryDirectory() as d:
+                runner = hc.HashcatRunner(binary=_write_stub(d, 'exit 1\n'))
+                self.assertIn('already running', launcher.start_run(run, runner=runner))
+        finally:
+            with launcher._lock:
+                launcher._active.pop(busy.pk, None)
+
+    def test_start_refused_when_exhausted(self):
+        run = self._mask_run(status='exhausted')
         with tempfile.TemporaryDirectory() as d:
-            runner = hc.HashcatRunner(binary=_write_stub(d, 'exit 1\n'))
-            self.assertIn('already running', launcher.start_run(run, runner=runner))
+            runner = hc.HashcatRunner(binary=_write_stub(d, 'exit 0\n'))  # available
+            self.assertIn('already exhausted', launcher.start_run(run, runner=runner))
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'exhausted')  # not relaunched
+
+    def test_enqueue_refused_when_exhausted(self):
+        run = self._mask_run(status='exhausted')
+        self.assertIn('already exhausted', launcher.enqueue(run))
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'exhausted')  # not queued
 
     def test_stop_recovers_orphaned_run(self):
         # A run left 'running' after a server restart: no thread, no live pid.
@@ -565,6 +614,46 @@ class LauncherUnitTests(TestCase):
 
     def test_pid_is_hashcat_false_for_bogus_pid(self):
         self.assertFalse(launcher._pid_is_hashcat(999999))
+
+    def test_reconcile_aborts_orphan_without_pid(self):
+        # The reported deadlock: a 'running' row that was never really launched
+        # (no pid, no tracking thread) must be swept, not left to block forever.
+        run = self._mask_run(status='running')  # pid=None, not in _active
+        self.assertEqual(launcher.reconcile_stale_runs(), 1)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'aborted')
+        self.assertIsNone(run.pid)
+        self.assertIsNotNone(run.ended_at)
+
+    def test_reconcile_aborts_orphan_with_dead_pid(self):
+        run = self._mask_run(status='running')
+        run.pid = 999999  # a pid that is not a live hashcat process
+        run.save(update_fields=['pid'])
+        self.assertEqual(launcher.reconcile_stale_runs(), 1)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'aborted')
+
+    def test_reconcile_keeps_live_run(self):
+        run = self._mask_run(status='running')
+
+        class _FakeProc:
+            pid = 4242
+        with launcher._lock:
+            launcher._active[run.pk] = _FakeProc()
+        try:
+            self.assertEqual(launcher.reconcile_stale_runs(), 0)
+        finally:
+            with launcher._lock:
+                launcher._active.pop(run.pk, None)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'running')  # untouched -- it's really running
+
+    def test_orphan_no_longer_blocks_the_one_at_a_time_guard(self):
+        self._mask_run(status='running')  # stale orphan
+        self.assertTrue(Run.objects.filter(status='running').exists())
+        launcher.reconcile_stale_runs()
+        # Guard set is now clear, so a new launch is no longer refused.
+        self.assertFalse(Run.objects.filter(status='running').exists())
 
 
 class LauncherExecuteTests(TransactionTestCase):
@@ -1516,7 +1605,9 @@ class QueueTests(TestCase):
             m.assert_not_called()
 
     def test_advance_noop_when_running(self):
-        self._run(status='running')            # occupies the GPU
+        busy = self._run(status='running')     # occupies the GPU
+        with launcher._lock:                   # ...and is genuinely live (tracked)
+            launcher._active[busy.pk] = type('P', (), {'pid': 4242})()
         with mock.patch.object(launcher, 'start_run', return_value=None) as m:
             a = self._run(); launcher.enqueue(a)   # enqueue -> advance sees running
             m.assert_not_called()
@@ -1640,3 +1731,48 @@ class SettingsViewTests(TestCase):
         s.save()
         self.assertEqual(Settings.objects.count(), 1)
         self.assertEqual(s.pk, 1)
+
+
+class RecordAndRunViewTests(TestCase):
+    """The streamlined 'Record & run' action: record a mask then launch it."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='RR-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='RRTEST', hashtype=self.ht,
+                                              universe='0123456789')
+        Hash.objects.create(hashstring='rr1', project=self.project, cracked=False)
+        self.url = '/zebra/project/%d/mask/new/' % self.project.pk
+
+    def test_record_run_creates_run_launches_and_lands_on_run_page(self):
+        from unittest import mock
+        with mock.patch('zebra.views.launcher.start_run', return_value=None) as start:
+            r = self.client.post(self.url, {'pattern': '?d?d', 'custom_charsets': '',
+                                            'status': 'planned', 'action': 'record_run'})
+        run = Run.objects.get(mask__project=self.project)
+        start.assert_called_once_with(run)
+        # Lands on the live run page, not the project dashboard.
+        self.assertRedirects(r, '/zebra/run/%d/' % run.pk,
+                             fetch_redirect_response=False)
+
+    def test_record_run_surfaces_launch_error_on_run_page(self):
+        from unittest import mock
+        with mock.patch('zebra.views.launcher.start_run',
+                        return_value='hashcat is not installed on this machine.'):
+            r = self.client.post(self.url, {'pattern': '?d?d', 'custom_charsets': '',
+                                            'status': 'planned', 'action': 'record_run'})
+        run = Run.objects.get(mask__project=self.project)
+        self.assertIn('/zebra/run/%d/?error=' % run.pk, r['Location'])
+        self.assertIn('not%20installed', r['Location'])
+
+    def test_record_run_is_noop_launch_for_non_mask_mode(self):
+        # Non-mask modes can't launch yet: record_run must still record, and must
+        # NOT call the mask launcher.
+        from unittest import mock
+        Wordlist.objects.create(name='rockyou.txt')
+        with mock.patch('zebra.views.launcher.start_run') as start:
+            r = self.client.post(self.url, {'attack_mode': '0', 'wordlist': 'rockyou.txt',
+                                            'status': 'planned', 'action': 'record_run'})
+        start.assert_not_called()
+        self.assertRedirects(r, '/zebra/project/%d/' % self.project.pk,
+                             fetch_redirect_response=False)
+        self.assertTrue(Run.objects.filter(project=self.project, attack_mode=0).exists())

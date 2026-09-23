@@ -33,6 +33,10 @@ from . import hashcat as hc
 
 POLL_SECONDS = 10  # send hashcat an 's' keypress this often to refresh status
 
+# Finished run states: the search is complete (whole keyspace exhausted, or all
+# targeted hashes cracked), so there is nothing left to (re)launch or queue.
+TERMINAL_STATUSES = ('exhausted', 'cracked')
+
 
 def _session_name(run):
     """Filesystem-safe hashcat ``--session`` name identifying this run.
@@ -114,11 +118,14 @@ def start_run(run, runner=None):
         return 'Only mask attacks (-a 3) can be launched yet.'
     if run.mask is None:
         return 'This mask attack has no mask to run.'
+    if run.status in TERMINAL_STATUSES:
+        return 'This attack is already %s — nothing left to run.' % run.status
     if run.project is None or not run.project.hash_set.exists():
         return 'This project has no hashes to attack.'
     if run.project.hashtype is None:
         return 'This project has no hash type set.'
     with _lock:
+        reconcile_stale_runs()  # self-heal orphaned 'running' rows before the guard
         if Run.objects.filter(status='running').exists():
             return 'Another attack is already running (one at a time).'
 
@@ -248,6 +255,39 @@ def _pid_is_hashcat(pid):
         return False
 
 
+def _run_is_live(run):
+    """True if a ``running`` row is actually backed by a live process.
+
+    Either this process launched it (it's in ``_active``) or its recorded pid is a
+    live hashcat process. A ``running`` row that is neither is *orphaned*: its
+    worker thread was lost to a server restart, or it was never really launched
+    (e.g. a stale row from a crash, which has no pid at all)."""
+    if run.pk in _active:
+        return True
+    return bool(run.pid) and _pid_is_hashcat(run.pid)
+
+
+def reconcile_stale_runs():
+    """Abort orphaned ``running`` rows so they stop deadlocking the launcher.
+
+    The one-at-a-time guard treats *any* ``running`` row as the active attack, so a
+    single orphan (a restart, a crash, or a row that never really launched) blocks
+    every future launch with "another attack is already running" -- with no obvious
+    Stop button to clear it. Sweeping orphans to ``aborted`` here, lazily, right
+    before the guard is checked, makes the state machine self-healing. Returns the
+    number of runs reconciled."""
+    reconciled = 0
+    for run in Run.objects.filter(status='running'):
+        if _run_is_live(run):
+            continue
+        run.status = 'aborted'
+        run.pid = None
+        run.ended_at = timezone.now()
+        run.save(update_fields=['status', 'pid', 'ended_at'])
+        reconciled += 1
+    return reconciled
+
+
 def stop_run(run):
     """Stop a running attack, or recover an orphaned one.
 
@@ -308,6 +348,7 @@ def _advance_queue(runner=None):
     None."""
     if _paused:
         return None
+    reconcile_stale_runs()  # don't let an orphan block the queue either
     if Run.objects.filter(status='running').exists():
         return None
     nxt = _next_queued()
@@ -325,6 +366,8 @@ def enqueue(run):
         return 'Only mask attacks (-a 3) can be queued yet.'
     if run.mask is None:
         return 'This mask attack has no mask to run.'
+    if run.status in TERMINAL_STATUSES:
+        return 'This attack is already %s — nothing left to queue.' % run.status
     if run.status in ('running', 'queued'):
         return None  # already active/queued -- nothing to do
     last = (Run.objects.filter(status='queued')

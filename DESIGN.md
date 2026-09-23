@@ -217,13 +217,21 @@ Runs a recorded **mask** attack with hashcat from the attack page (first cut).
   as a list, so masks/paths can't inject shell.
 - **Guards:** hashcat installed, `attack_mode == 3` only (mask attacks need no
   external files — other modes are a follow-up), project has hashes, and **one run at
-  a time** (the GPU is exclusive; refuse if any `Run` is `running`).
+  a time** (the GPU is exclusive; refuse if a *live* `Run` is `running`). The
+  one-at-a-time check runs `reconcile_stale_runs()` first, which aborts any
+  `running` row not backed by a live process (in the in-process registry, or a live
+  hashcat pid) — see the self-healing note below.
 - **Finalisation** from the exit code via `_final_status` (`0 cracked, 1 exhausted,
   2/3/4 aborted, else error`); cracks are imported from the run's potfile
   (`parse_potfile` → `ingest_cracks`). `Run.pid` + an in-process registry back the
   **Stop** button (SIGINT = hashcat's clean checkpoint-abort).
-- **Known limitation:** a server restart orphans a `running` run (recover with Stop);
-  the robust fix is the worker/queue below.
+- **Self-healing orphans:** a server restart (or a stale/bogus `running` row that
+  was never really launched) leaves a `running` run with no worker thread. Rather
+  than deadlocking every future launch behind the one-at-a-time guard,
+  `reconcile_stale_runs()` sweeps such rows to `aborted` lazily, right before the
+  guard is checked in `start_run` and `_advance_queue` (a run counts as live only if
+  it's in the in-process registry or its `pid` is a live hashcat process). Stop still
+  works for an explicit recovery; the fully robust fix is the worker/queue below.
 
 ## 7. Extensibility seams (designed, not built)
 
