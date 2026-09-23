@@ -8,7 +8,28 @@
   &nbsp;<a href="{% url 'project_detail' project.pk %}">Back to project</a></div>{% endif %}
 {% if error %}<div class="note warn">{{ error }}</div>{% endif %}
 
-{% if not project.hashtype %}
+{% if project.is_file_backed %}
+<form method="post" class="card" enctype="multipart/form-data">
+  {% csrf_token %}
+  <p class="muted">This is a <strong>file-backed</strong> project. Its hashes live in
+    an external file, so there's nothing to ingest — point it at a new file to
+    replace the reference and recount. Current file:
+    <code>{{ project.hashfile_path }}</code>
+    ({{ project.hash_count|default:"?" }} hashes).</p>
+
+  <label>Server-side file path <span class="muted">(absolute; zero-copy)</span></label>
+  <input type="text" name="hashfile_path" value="{{ project.hashfile_path }}"
+         placeholder="/data/hashes/ntlm-dump.txt">
+
+  <label>…or upload a file to store <span class="muted">(replaces the current file)</span></label>
+  <input type="file" name="hashfile_upload" accept=".txt,.hash,.hashes,.lst,text/plain">
+
+  <div style="margin-top:12px">
+    <button class="btn" type="submit">Set hash file</button>
+    <a class="btn secondary" href="{% url 'project_detail' project.pk %}">Done</a>
+  </div>
+</form>
+{% elif not project.hashtype %}
   <div class="note warn">
     This project has no hash type set. Set one in the
     <a href="/admin/zebra/project/{{ project.pk }}/change/">admin</a> first.

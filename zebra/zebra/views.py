@@ -1,6 +1,9 @@
+import os
 import shutil
+import time
 from decimal import Decimal
 
+from django.conf import settings as dj_settings
 from django.shortcuts import render, get_object_or_404, redirect
 from django.urls import reverse
 from django.http import JsonResponse
@@ -11,6 +14,7 @@ from . import run_helpers as rh
 from .services import hashcat as hc
 from .services import similarity as sim
 from .services import coverage as cov
+from .services import hashfile
 from .services import launcher
 from urllib.parse import quote
 
@@ -97,9 +101,12 @@ def project_new(request):
         description = (request.POST.get('description') or '').strip()
         hashtype_id = request.POST.get('hashtype')
         hashlist_raw = request.POST.get('hashlist') or ''
+        hash_source = request.POST.get('hash_source') or 'db'
         universe, universe_error = _resolve_universe(request)
         context.update({'name': name, 'description': description,
                         'hashtype_id': hashtype_id, 'hashlist': hashlist_raw,
+                        'hash_source': hash_source,
+                        'hashfile_path': request.POST.get('hashfile_path') or '',
                         'universe_choice': request.POST.get('universe') or '',
                         'universe_custom': request.POST.get('universe_custom') or ''})
 
@@ -116,7 +123,14 @@ def project_new(request):
             project = Project.objects.create(
                 name=name, description=description or None,
                 hashtype=hashtype, universe=universe or None)
-            _create_hashes(project, _hashlist_from_request(request))
+            if hash_source == 'file':
+                ok, err = _apply_file_source(project, request)
+                if not ok:
+                    project.delete()  # roll back the just-created project
+                    context['error'] = err
+                    return render(request, 'zebra/project_new.html', context)
+            else:
+                _create_hashes(project, _hashlist_from_request(request))
             return redirect(reverse('project_detail', args=[project.pk]))
     return render(request, 'zebra/project_new.html', context)
 
@@ -149,8 +163,10 @@ def _coverage_total(coverage, rate):
 def project_detail(request, pk):
     project = get_object_or_404(Project, pk=pk)
     hashes = project.hash_set.all()
-    cracked = hashes.filter(cracked=True).count()
-    total_hashes = hashes.count()
+    # Counts route through the project so a file-backed project reports its cached
+    # line count / potfile-derived cracks instead of (absent) Hash rows.
+    cracked = project.cracked_count()
+    total_hashes = project.hash_count_value()
     coverage = ch.project_coverage(project)
     # Annotate each length's remaining keyspace with an approximate time to
     # exhaust it (remaining / benchmark), when a benchmark is set.
@@ -280,7 +296,7 @@ def run_detail(request, pk):
         'project': run.project,
         'specs': specs,
         'cracks': run.cracks.select_related('hash').all(),
-        'target_count': run.hashes.count(),
+        'target_count': run.target_count(),
         'hashcat_available': hc.configured_runner().available(),
         'launch_error': request.GET.get('error'),
     }
@@ -458,16 +474,64 @@ def _create_hashes(project, raw):
     return len(rows), skipped
 
 
+def _store_uploaded_hashfile(project, upload):
+    """Stream an uploaded hash file into the managed dir; return its abs path.
+
+    Uses ``upload.chunks()`` (never ``.read()``) so a multi-gigabyte list is never
+    held in memory -- the whole point of file-backed projects."""
+    dest_dir = os.path.join(dj_settings.ZEBRA_DATA_DIR, 'hashfiles')
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, 'project-%d-%d.txt' % (project.pk, int(time.time())))
+    with open(dest, 'wb') as f:
+        for chunk in upload.chunks():
+            f.write(chunk)
+    return dest
+
+
+def _apply_file_source(project, request):
+    """Point ``project`` at an external hash file from the form. Returns (ok, error).
+
+    Accepts either an uploaded file (saved into the managed dir, marked managed) or
+    a server-side absolute path (referenced zero-copy). Caches the line count."""
+    path = (request.POST.get('hashfile_path') or '').strip()
+    upload = request.FILES.get('hashfile_upload')
+    if upload:
+        project.hashfile_path = _store_uploaded_hashfile(project, upload)
+        project.hashfile_managed = True
+    elif path:
+        ok, err = hashfile.validate_path(path)
+        if not ok:
+            return False, err
+        project.hashfile_path = path
+        project.hashfile_managed = False
+    else:
+        return False, 'Provide a server-side path or upload a hash file.'
+    project.save(update_fields=['hashfile_path', 'hashfile_managed'])
+    project.refresh_hash_count()
+    return True, None
+
+
 def hashes_add(request, pk):
     project = get_object_or_404(Project, pk=pk)
     context = {'project': project}
     if request.method == 'POST':
-        hashlist_raw = request.POST.get('hashlist') or ''
-        context['hashlist'] = hashlist_raw
-        if project.hashtype is None:
+        if project.is_file_backed:
+            # File-backed: "add hashes" = point at a new file (path or upload) and
+            # re-count. We never mutate an operator's server-side file, so this
+            # replaces the reference rather than appending.
+            ok, err = _apply_file_source(project, request)
+            if ok:
+                context['message'] = ('Hash file set to %s (%s hashes).'
+                                      % (project.hashfile_path,
+                                         project.hash_count if project.hash_count is not None else '?'))
+            else:
+                context['error'] = err
+        elif project.hashtype is None:
             context['error'] = ('This project has no hash type set. Set one in the '
                                 'admin before adding hashes.')
         else:
+            hashlist_raw = request.POST.get('hashlist') or ''
+            context['hashlist'] = hashlist_raw
             added, skipped = _create_hashes(project, _hashlist_from_request(request))
             context['message'] = (
                 'Added %d hash(es) as %s%s.'
@@ -587,7 +651,11 @@ def mask_new(request, pk):
                 mask=mask, project=project, attack_mode=3,
                 device=device or None, status=status, command=context['command'],
                 signature=sim.signature(sig_spec))
-            run.hashes.set(project.hash_set.all())
+            # Snapshot targeted hashes for DB-backed projects only; a file-backed
+            # project would create millions of M2M rows (target_count falls back to
+            # the project's hash count instead).
+            if not project.is_file_backed:
+                run.hashes.set(project.hash_set.all())
             # "Record & run": launch straight away and land on the live run page,
             # collapsing record -> find in list -> open -> Run into one click. A
             # launch guard failure (no hashcat, one already running, ...) is shown
@@ -646,7 +714,8 @@ def mask_new(request, pk):
             params=params, signature=sim.signature(candidate_spec))
         run.wordlists.set(wl_objs)
         run.rules.set(rule_objs)
-        run.hashes.set(project.hash_set.all())
+        if not project.is_file_backed:  # see the mask path -- skip the huge M2M
+            run.hashes.set(project.hash_set.all())
         return redirect(reverse('project_detail', args=[project.pk]))
     return render(request, 'zebra/mask_new.html', context)
 
@@ -660,9 +729,20 @@ def import_results(request, pk):
         try:
             if kind == 'potfile':
                 pairs = hc.parse_potfile(text)
-                matched = hc.ingest_cracks(project, pairs)
-                context['message'] = ('Imported %d potfile line(s); %d hash(es) '
-                                      'newly cracked.' % (len(pairs), matched))
+                if project.is_file_backed:
+                    # No Hash rows to match against -- the persistent potfile is the
+                    # source of truth, so append the parsed cracks to it.
+                    pot = project.resolve_potfile_path()
+                    os.makedirs(os.path.dirname(pot), exist_ok=True)
+                    with open(pot, 'a', encoding='utf-8') as f:
+                        for h, plain in pairs:
+                            f.write('%s:%s\n' % (h, plain))
+                    context['message'] = ('Appended %d crack(s) to the project '
+                                          'potfile.' % len(pairs))
+                else:
+                    matched = hc.ingest_cracks(project, pairs)
+                    context['message'] = ('Imported %d potfile line(s); %d hash(es) '
+                                          'newly cracked.' % (len(pairs), matched))
             elif kind == 'status':
                 summary = hc.parse_status_json(text)
                 context['message'] = 'Parsed status: %r' % summary

@@ -15,6 +15,8 @@
 <div class="card">
   <span class="pill ok">{{ project.hashtype.name|default:"no hash type" }}{% if project.hashtype %}
     ({{ project.hashtype.hashcat_module }}){% endif %}</span>
+  {% if project.is_file_backed %}<span class="pill" style="background:#e8eafd;color:#3b3fb5"
+     title="{{ project.hashfile_path }}">file-backed</span>{% endif %}
   &nbsp; <strong>{{ cracked }}/{{ total_hashes }}</strong> hashes cracked
   ({{ cracked_pct|floatformat:1 }}%)
   &nbsp;·&nbsp; <a class="btn" href="{% url 'mask_new' project.pk %}">Record an attack</a>
@@ -132,7 +134,7 @@
       {% if r.status == 'queued' %}<a class="pill status st-queued" href="{% url 'queue' %}" style="text-decoration:none">{{ r.status }}</a>
       {% else %}<span class="pill status st-{{ r.status }}">{{ r.status }}</span>{% endif %}
     </td>
-    <td>{{ r.hashes.count }}</td>
+    <td>{{ r.target_count }}</td>
     <td>{{ r.cracks.count }}</td>
     <td>{% if r.mask and r.mask.keyspace is not None %}{{ r.mask.keyspace|bignum }}{% else %}—{% endif %}</td>
     <td class="muted">{{ r.created_at }}</td>

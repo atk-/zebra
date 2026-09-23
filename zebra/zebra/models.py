@@ -49,6 +49,91 @@ class Project(models.Model):
     # 64 bits; the engine treats it as a plain int.
     benchmark_hs = models.DecimalField(max_digits=80, decimal_places=0,
                                        null=True, blank=True)
+    # --- hash source (hybrid: DB-backed OR file-backed) ---------------------
+    # When set, the project's hashes live in this external file and are NEVER
+    # ingested as Hash rows -- hashcat reads the file directly (zero-copy). This
+    # single nullable field is the mode discriminator: NULL => DB-backed (the
+    # default; hashes are Hash rows, exactly as before). Lets a campaign of
+    # millions of hashes skip duplicating gigabytes into SQLite.
+    hashfile_path = models.CharField(max_length=4096, blank=True, null=True)
+    # Cached line count of hashfile_path (the cracked-% denominator for a
+    # file-backed project); computed once when the path is set. BigInteger, not
+    # Decimal: a hash *count* never overflows 63 bits (unlike keyspaces).
+    hash_count = models.BigIntegerField(null=True, blank=True)
+    # Persistent per-project potfile for a file-backed project (hashcat
+    # --potfile-path): the source of truth for recovered hashes, so no Crack rows
+    # are created. NULL => resolve_potfile_path() derives a managed default.
+    potfile_path = models.CharField(max_length=4096, blank=True, null=True)
+    # True when zebra *saved* an upload into its managed dir (so it may replace
+    # that file on refresh); False for a zero-copy server-side path we never touch.
+    hashfile_managed = models.BooleanField(default=False)
+
+    @property
+    def is_file_backed(self):
+        """True when this project's hashes live in an external file, not the DB."""
+        return bool(self.hashfile_path)
+
+    def has_hashes(self):
+        """Whether the project has hashes to attack (launch guard).
+
+        File-backed: the referenced file exists and is non-empty. DB-backed: any
+        Hash rows exist."""
+        if self.is_file_backed:
+            import os
+            return os.path.isfile(self.hashfile_path) and os.path.getsize(self.hashfile_path) > 0
+        return self.hash_set.exists()
+
+    def hash_count_value(self):
+        """Total number of hashes (the coverage/cracked-% denominator).
+
+        File-backed: the cached line count (recomputed if missing). DB-backed: a
+        live row count (cheap)."""
+        if self.is_file_backed:
+            if self.hash_count is None:
+                self.refresh_hash_count()
+            return self.hash_count or 0
+        return self.hash_set.count()
+
+    def cracked_count(self):
+        """How many hashes are cracked.
+
+        File-backed: line count of the persistent potfile (hashcat's own record).
+        DB-backed: the denormalized ``cracked`` flag."""
+        if self.is_file_backed:
+            from .services import hashfile
+            return hashfile.potfile_cracked_count(self.resolve_potfile_path())
+        return self.hash_set.filter(cracked=True).count()
+
+    def resolve_potfile_path(self):
+        """The persistent per-project potfile path (explicit, else managed default)."""
+        if self.potfile_path:
+            return self.potfile_path
+        from django.conf import settings
+        import os
+        return os.path.join(settings.ZEBRA_DATA_DIR, 'potfiles', 'project-%s.pot' % self.pk)
+
+    def refresh_hash_count(self):
+        """Recount lines of the external hashfile and cache it on the project."""
+        from .services import hashfile
+        self.hash_count = hashfile.count_lines(self.hashfile_path)
+        if self.pk:
+            self.save(update_fields=['hash_count'])
+        return self.hash_count
+
+    def launch_hashfile(self, workdir):
+        """Path to the hashfile hashcat should read for this project.
+
+        File-backed: the external file itself (zero-copy). DB-backed: materialize
+        the project's Hash rows to ``workdir/hashes.txt`` (one per line) and return
+        that -- the caller's workdir cleanup disposes of it."""
+        if self.is_file_backed:
+            return self.hashfile_path
+        import os
+        path = os.path.join(workdir, 'hashes.txt')
+        with open(path, 'w', encoding='utf-8') as f:
+            for hs in self.hash_set.values_list('hashstring', flat=True):
+                f.write('%s\n' % hs)
+        return path
 
     def __str__(self):
         return self.name
@@ -230,6 +315,17 @@ class Run(models.Model):
     @property
     def attack_mode_label(self):
         return dict(self.ATTACK_MODES).get(self.attack_mode, str(self.attack_mode))
+
+    def target_count(self):
+        """How many hashes this run targeted, for display.
+
+        The Run<->Hash M2M is snapshotted at record time for DB-backed projects,
+        but left empty for file-backed ones (millions of join rows won't scale), so
+        fall back to the project's hash count."""
+        n = self.hashes.count()
+        if n:
+            return n
+        return self.project.hash_count_value() if self.project else 0
 
     def describe(self):
         """Human-readable one-line summary of what this run searched."""

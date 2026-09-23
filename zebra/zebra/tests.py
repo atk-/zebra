@@ -528,13 +528,22 @@ class LauncherUnitTests(TestCase):
         self.assertEqual(launcher._final_status(-signal.SIGINT), 'aborted')  # Stop
         self.assertEqual(launcher._final_status(255), 'error')
 
-    def test_materialize_hashfile_writes_project_hashes(self):
+    def test_launch_hashfile_materializes_db_project_hashes(self):
         Hash.objects.create(hashstring='deadbeef', project=self.project, cracked=False)
         with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, 'h.txt')
-            launcher._materialize_hashfile(self.project, path)
+            path = self.project.launch_hashfile(d)  # DB-backed: writes workdir/hashes.txt
+            self.assertEqual(path, os.path.join(d, 'hashes.txt'))
             self.assertEqual(sorted(open(path).read().split()),
                              ['5f4dcc3b', 'deadbeef'])
+
+    def test_launch_hashfile_returns_external_path_for_file_backed(self):
+        with tempfile.TemporaryDirectory() as d:
+            ext = os.path.join(d, 'big.txt')
+            open(ext, 'w').write('aaaa\nbbbb\n')
+            self.project.hashfile_path = ext
+            self.project.save(update_fields=['hashfile_path'])
+            # Zero-copy: returns the external path itself, writes nothing new.
+            self.assertEqual(self.project.launch_hashfile(d), ext)
 
     def test_start_refused_without_hashcat(self):
         run = self._mask_run()
@@ -700,6 +709,28 @@ class LauncherExecuteTests(TransactionTestCase):
         launcher._execute(self.run, proc, proc.stdout.fileno(), d, pot)
         self.run.refresh_from_db()
         self.assertEqual(self.run.status, 'cracked')
+
+    def test_execute_file_backed_skips_crack_ingest(self):
+        # File-backed: the persistent potfile is the source of truth, so _execute
+        # must NOT create Crack rows / flip the cracked flag, and must not delete
+        # the potfile (it lives outside the workdir that gets rmtree'd).
+        from zebra.models import Crack
+        work = tempfile.mkdtemp()
+        keep = tempfile.mkdtemp()  # stands in for the external/persistent locations
+        ext = os.path.join(keep, 'hashes.txt'); open(ext, 'w').write('aaa\n')
+        pot = os.path.join(keep, 'project.pot'); open(pot, 'w').write('aaa:secret\n')
+        self.project.hashfile_path = ext
+        self.project.save(update_fields=['hashfile_path'])
+        stub = _write_stub(work, "exit 1\n")
+        proc = subprocess.Popen([stub], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        launcher._execute(self.run, proc, proc.stdout.fileno(), work, pot)
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, 'exhausted')
+        self.assertFalse(Crack.objects.filter(run=self.run).exists())
+        self.h.refresh_from_db()
+        self.assertFalse(self.h.cracked)          # DB hash untouched
+        self.assertTrue(os.path.exists(pot))      # persistent potfile survives
 
 
 class RunLaunchTemplateTests(TestCase):
@@ -1776,3 +1807,163 @@ class RecordAndRunViewTests(TestCase):
         self.assertRedirects(r, '/zebra/project/%d/' % self.project.pk,
                              fetch_redirect_response=False)
         self.assertTrue(Run.objects.filter(project=self.project, attack_mode=0).exists())
+
+
+class HashfileServiceTests(SimpleTestCase):
+    """Pure file-side helpers for file-backed projects (no DB)."""
+
+    def _tmp(self, content, mode='w'):
+        import tempfile as _tf
+        fd, path = _tf.mkstemp()
+        os.close(fd)
+        with open(path, mode) as f:
+            f.write(content)
+        return path
+
+    def test_count_lines_basic_and_trailing(self):
+        from .services import hashfile
+        self.assertEqual(hashfile.count_lines(self._tmp('a\nb\nc\n')), 3)
+        self.assertEqual(hashfile.count_lines(self._tmp('a\nb\nc')), 3)  # no trailing nl
+
+    def test_count_lines_skips_blanks_and_empty(self):
+        from .services import hashfile
+        self.assertEqual(hashfile.count_lines(self._tmp('a\n\n  \nb\n')), 2)
+        self.assertEqual(hashfile.count_lines(self._tmp('')), 0)
+
+    def test_count_lines_spanning_chunk_boundary(self):
+        from .services import hashfile
+        n = 5000
+        path = self._tmp(''.join('h%d\n' % i for i in range(n)))
+        # Force a tiny chunk so lines straddle read boundaries.
+        orig = hashfile._CHUNK
+        hashfile._CHUNK = 7
+        try:
+            self.assertEqual(hashfile.count_lines(path), n)
+        finally:
+            hashfile._CHUNK = orig
+
+    def test_validate_path(self):
+        from .services import hashfile
+        ok, _ = hashfile.validate_path(self._tmp('x\n'))
+        self.assertTrue(ok)
+        self.assertFalse(hashfile.validate_path('relative/path')[0])
+        self.assertFalse(hashfile.validate_path('/no/such/file/here')[0])
+        import tempfile as _tf
+        self.assertFalse(hashfile.validate_path(_tf.mkdtemp())[0])  # a directory
+
+    def test_potfile_cracked_count_and_missing(self):
+        from .services import hashfile
+        self.assertEqual(hashfile.potfile_cracked_count('/no/such.pot'), 0)
+        p = self._tmp('h1:pw\nh2:pw2\n')
+        self.assertEqual(hashfile.potfile_cracked_count(p), 2)
+        # Cache invalidates when the file grows.
+        with open(p, 'a') as f:
+            f.write('h3:pw3\n')
+        self.assertEqual(hashfile.potfile_cracked_count(p), 3)
+
+
+class ProjectHashSourceTests(TestCase):
+    """Project methods route counts/paths through the DB-vs-file abstraction."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='HS-MD5', hashcat_module=0)
+
+    def test_db_backed_counts(self):
+        p = Project.objects.create(name='DBP', hashtype=self.ht)
+        Hash.objects.create(hashstring='a', project=p, cracked=True)
+        Hash.objects.create(hashstring='b', project=p, cracked=False)
+        self.assertFalse(p.is_file_backed)
+        self.assertEqual(p.hash_count_value(), 2)
+        self.assertEqual(p.cracked_count(), 1)
+        self.assertTrue(p.has_hashes())
+
+    def test_file_backed_counts_and_paths(self):
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        ext = os.path.join(d, 'h.txt'); open(ext, 'w').write('a\nb\nc\n')
+        p = Project.objects.create(name='FP', hashtype=self.ht, hashfile_path=ext)
+        self.assertTrue(p.is_file_backed)
+        self.assertTrue(p.has_hashes())
+        self.assertEqual(p.refresh_hash_count(), 3)
+        self.assertEqual(p.hash_count_value(), 3)         # cached
+        self.assertEqual(p.cracked_count(), 0)            # no potfile yet
+        # Write the resolved potfile -> cracked count reflects it.
+        pot = p.resolve_potfile_path()
+        os.makedirs(os.path.dirname(pot), exist_ok=True)
+        open(pot, 'w').write('a:pw\n')
+        self.assertEqual(p.cracked_count(), 1)
+        os.remove(pot)
+
+    def test_file_backed_missing_file_has_no_hashes(self):
+        p = Project.objects.create(name='MISS', hashtype=self.ht,
+                                   hashfile_path='/no/such/file.txt')
+        self.assertFalse(p.has_hashes())
+
+
+class FileBackedViewTests(TestCase):
+    """Creating/using a file-backed project through the views."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='FV-MD5', hashcat_module=0)
+        import tempfile as _tf
+        self.d = _tf.mkdtemp()
+        self.ext = os.path.join(self.d, 'big.txt')
+        open(self.ext, 'w').write('h1\nh2\nh3\nh4\n')
+
+    def test_create_file_backed_project_by_path(self):
+        r = self.client.post('/zebra/project/new/', {
+            'name': 'FILEPROJ', 'hashtype': str(self.ht.pk),
+            'hash_source': 'file', 'hashfile_path': self.ext})
+        self.assertEqual(r.status_code, 302)
+        p = Project.objects.get(name='FILEPROJ')
+        self.assertEqual(p.hashfile_path, self.ext)
+        self.assertFalse(p.hashfile_managed)
+        self.assertEqual(p.hash_count, 4)
+        self.assertEqual(p.hash_set.count(), 0)   # NOT ingested
+
+    def test_create_file_backed_rejects_bad_path(self):
+        r = self.client.post('/zebra/project/new/', {
+            'name': 'BADPROJ', 'hashtype': str(self.ht.pk),
+            'hash_source': 'file', 'hashfile_path': '/no/such/file'})
+        self.assertEqual(r.status_code, 200)      # re-render with error
+        self.assertFalse(Project.objects.filter(name='BADPROJ').exists())  # rolled back
+
+    def test_create_file_backed_by_upload_is_stored(self):
+        from io import BytesIO
+        up = BytesIO(b'x1\nx2\n'); up.name = 'list.txt'
+        r = self.client.post('/zebra/project/new/', {
+            'name': 'UPPROJ', 'hashtype': str(self.ht.pk),
+            'hash_source': 'file', 'hashfile_upload': up})
+        self.assertEqual(r.status_code, 302)
+        p = Project.objects.get(name='UPPROJ')
+        self.assertTrue(p.hashfile_managed)
+        self.assertTrue(os.path.exists(p.hashfile_path))
+        self.assertEqual(p.hash_count, 2)
+        self.assertEqual(p.hash_set.count(), 0)
+
+    def test_hashes_add_replaces_path_for_file_backed(self):
+        p = Project.objects.create(name='RP', hashtype=self.ht,
+                                   hashfile_path=self.ext, hash_count=4)
+        other = os.path.join(self.d, 'other.txt'); open(other, 'w').write('a\nb\n')
+        r = self.client.post('/zebra/project/%d/hashes/add/' % p.pk,
+                             {'hashfile_path': other})
+        self.assertEqual(r.status_code, 200)
+        p.refresh_from_db()
+        self.assertEqual(p.hashfile_path, other)
+        self.assertEqual(p.hash_count, 2)
+
+    def test_import_results_appends_to_project_potfile(self):
+        p = Project.objects.create(name='IMP', hashtype=self.ht,
+                                   hashfile_path=self.ext, hash_count=4)
+        pot = p.resolve_potfile_path()
+        try:
+            r = self.client.post('/zebra/project/%d/import/' % p.pk,
+                                 {'kind': 'potfile', 'text': 'h1:secret\nh2:hunter2\n'})
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(os.path.exists(pot))
+            self.assertEqual(p.cracked_count(), 2)
+            from .models import Crack
+            self.assertEqual(Crack.objects.count(), 0)  # no Crack rows for file-backed
+        finally:
+            if os.path.exists(pot):
+                os.remove(pot)

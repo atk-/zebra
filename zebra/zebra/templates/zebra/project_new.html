@@ -47,12 +47,41 @@
     })();
   </script>
 
-  <label>Hashlist <span class="muted">(one hash per line)</span></label>
-  <textarea name="hashlist" rows="8"
-            placeholder="5f4dcc3b5aa765d61d8327deb882cf99&#10;e10adc3949ba59abbe56e057f20f883e">{{ hashlist|default:'' }}</textarea>
+  <label>Hash source</label>
+  <select name="hash_source" id="hash-source">
+    <option value="db" {% if hash_source == 'file' %}{% else %}selected{% endif %}>Store in database — paste / upload (best for modest lists)</option>
+    <option value="file" {% if hash_source == 'file' %}selected{% endif %}>External file — reference a file on disk (millions of hashes, never ingested)</option>
+  </select>
 
-  <label>…or upload a file <span class="muted">(one hash per line; combined with any text above)</span></label>
-  <input type="file" name="hashfile" accept=".txt,.hash,.hashes,.lst,text/plain">
+  <div data-source="db">
+    <label>Hashlist <span class="muted">(one hash per line)</span></label>
+    <textarea name="hashlist" rows="8"
+              placeholder="5f4dcc3b5aa765d61d8327deb882cf99&#10;e10adc3949ba59abbe56e057f20f883e">{{ hashlist|default:'' }}</textarea>
+
+    <label>…or upload a file <span class="muted">(one hash per line; combined with any text above)</span></label>
+    <input type="file" name="hashfile" accept=".txt,.hash,.hashes,.lst,text/plain">
+  </div>
+
+  <div data-source="file">
+    <label>Server-side file path <span class="muted">(absolute path on this machine; hashcat reads it directly — zero-copy)</span></label>
+    <input type="text" name="hashfile_path" value="{{ hashfile_path|default:'' }}"
+           placeholder="/data/hashes/ntlm-dump.txt">
+
+    <label>…or upload a file to store <span class="muted">(saved once and referenced by path; not ingested row-by-row)</span></label>
+    <input type="file" name="hashfile_upload" accept=".txt,.hash,.hashes,.lst,text/plain">
+  </div>
+
+  <script>
+    (function () {
+      var sel = document.getElementById('hash-source');
+      function sync() {
+        document.querySelectorAll('[data-source]').forEach(function (el) {
+          el.hidden = el.getAttribute('data-source') !== sel.value;
+        });
+      }
+      sel.addEventListener('change', sync); sync();
+    })();
+  </script>
 
   <div style="margin-top:14px">
     <button class="btn" type="submit">Create project</button>

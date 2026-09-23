@@ -99,13 +99,6 @@ def _final_status(returncode):
             2: 'aborted', 3: 'aborted', 4: 'aborted'}.get(returncode, 'error')
 
 
-def _materialize_hashfile(project, path):
-    """Write the project's hash strings, one per line, to ``path``."""
-    with open(path, 'w', encoding='utf-8') as f:
-        for hs in project.hash_set.values_list('hashstring', flat=True):
-            f.write('%s\n' % hs)
-
-
 def start_run(run, runner=None):
     """Launch ``run`` with hashcat in a background thread.
 
@@ -120,7 +113,11 @@ def start_run(run, runner=None):
         return 'This mask attack has no mask to run.'
     if run.status in TERMINAL_STATUSES:
         return 'This attack is already %s — nothing left to run.' % run.status
-    if run.project is None or not run.project.hash_set.exists():
+    if run.project is None:
+        return 'This project has no hashes to attack.'
+    if not run.project.has_hashes():
+        if run.project.is_file_backed:
+            return 'Hash file not found or empty: %s' % run.project.hashfile_path
         return 'This project has no hashes to attack.'
     if run.project.hashtype is None:
         return 'This project has no hash type set.'
@@ -130,9 +127,16 @@ def start_run(run, runner=None):
             return 'Another attack is already running (one at a time).'
 
     workdir = tempfile.mkdtemp(prefix='zebra-run-%d-' % run.pk)
-    hashpath = os.path.join(workdir, 'hashes.txt')
-    pot = os.path.join(workdir, 'zebra.pot')
-    _materialize_hashfile(run.project, hashpath)
+    # File-backed: hashcat reads the external file directly (zero-copy) and writes
+    # to a *persistent* per-project potfile (kept outside workdir, so it survives
+    # this run's cleanup and lets hashcat auto-skip already-cracked hashes next
+    # time). DB-backed: materialize hashes into workdir and use a transient potfile.
+    hashpath = run.project.launch_hashfile(workdir)
+    if run.project.is_file_backed:
+        pot = run.project.resolve_potfile_path()
+        os.makedirs(os.path.dirname(pot), exist_ok=True)
+    else:
+        pot = os.path.join(workdir, 'zebra.pot')
 
     argv = runner.build_run_args(
         3, run.project.hashtype.hashcat_module, hashfile=hashpath,
@@ -214,13 +218,17 @@ def _execute(run, proc, fd, workdir, pot):
             run.progress = 1.0
         run.save(update_fields=['status', 'ended_at', 'pid', 'progress'])
 
-        try:
-            with open(pot, encoding='utf-8') as f:
-                pairs = hc.parse_potfile(f.read())
-            if pairs:
-                hc.ingest_cracks(run.project, pairs, run)
-        except FileNotFoundError:
-            pass
+        # DB-backed: import the run's potfile into Crack rows + the cracked flag.
+        # File-backed: the persistent potfile IS the source of truth (no Crack
+        # rows), so there is nothing to ingest.
+        if not run.project.is_file_backed:
+            try:
+                with open(pot, encoding='utf-8') as f:
+                    pairs = hc.parse_potfile(f.read())
+                if pairs:
+                    hc.ingest_cracks(run.project, pairs, run)
+            except FileNotFoundError:
+                pass
     except Exception as exc:  # never let the thread die silently
         run.status = 'error'
         run.ended_at = timezone.now()

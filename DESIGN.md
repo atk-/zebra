@@ -171,7 +171,40 @@ become **one project per type** — cleaner, since fast and slow types deserve s
 coverage/similarity histories. This supersedes the earlier `Hashlist`-grouping idea;
 a future **case / superproject** layer can group related projects for an
 engagement-level rollup. `Run`↔`Hash` still records which hashes a run targeted (all
-current project hashes), so hashes added later are flagged as not-yet-covered.
+current project hashes), so hashes added later are flagged as not-yet-covered — but
+only for DB-backed projects (see below).
+
+### 4a. Hybrid hash source (DB-backed **or** file-backed)
+
+The coverage/overlap engine never touches `Hash` (it works purely off masks), and
+hashcat only ever needs a flat file — so hashes in the DB are just an intermediate
+store on the way to a file. For campaigns of millions of hashes, ingesting one `Hash`
+row per line duplicates gigabytes of data (and `_create_hashes` loads every existing
+hashstring into memory to dedup). So hash storage is a **per-project choice**, keyed
+on one nullable field:
+
+- **`Project.hashfile_path`** — NULL ⇒ **DB-backed** (unchanged: paste/upload → `Hash`
+  rows, `Crack` rows, the `cracked` flag). Set ⇒ **file-backed**: the project
+  references an on-disk file zebra **never ingests**; hashcat reads it directly
+  (zero-copy). A file-backed project may reference a **server-side path** (referenced
+  as-is) or an **uploaded file** saved once into `ZEBRA_DATA_DIR/hashfiles/`
+  (`Project.hashfile_managed=True`).
+- **Counts** route through `Project` methods so call sites don't branch: `hash_count_value()`
+  (file-backed → cached `hash_count`, scanned once via `services/hashfile.count_lines`;
+  DB → live row count), `cracked_count()`, `has_hashes()`, and `Run.target_count()`.
+  The pure, DB-free file work (streamed line counting, path validation, potfile line
+  counting with an mtime/size cache) lives in **`services/hashfile.py`** (mirrors the
+  `coverage.py` + glue split).
+- **Cracks for file-backed projects use a persistent per-project potfile**
+  (`Project.resolve_potfile_path()` → `ZEBRA_DATA_DIR/potfiles/project-<pk>.pot`,
+  passed to hashcat as `--potfile-path`) as the source of truth — **no `Crack` rows,
+  no `cracked` bool**. Cracked count = potfile line count. A persistent potfile also
+  makes hashcat auto-skip already-cracked hashes on later runs. The launcher keeps the
+  potfile **outside** the per-run `workdir`, so `rmtree(workdir)` never deletes it; DB-
+  backed runs keep their transient in-workdir potfile + `ingest_cracks`. The Run↔Hash
+  M2M is **skipped** for file-backed projects (millions of join rows won't scale).
+- Backward compatible: existing projects have `hashfile_path IS NULL`, so every method
+  takes the DB branch — behavior is identical to before. No data migration.
 
 ## 5. Hashcat service (`services/hashcat.py`)
 

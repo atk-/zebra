@@ -20,9 +20,13 @@ mask keyspace, not just a list of commands.
 
 - **Projects & hashlists** — a project targets **one hash type** (chosen once at
   creation, from all 590 seeded Hashcat modules); its hashes and attacks inherit it.
-  Add more hashes any time — paste them or upload a text file; duplicates are
-  skipped. Multi-type dumps become one
-  project per type (a future "case" layer can group them).
+  Hash storage is a per-project choice: **DB-backed** (paste or upload a text file;
+  duplicates skipped — good for modest lists) or **file-backed** (reference an
+  external file on disk, or upload one stored once; never ingested — for millions of
+  hashes). File-backed projects read the file zero-copy at launch and track cracks via
+  a persistent per-project potfile (`--potfile-path`) instead of `Crack` rows. See
+  `DESIGN.md` §4a. Multi-type dumps become one project per type (a future "case" layer
+  can group them).
 - **Record attacks (all common modes)** — mask (`-a 3`), straight/wordlist (`-a 0`,
   with rule files), combinator (`-a 1`), and hybrids (`-a 6`/`-a 7`). Mask attacks get
   exact keyspace + overlap; the others (whose keyspace can't be computed) are checked

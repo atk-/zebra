@@ -6,3 +6,5 @@ __pycache__/
 # Django
 *.sqlite3
 /zebra/db.sqlite3
+# zebra-managed hash files & per-project potfiles (may be huge / contain plaintexts)
+/data/

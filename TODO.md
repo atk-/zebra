@@ -94,6 +94,10 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
 ## Data model & scope
 - [x] **One hash type per project** (`Project.hashtype`); hashes/attacks inherit it;
       coverage scope is per (project, length)
+- [x] **Hybrid hash source**: DB-backed (ingested `Hash` rows) OR file-backed
+      (`Project.hashfile_path` → external file, read zero-copy; cracks via a
+      persistent per-project potfile, no `Crack` rows) for millions-of-hashes lists.
+      Line-counted once (`services/hashfile.py`); see `DESIGN.md` §4a
 - [ ] **Case / superproject** layer grouping related projects (e.g. all hash types
       from one AD dump) for an engagement-level rollup
 - [ ] Per-project **wildcard/charset scoping** (wildcards are currently global)

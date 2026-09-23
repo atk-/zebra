@@ -20,6 +20,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # this file. Shipped at the repo root, one level above BASE_DIR (the project dir).
 ZEBRA_C_COMPLEMENT_PATH = BASE_DIR.parent / 'b_complement.hcchr'
 
+# Root for zebra-managed data files: uploaded-and-stored hashfiles
+# (data/hashfiles/) and persistent per-project potfiles (data/potfiles/) for
+# file-backed projects. Subdirs are created lazily at write time. The repo-root
+# `data/` dir is gitignored.
+ZEBRA_DATA_DIR = str(BASE_DIR.parent / 'data')
+
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
