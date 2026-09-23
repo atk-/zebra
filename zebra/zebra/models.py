@@ -145,6 +145,7 @@ class Run(models.Model):
     """
     STATUS_CHOICES = [
         ('planned', 'Planned'),
+        ('queued', 'Queued'),
         ('running', 'Running'),
         ('exhausted', 'Exhausted'),
         ('aborted', 'Aborted'),
@@ -183,6 +184,9 @@ class Run(models.Model):
     # hashcat is on. offset is 0-based; both null for a non-incremental run.
     increment_offset = models.IntegerField(null=True, blank=True)
     increment_count = models.IntegerField(null=True, blank=True)
+    # Ordering key while status == 'queued' (the machine-wide attack queue); null
+    # when the run isn't queued. Lower position runs first.
+    queue_position = models.IntegerField(null=True, blank=True)
     pid = models.IntegerField(null=True, blank=True)  # OS pid while running (launcher)
     started_at = models.DateTimeField(null=True, blank=True)
     ended_at = models.DateTimeField(null=True, blank=True)

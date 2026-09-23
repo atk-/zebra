@@ -61,13 +61,25 @@
       setTimeout(poll, 3000);
     })();
     </script>
+  {% elif run.status == 'queued' %}
+    <p><span class="pill">queued</span> in the
+      <a href="{% url 'queue' %}">attack queue</a> — it starts automatically when the
+      running attack finishes.</p>
+    <form method="post" action="{% url 'run_dequeue' run.pk %}" style="display:inline"
+          onsubmit="return confirm('Remove this attack from the queue?');">
+      {% csrf_token %}
+      <button class="btn danger" type="submit">Remove from queue</button>
+    </form>
   {% elif run.attack_mode == 3 and hashcat_available %}
-    <form method="post" action="{% url 'run_start' run.pk %}">
+    <form method="post" action="{% url 'run_start' run.pk %}" style="display:inline">
       {% csrf_token %}
       <button class="btn" type="submit">Run attack</button>
-      <span class="muted">Launches hashcat against this project's hashes and updates
-        the status when it finishes.</span>
     </form>
+    <form method="post" action="{% url 'run_enqueue' run.pk %}" style="display:inline">
+      {% csrf_token %}
+      <button class="btn secondary" type="submit">Add to queue</button>
+    </form>
+    <span class="muted">Run now, or queue it to run after other attacks.</span>
   {% elif run.attack_mode != 3 %}
     <div class="note muted">Launching this attack type isn't supported yet — it needs
       the wordlist/rule files on disk. Mask attacks (-a 3) can be run from here.</div>

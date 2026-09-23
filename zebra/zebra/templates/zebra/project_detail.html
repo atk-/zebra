@@ -131,6 +131,7 @@
     <td>
       {% if r.status == 'exhausted' or r.status == 'cracked' %}<span class="pill ok">{{ r.status }}</span>
       {% elif r.status == 'aborted' or r.status == 'error' %}<span class="pill warn">{{ r.status }}</span>
+      {% elif r.status == 'queued' %}<a class="pill" href="{% url 'queue' %}" style="text-decoration:none">queued</a>
       {% else %}<span class="muted">{{ r.status }}</span>{% endif %}
     </td>
     <td>{{ r.hashes.count }}</td>

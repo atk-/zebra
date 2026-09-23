@@ -50,6 +50,9 @@ def _session_name(run):
     parts.append('a%d' % run.pk)
     return '-'.join(parts)
 
+_paused = False  # queue auto-advance paused? Process-local, like _active (resets on
+#                  restart); the queue simply won't auto-start until resumed.
+
 # run_id -> subprocess.Popen for the currently-running attack(s).
 _active = {}
 _lock = threading.Lock()
@@ -226,6 +229,9 @@ def _execute(run, proc, fd, workdir, pot):
         with _lock:
             _active.pop(run.pk, None)
         shutil.rmtree(workdir, ignore_errors=True)
+        # This run's status is already terminal, so the one-at-a-time guard is now
+        # clear: chain to the next queued attack (unless the queue is paused).
+        _advance_queue()
         connection.close()
 
 
@@ -275,3 +281,98 @@ def stop_run(run):
         run.ended_at = timezone.now()
         run.save(update_fields=['status', 'pid', 'ended_at'])
     return None
+
+
+# --- attack queue -----------------------------------------------------------
+#
+# A machine-wide FIFO (reorderable) queue of mask runs. Enqueuing marks a planned
+# run 'queued'; when the active run finalises (or on enqueue/resume while idle) the
+# lowest-position queued run is auto-started. The GPU is a single resource, so the
+# queue spans all projects and honours the same one-at-a-time guarantee.
+
+def is_paused():
+    return _paused
+
+
+def _next_queued():
+    """The queued run that should run next (lowest position), or None."""
+    return (Run.objects.filter(status='queued')
+            .order_by('queue_position', 'pk').first())
+
+
+def _advance_queue(runner=None):
+    """Start the next queued run if the queue is active and nothing is running.
+
+    Relies on ``start_run``'s DB guard as the real gate, so it does not hold
+    ``_lock`` across the call (Lock is not reentrant). Returns the started run or
+    None."""
+    if _paused:
+        return None
+    if Run.objects.filter(status='running').exists():
+        return None
+    nxt = _next_queued()
+    if nxt is None:
+        return None
+    err = start_run(nxt, runner=runner)
+    return None if err else nxt
+
+
+def enqueue(run):
+    """Add a planned mask run to the tail of the queue; start it if idle.
+
+    Returns None on success or an error string."""
+    if run.attack_mode != 3:
+        return 'Only mask attacks (-a 3) can be queued yet.'
+    if run.mask is None:
+        return 'This mask attack has no mask to run.'
+    if run.status in ('running', 'queued'):
+        return None  # already active/queued -- nothing to do
+    last = (Run.objects.filter(status='queued')
+            .order_by('-queue_position').first())
+    run.queue_position = (last.queue_position + 1) if last and last.queue_position else 1
+    run.status = 'queued'
+    run.save(update_fields=['status', 'queue_position'])
+    _advance_queue()
+    return None
+
+
+def dequeue(run):
+    """Remove a run from the queue, returning it to 'planned'."""
+    if run.status == 'queued':
+        run.status = 'planned'
+        run.queue_position = None
+        run.save(update_fields=['status', 'queue_position'])
+    return None
+
+
+def move(run, delta):
+    """Reorder a queued run by swapping positions with its neighbour (delta ±1)."""
+    if run.status != 'queued':
+        return None
+    order = list(Run.objects.filter(status='queued').order_by('queue_position', 'pk'))
+    idx = next((i for i, r in enumerate(order) if r.pk == run.pk), None)
+    if idx is None:
+        return None
+    swap = idx + (1 if delta > 0 else -1)
+    if 0 <= swap < len(order):
+        a, b = order[idx], order[swap]
+        a.queue_position, b.queue_position = b.queue_position, a.queue_position
+        # positions may be null/duplicated on legacy rows -> normalise this pair
+        if a.queue_position == b.queue_position:
+            a.queue_position, b.queue_position = swap + 1, idx + 1
+        a.save(update_fields=['queue_position'])
+        b.save(update_fields=['queue_position'])
+    return None
+
+
+def pause_queue():
+    """Stop the queue from auto-advancing (the active run keeps going)."""
+    global _paused
+    _paused = True
+
+
+def resume_queue():
+    """Resume auto-advance and kick off the next queued run if idle."""
+    global _paused
+    _paused = False
+    _advance_queue()

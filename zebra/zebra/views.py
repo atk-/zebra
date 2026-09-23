@@ -329,6 +329,81 @@ def run_stop(request, pk):
     return redirect(detail + ('?error=' + quote(err) if err else ''))
 
 
+def _queue_back(request, pk):
+    """Where to return after a queue action: the form's 'next', else run detail."""
+    return request.POST.get('next') or reverse('run_detail', args=[pk])
+
+
+def run_enqueue(request, pk):
+    """Add a planned mask run to the attack queue (POST-only)."""
+    run = get_object_or_404(Run, pk=pk)
+    if request.method != 'POST':
+        return redirect(reverse('run_detail', args=[pk]))
+    err = launcher.enqueue(run)
+    if err:
+        return redirect(reverse('run_detail', args=[pk]) + '?error=' + quote(err))
+    return redirect(_queue_back(request, pk))
+
+
+def run_dequeue(request, pk):
+    """Remove a run from the queue, back to planned (POST-only)."""
+    run = get_object_or_404(Run, pk=pk)
+    if request.method != 'POST':
+        return redirect(reverse('run_detail', args=[pk]))
+    launcher.dequeue(run)
+    return redirect(_queue_back(request, pk))
+
+
+def run_move(request, pk):
+    """Reorder a queued run up/down (POST-only, ?dir=up|down)."""
+    run = get_object_or_404(Run, pk=pk)
+    if request.method != 'POST':
+        return redirect(reverse('queue'))
+    launcher.move(run, -1 if request.POST.get('dir') == 'up' else 1)
+    return redirect(_queue_back(request, pk))
+
+
+def queue_pause(request):
+    if request.method == 'POST':
+        launcher.pause_queue()
+    return redirect(reverse('queue'))
+
+
+def queue_resume(request):
+    if request.method == 'POST':
+        launcher.resume_queue()
+    return redirect(reverse('queue'))
+
+
+def queue(request):
+    """The machine-wide attack queue: what's running, what's next, ETA to clear it."""
+    running = (Run.objects.filter(status='running')
+               .select_related('mask', 'project').first())
+    queued = list(Run.objects.filter(status='queued')
+                  .select_related('mask', 'project').order_by('queue_position', 'pk'))
+    items, cumulative, all_have_eta = [], 0.0, True
+    for r in queued:
+        rate = int(r.project.benchmark_hs) if r.project and r.project.benchmark_hs else 0
+        ks = int(r.mask.keyspace) if r.mask and r.mask.keyspace is not None else None
+        if rate and ks is not None:
+            est = ks / rate
+            cumulative += est
+            label = _format_duration(est)
+        else:
+            label, all_have_eta = None, False
+        items.append({'run': r, 'est_label': label})
+    recent = (Run.objects.filter(status__in=['exhausted', 'cracked', 'aborted', 'error'])
+              .select_related('mask', 'project').order_by('-ended_at')[:8])
+    return render(request, 'zebra/queue.html', {
+        'running': running,
+        'items': items,
+        'queued_count': len(queued),
+        'total_eta': _format_duration(cumulative) if items and all_have_eta else None,
+        'paused': launcher.is_paused(),
+        'recent': recent,
+    })
+
+
 def run_delete(request, pk):
     """Remove an attack (typo/error). POST-only; GET falls back to the detail page."""
     run = get_object_or_404(Run, pk=pk)

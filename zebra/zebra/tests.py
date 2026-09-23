@@ -1425,3 +1425,167 @@ class SessionNameTests(TestCase):
         project = Project.objects.create(name='X', hashtype=ht)
         run = Run.objects.create(project=project, attack_mode=3, status='planned')
         self.assertRegex(launcher._session_name(run), r'^zebra-p\d+-x-a\d+$')
+
+
+class QueueTests(TestCase):
+    """Attack-queue logic: enqueue/dequeue/reorder and auto-advance selection."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='Q-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='QUEUE', hashtype=self.ht)
+        Hash.objects.create(hashstring='q1', project=self.project, cracked=False)
+
+    def tearDown(self):
+        launcher._paused = False
+        with launcher._lock:
+            launcher._active.clear()
+
+    def _run(self, pattern='?d?d', status='planned'):
+        mask = Mask.objects.create(project=self.project, pattern=pattern)
+        r = Run.objects.create(mask=mask, project=self.project, attack_mode=3, status=status)
+        r.hashes.set(self.project.hash_set.all())
+        return r
+
+    @mock.patch.object(launcher, 'start_run', return_value=None)
+    def test_enqueue_assigns_incrementing_positions(self, _start):
+        a, b = self._run('?d?d'), self._run('?d?d?d')
+        launcher.enqueue(a); launcher.enqueue(b)
+        a.refresh_from_db(); b.refresh_from_db()
+        self.assertEqual((a.status, b.status), ('queued', 'queued'))
+        self.assertEqual([a.queue_position, b.queue_position], [1, 2])
+
+    def test_enqueue_rejects_non_mask(self):
+        r = Run.objects.create(project=self.project, attack_mode=0, status='planned')
+        self.assertIn('mask', launcher.enqueue(r))
+
+    @mock.patch.object(launcher, 'start_run', return_value=None)
+    def test_dequeue_restores_planned(self, _s):
+        launcher._paused = True
+        a = self._run(); launcher.enqueue(a)
+        launcher.dequeue(a); a.refresh_from_db()
+        self.assertEqual(a.status, 'planned')
+        self.assertIsNone(a.queue_position)
+
+    @mock.patch.object(launcher, 'start_run', return_value=None)
+    def test_move_reorders(self, _s):
+        launcher._paused = True
+        a, b, c = self._run(), self._run('?d?d?d'), self._run('?d?d?d?d')
+        for r in (a, b, c):
+            launcher.enqueue(r)
+        launcher.move(c, -1)  # move last up one
+        order = list(Run.objects.filter(status='queued')
+                     .order_by('queue_position', 'pk').values_list('pk', flat=True))
+        self.assertEqual(order, [a.pk, c.pk, b.pk])
+
+    def test_next_queued_is_lowest_position(self):
+        launcher._paused = True
+        a, b = self._run(), self._run('?d?d?d')
+        with mock.patch.object(launcher, 'start_run', return_value=None):
+            launcher.enqueue(a); launcher.enqueue(b)
+        self.assertEqual(launcher._next_queued().pk, a.pk)
+
+    def test_advance_starts_next_when_idle(self):
+        launcher._paused = True
+        with mock.patch.object(launcher, 'start_run', return_value=None):
+            a = self._run(); launcher.enqueue(a)   # queued but not started (paused)
+        with mock.patch.object(launcher, 'start_run', return_value=None) as m:
+            launcher._paused = False
+            started = launcher._advance_queue()
+        self.assertEqual(started.pk, a.pk)
+        m.assert_called_once()
+
+    def test_advance_noop_when_paused(self):
+        launcher._paused = True
+        with mock.patch.object(launcher, 'start_run', return_value=None) as m:
+            launcher.enqueue(self._run())
+            self.assertIsNone(launcher._advance_queue())
+            m.assert_not_called()
+
+    def test_advance_noop_when_running(self):
+        self._run(status='running')            # occupies the GPU
+        with mock.patch.object(launcher, 'start_run', return_value=None) as m:
+            a = self._run(); launcher.enqueue(a)   # enqueue -> advance sees running
+            m.assert_not_called()
+        a.refresh_from_db()
+        self.assertEqual(a.status, 'queued')
+
+
+class QueueChainTests(TransactionTestCase):
+    """Finishing a run advances the queue (the _execute finally hook)."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='QC-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='QCHAIN', hashtype=self.ht)
+        Hash.objects.create(hashstring='qc', project=self.project, cracked=False)
+        self.mask = Mask.objects.create(project=self.project, pattern='?d?d')
+        self.run = Run.objects.create(mask=self.mask, project=self.project,
+                                      attack_mode=3, status='running')
+        self.run.hashes.set(self.project.hash_set.all())
+
+    def tearDown(self):
+        launcher._paused = False
+        with launcher._lock:
+            launcher._active.clear()
+
+    def test_execute_finally_advances_queue(self):
+        d = tempfile.mkdtemp()
+        pot = os.path.join(d, 'zebra.pot')
+        stub = _write_stub(d, "exit 1\n")  # exhausted
+        proc = subprocess.Popen([stub], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        with mock.patch.object(launcher, '_advance_queue', return_value=None) as adv:
+            launcher._execute(self.run, proc, proc.stdout.fileno(), d, pot)
+        adv.assert_called_once()
+
+
+class QueueViewTests(TestCase):
+    """Queue page + enqueue/dequeue/pause endpoints."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='QV-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='QV', hashtype=self.ht,
+                                              benchmark_hs=1_000_000_000)  # 1 GH/s
+        Hash.objects.create(hashstring='qv1', project=self.project, cracked=False)
+
+    def tearDown(self):
+        launcher._paused = False
+        with launcher._lock:
+            launcher._active.clear()
+
+    def _queued(self, pattern='?d?d', pos=1):
+        mask = Mask.objects.create(project=self.project, pattern=pattern)
+        ch.compute_and_cache_keyspace(mask); mask.save()
+        r = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                               status='queued', queue_position=pos)
+        r.hashes.set(self.project.hash_set.all())
+        return r
+
+    def test_queue_page_lists_and_totals(self):
+        self._queued('?d' * 12, pos=1)   # 10^12 / 1e9 = 1000s ~ 16.7 minutes
+        resp = self.client.get('/zebra/queue/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, 'queued')
+        self.assertContains(resp, '× 10')       # keyspace scientific
+        self.assertContains(resp, 'to clear')   # cumulative ETA header
+
+    def test_enqueue_endpoint(self):
+        mask = Mask.objects.create(project=self.project, pattern='?d?d')
+        run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                                 status='planned')
+        run.hashes.set(self.project.hash_set.all())
+        with mock.patch.object(launcher, 'start_run', return_value=None):
+            self.client.post('/zebra/run/%d/enqueue/' % run.pk)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'queued')
+
+    def test_dequeue_endpoint(self):
+        run = self._queued()
+        self.client.post('/zebra/run/%d/dequeue/' % run.pk)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'planned')
+
+    def test_pause_resume_endpoints(self):
+        with mock.patch.object(launcher, '_advance_queue', return_value=None):
+            self.client.post('/zebra/queue/pause/')
+            self.assertTrue(launcher.is_paused())
+            self.client.post('/zebra/queue/resume/')
+            self.assertFalse(launcher.is_paused())

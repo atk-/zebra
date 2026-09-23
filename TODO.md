@@ -65,6 +65,10 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
       persisting historical `Benchmark` rows (per hashtype/device)
 - [x] **Active launcher, first cut** (`services/launcher.py`): run a **mask** attack
       from its page in a background thread; live progress; final status + crack import
+- [x] **Attack queue / playbook**: queue planned mask runs and chain them sequentially
+      unattended (auto-start next on finish), machine-wide, with cumulative ETA,
+      reorder, remove, and pause/resume (`/zebra/queue/`). Distinct from the
+      worker/queue item below (this is in-process sequential, not RQ/Celery).
 - [ ] Launch **wordlist/combinator/hybrid** attacks (needs `Wordlist`/`RuleSet` paths
       validated on disk)
 - [ ] **Worker/queue** (RQ/Celery) so runs survive restarts / can run in parallel.

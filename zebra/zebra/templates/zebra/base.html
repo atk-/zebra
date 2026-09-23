@@ -112,7 +112,9 @@
 </style>
 </head>
 <body>
-<header><a href="{% url 'index' %}">🦓 zebra</a> <span class="muted">hashcat mask coverage</span></header>
+<header><a href="{% url 'index' %}">🦓 zebra</a>
+  <a href="{% url 'queue' %}" style="margin-left:16px; font-weight:400;">Queue</a>
+  <span class="muted">hashcat mask coverage</span></header>
 <main>{% block breadcrumb %}{% endblock %}{% block content %}{% endblock %}</main>
 <script>
 // Attack-type toggle: show only the field groups whose data-modes contains the

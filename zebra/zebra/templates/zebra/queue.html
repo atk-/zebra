@@ -1,0 +1,98 @@
+{% extends "zebra/base.html" %}
+{% load zebra_extras %}
+{% block title %}Attack queue — zebra{% endblock %}
+{% block breadcrumb %}
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <a href="{% url 'index' %}">Projects</a>
+  <span class="sep">&rsaquo;</span>
+  <span class="current" aria-current="page">Queue</span>
+</nav>
+{% endblock %}
+{% block content %}
+<h1>Attack queue</h1>
+<p class="muted">Mask attacks run one at a time; queued attacks start automatically
+  when the current one finishes.</p>
+
+<div class="card" style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+  <div>
+    <strong>{{ queued_count }}</strong> queued
+    {% if total_eta %}&middot; <span class="muted">~{{ total_eta }} to clear</span>
+    {% elif queued_count %}&middot; <span class="muted">ETA needs a benchmark on each project</span>{% endif %}
+  </div>
+  <div style="margin-left:auto;">
+    {% if paused %}
+      <span class="pill warn">paused</span>
+      <form method="post" action="{% url 'queue_resume' %}" style="display:inline">
+        {% csrf_token %}<button class="btn" type="submit">Resume queue</button>
+      </form>
+    {% else %}
+      <form method="post" action="{% url 'queue_pause' %}" style="display:inline">
+        {% csrf_token %}<button class="btn secondary" type="submit">Pause queue</button>
+      </form>
+    {% endif %}
+  </div>
+</div>
+
+{% if running %}
+<h2>Running now</h2>
+<div class="card">
+  <a href="{% url 'run_detail' running.pk %}"><code>{{ running.describe }}</code></a>
+  <span class="pill">running</span>
+  <div class="muted" style="margin-top:6px;">{{ running.project.name }} ·
+    {% widthratio running.progress 1 100 %}% ·
+    <a href="{% url 'run_detail' running.pk %}">live progress →</a></div>
+</div>
+{% endif %}
+
+<h2>Up next ({{ queued_count }})</h2>
+{% if items %}
+<table>
+  <tr><th style="width:2em">#</th><th>Project</th><th>Attack</th><th>Keyspace</th>
+      <th>Est. runtime</th><th style="width:9em">Order</th><th></th></tr>
+  {% for it in items %}
+  <tr>
+    <td class="muted">{{ forloop.counter }}</td>
+    <td><a href="{% url 'project_detail' it.run.project.pk %}">{{ it.run.project.name }}</a></td>
+    <td><a href="{% url 'run_detail' it.run.pk %}"><code>{{ it.run.describe }}</code></a></td>
+    <td>{% if it.run.mask.keyspace is not None %}{{ it.run.mask.keyspace|bignum }}{% else %}—{% endif %}</td>
+    <td>{% if it.est_label %}~{{ it.est_label }}{% else %}<span class="muted">—</span>{% endif %}</td>
+    <td>
+      <form method="post" action="{% url 'run_move' it.run.pk %}" style="display:inline">
+        {% csrf_token %}<input type="hidden" name="next" value="{% url 'queue' %}">
+        <button class="btn secondary" type="submit" name="dir" value="up"
+                title="Move up"{% if forloop.first %} disabled{% endif %}>↑</button>
+        <button class="btn secondary" type="submit" name="dir" value="down"
+                title="Move down"{% if forloop.last %} disabled{% endif %}>↓</button>
+      </form>
+    </td>
+    <td>
+      <form method="post" action="{% url 'run_dequeue' it.run.pk %}" style="display:inline"
+            onsubmit="return confirm('Remove this attack from the queue?');">
+        {% csrf_token %}<input type="hidden" name="next" value="{% url 'queue' %}">
+        <button class="btn danger" type="submit">Remove</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">Nothing queued. Open an attack's page and choose <em>Add to queue</em>.</p>
+{% endif %}
+
+{% if recent %}
+<h2>Recently finished</h2>
+<table>
+  <tr><th>Project</th><th>Attack</th><th>Status</th><th>Cracks</th><th>When</th></tr>
+  {% for r in recent %}
+  <tr>
+    <td class="muted">{{ r.project.name }}</td>
+    <td><a href="{% url 'run_detail' r.pk %}"><code>{{ r.describe }}</code></a></td>
+    <td>{% if r.status == 'exhausted' or r.status == 'cracked' %}<span class="pill ok">{{ r.status }}</span>
+        {% else %}<span class="pill warn">{{ r.status }}</span>{% endif %}</td>
+    <td>{{ r.cracks.count }}</td>
+    <td class="muted">{{ r.ended_at }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}
