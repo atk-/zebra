@@ -368,6 +368,9 @@ def ingest_status(run, summary):
     if 'speed_hs' in summary:
         run.speed_hs = summary['speed_hs']
         fields.append('speed_hs')
+    if 'recovered' in summary:
+        run.recovered = summary['recovered']
+        fields.append('recovered')
     if 'base_offset' in summary:
         run.increment_offset = summary['base_offset']
         fields.append('increment_offset')

@@ -1398,6 +1398,18 @@ class IncrementProgressTests(TestCase):
         self.assertEqual(run.increment_offset, 2)
         self.assertEqual(run.increment_count, 3)
 
+    def test_ingest_status_stores_recovered(self):
+        mask = Mask.objects.create(project=self.project, pattern='?d?d?d')
+        run = Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                                 status='running')
+        # hashcat status-json: recovered_hashes: [3, 100]
+        summary = hcsvc.parse_status_json(
+            '{"status":3,"progress":[5,100],"recovered_hashes":[3,100]}')
+        self.assertEqual(summary['recovered'], 3)
+        hcsvc.ingest_status(run, summary)
+        run.refresh_from_db()
+        self.assertEqual(run.recovered, 3)
+
     def test_status_json_view_reports_1based_counter(self):
         mask = Mask.objects.create(project=self.project, pattern='?d?d?d',
                                    increment_min=1, increment_max=3)
@@ -1967,3 +1979,102 @@ class FileBackedViewTests(TestCase):
         finally:
             if os.path.exists(pot):
                 os.remove(pot)
+
+
+class ProjectRunsStatusTests(TestCase):
+    """The dashboard's live runs-status endpoint + Progress column."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='PR-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='PRUNS', hashtype=self.ht)
+        Hash.objects.create(hashstring='h', project=self.project, cracked=False)
+        self.mask = Mask.objects.create(project=self.project, pattern='?d?d')
+
+    def _run(self, status, progress=0.0):
+        return Run.objects.create(mask=self.mask, project=self.project,
+                                  attack_mode=3, status=status, progress=progress)
+
+    def test_status_json_reports_percent_and_active(self):
+        self._run('running', 0.42)
+        self._run('exhausted', 1.0)
+        d = self.client.get('/zebra/project/%d/runs.json' % self.project.pk).json()
+        by_pk = {r['pk']: r for r in d['runs']}
+        pcts = sorted(r['percent'] for r in d['runs'])
+        self.assertEqual(pcts, [42, 100])
+        self.assertTrue(d['active'])  # a running run can still change
+
+    def test_status_json_inactive_when_all_terminal(self):
+        self._run('exhausted', 1.0)
+        self._run('aborted', 0.3)
+        d = self.client.get('/zebra/project/%d/runs.json' % self.project.pk).json()
+        self.assertFalse(d['active'])
+
+    def test_live_cracks_from_recovered_while_running(self):
+        Hash.objects.create(hashstring='h2', project=self.project, cracked=False)  # 2 total
+        run = self._run('running', 0.5)
+        run.recovered = 1  # hashcat reports 1 recovered so far (no Crack rows yet)
+        run.save(update_fields=['recovered'])
+        d = self.client.get('/zebra/project/%d/runs.json' % self.project.pk).json()
+        row = next(r for r in d['runs'] if r['pk'] == run.pk)
+        self.assertEqual(row['cracks'], 1)     # live from recovered
+        self.assertEqual(d['cracked'], 1)      # project-level live count
+        self.assertEqual(d['cracked_pct'], 50.0)
+
+    def test_finished_run_reports_committed_crack_count(self):
+        from .models import Crack
+        h = Hash.objects.get(hashstring='h', project=self.project)
+        run = self._run('exhausted', 1.0)
+        Crack.objects.create(hash=h, plaintext='pw', run=run)
+        d = self.client.get('/zebra/project/%d/runs.json' % self.project.pk).json()
+        row = next(r for r in d['runs'] if r['pk'] == run.pk)
+        self.assertEqual(row['cracks'], 1)     # committed Crack rows, not recovered
+
+    def test_dashboard_shows_progress_only_for_running_and_polls(self):
+        self._run('running', 0.5)
+        self._run('exhausted', 1.0)
+        html = self.client.get('/zebra/project/%d/' % self.project.pk).content.decode()
+        self.assertNotIn('<th>Progress</th>', html)   # merged into Status
+        self.assertIn('data-runs-url', html)
+        self.assertIn('data-run-status="running"', html)
+        self.assertIn('50%', html)                    # running run's progress
+        # Only the running run gets a progress badge (not the exhausted one).
+        self.assertEqual(html.count('class="run-progress'), 1)
+
+
+class LiveCrackCountHarmonizationTests(TestCase):
+    """Live crack counts show on first paint (not 0 until a poll), everywhere."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='LH-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='LHP', hashtype=self.ht)
+        for s in ('a', 'b', 'c', 'd'):
+            Hash.objects.create(hashstring=s, project=self.project, cracked=False)
+        self.mask = Mask.objects.create(project=self.project, pattern='?d?d')
+
+    def _running(self, recovered=None):
+        return Run.objects.create(mask=self.mask, project=self.project, attack_mode=3,
+                                  status='running', progress=0.5, recovered=recovered)
+
+    def test_run_crack_count_uses_recovered_while_running(self):
+        run = self._running(recovered=2)
+        self.assertEqual(run.crack_count(), 2)          # live, before any Crack rows
+        run.status = 'exhausted'
+        self.assertEqual(run.crack_count(), 0)          # committed rows once finished
+
+    def test_project_live_cracked_count(self):
+        self._running(recovered=3)
+        self.assertEqual(self.project.live_cracked_count(), 3)
+
+    def test_dashboard_initial_render_shows_live_cracks(self):
+        self._running(recovered=2)
+        html = self.client.get('/zebra/project/%d/' % self.project.pk).content.decode()
+        # Top card cracked count and the run's Cracks cell reflect recovered at paint.
+        self.assertIn('id="proj-cracked">2<', html)
+        self.assertIn('class="run-cracks">2<', html)
+
+    def test_run_detail_and_status_json_show_live_cracks(self):
+        run = self._running(recovered=2)
+        html = self.client.get('/zebra/run/%d/' % run.pk).content.decode()
+        self.assertIn('id="run-cracks">2<', html)       # Specification table, first paint
+        d = self.client.get('/zebra/run/%d/status.json' % run.pk).json()
+        self.assertEqual(d['cracks'], 2)                # endpoint agrees

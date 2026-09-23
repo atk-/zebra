@@ -104,6 +104,18 @@ class Project(models.Model):
             return hashfile.potfile_cracked_count(self.resolve_potfile_path())
         return self.hash_set.filter(cracked=True).count()
 
+    def live_cracked_count(self):
+        """Project cracked count for display, live during a run.
+
+        A running attack's hashcat-reported ``recovered`` (already persisted each
+        status tick) if any, else the committed count. Mirrors ``Run.crack_count``
+        at the project level so the dashboard header is correct on first paint, not
+        only after the first poll."""
+        running = self.runs.filter(status='running').exclude(recovered=None).first()
+        if running is not None:
+            return running.recovered
+        return self.cracked_count()
+
     def resolve_potfile_path(self):
         """The persistent per-project potfile path (explicit, else managed default)."""
         if self.potfile_path:
@@ -295,6 +307,10 @@ class Run(models.Model):
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='planned')
     speed_hs = models.DecimalField(max_digits=80, decimal_places=0, null=True, blank=True)
     progress = models.FloatField(default=0.0)  # 0..1 (of the current sub-run)
+    # Live recovered-hash count reported by hashcat --status-json (recovered_hashes)
+    # while the run is in flight -- lets the dashboard show cracks in real time
+    # before the potfile is imported at the end. Null until the first status tick.
+    recovered = models.IntegerField(null=True, blank=True)
     # Live position within a --increment sweep: which of how many length sub-runs
     # hashcat is on. offset is hashcat's 1-based guess_base_offset (1..count, as in
     # its "Guess.Queue: X/Y"); both null for a non-incremental run.
@@ -326,6 +342,17 @@ class Run(models.Model):
         if n:
             return n
         return self.project.hash_count_value() if self.project else 0
+
+    def crack_count(self):
+        """Crack count for display, live during the run.
+
+        While running, hashcat's ``recovered`` (persisted every status tick, before
+        the potfile is imported at the end); otherwise the committed ``Crack`` rows.
+        Keeps the dashboard and the attack page showing the same number throughout
+        a run instead of 0 until it finishes."""
+        if self.status == 'running' and self.recovered is not None:
+            return self.recovered
+        return self.cracks.count()
 
     def describe(self):
         """Human-readable one-line summary of what this run searched."""

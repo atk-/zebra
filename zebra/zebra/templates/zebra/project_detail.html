@@ -17,8 +17,8 @@
     ({{ project.hashtype.hashcat_module }}){% endif %}</span>
   {% if project.is_file_backed %}<span class="pill" style="background:#e8eafd;color:#3b3fb5"
      title="{{ project.hashfile_path }}">file-backed</span>{% endif %}
-  &nbsp; <strong>{{ cracked }}/{{ total_hashes }}</strong> hashes cracked
-  ({{ cracked_pct|floatformat:1 }}%)
+  &nbsp; <strong><span id="proj-cracked">{{ cracked }}</span>/{{ total_hashes }}</strong> hashes cracked
+  (<span id="proj-cracked-pct">{{ cracked_pct|floatformat:1 }}</span>%)
   &nbsp;·&nbsp; <a class="btn" href="{% url 'mask_new' project.pk %}">Record an attack</a>
   <button class="btn secondary" type="button" data-open-reco>Suggest mask</button>
   <a class="btn secondary" href="{% url 'hashes_add' project.pk %}">Add hashes</a>
@@ -123,24 +123,65 @@
 
 <h2>Attacks ({{ runs|length }})</h2>
 {% if runs %}
-<table>
+<table id="attacks-table" data-runs-url="{% url 'project_runs_status' project.pk %}">
   <tr><th style="width:1.5em"></th><th>Type</th><th>Spec</th><th>Status</th><th>Hashes</th><th>Cracks</th><th>Keyspace</th><th>When</th></tr>
   {% for r in runs %}
-  <tr>
+  <tr data-run-id="{{ r.pk }}" data-run-status="{{ r.status }}">
     <td><a href="{% url 'run_detail' r.pk %}" title="View attack details" aria-label="View attack details">🔍</a></td>
     <td class="muted">-a{{ r.attack_mode }} {{ r.attack_mode_label }}</td>
     <td><code>{{ r.describe }}</code></td>
-    <td>
+    <td class="run-status" style="white-space:nowrap">
       {% if r.status == 'queued' %}<a class="pill status st-queued" href="{% url 'queue' %}" style="text-decoration:none">{{ r.status }}</a>
       {% else %}<span class="pill status st-{{ r.status }}">{{ r.status }}</span>{% endif %}
+      {% if r.status == 'running' %}<span class="run-progress muted" style="margin-left:6px; font-size:12px; font-variant-numeric:tabular-nums">{% widthratio r.progress 1 100 %}%</span>{% endif %}
     </td>
     <td>{{ r.target_count }}</td>
-    <td>{{ r.cracks.count }}</td>
+    <td class="run-cracks">{{ r.crack_count }}</td>
     <td>{% if r.mask and r.mask.keyspace is not None %}{{ r.mask.keyspace|bignum }}{% else %}—{% endif %}</td>
     <td class="muted">{{ r.created_at }}</td>
   </tr>
   {% endfor %}
 </table>
+<script>
+// Live-refresh the Attacks table like the detail page: poll the project's run
+// statuses, update the running row's progress % in place, and do a single full
+// reload when any run's status changes (queue advancing, a run finishing) so the
+// coverage/cracked numbers and badges stay consistent. Stops when nothing is
+// active (no running/queued run left to change on its own).
+(function () {
+  var table = document.getElementById('attacks-table');
+  if (!table) return;
+  function anyActive() {
+    return Array.prototype.some.call(table.querySelectorAll('[data-run-status]'), function (tr) {
+      var s = tr.getAttribute('data-run-status');
+      return s === 'running' || s === 'queued';
+    });
+  }
+  if (!anyActive()) return;  // nothing can change; leave the static table alone
+  function poll() {
+    fetch(table.dataset.runsUrl).then(function (r) { return r.json(); }).then(function (d) {
+      var changed = false;
+      (d.runs || []).forEach(function (run) {
+        var tr = table.querySelector('tr[data-run-id="' + run.pk + '"]');
+        if (!tr) { changed = true; return; }  // a new run appeared -> reload
+        if (tr.getAttribute('data-run-status') !== run.status) changed = true;
+        var prog = tr.querySelector('.run-progress');
+        if (prog && run.status === 'running') prog.textContent = run.percent + '%';
+        var cr = tr.querySelector('.run-cracks');
+        if (cr && run.cracks != null) cr.textContent = run.cracks;
+      });
+      // Live project-level cracked count / % in the header card.
+      var pc = document.getElementById('proj-cracked');
+      if (pc && d.cracked != null) pc.textContent = d.cracked;
+      var pct = document.getElementById('proj-cracked-pct');
+      if (pct && d.cracked_pct != null) pct.textContent = d.cracked_pct.toFixed(1);
+      if (changed) { location.reload(); return; }  // status transition -> full render
+      if (d.active) setTimeout(poll, 3000);        // keep polling while active
+    }).catch(function () { setTimeout(poll, 5000); });  // retry on transient error
+  }
+  setTimeout(poll, 3000);
+})();
+</script>
 {% else %}
 <p class="muted">No attacks recorded yet. <a href="{% url 'mask_new' project.pk %}">Record the first one.</a></p>
 {% endif %}

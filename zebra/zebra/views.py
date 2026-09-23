@@ -164,8 +164,10 @@ def project_detail(request, pk):
     project = get_object_or_404(Project, pk=pk)
     hashes = project.hash_set.all()
     # Counts route through the project so a file-backed project reports its cached
-    # line count / potfile-derived cracks instead of (absent) Hash rows.
-    cracked = project.cracked_count()
+    # line count / potfile-derived cracks instead of (absent) Hash rows. The cracked
+    # count is live (hashcat's recovered while a run is in flight), so it's right on
+    # first paint rather than 0 until the first poll.
+    cracked = project.live_cracked_count()
     total_hashes = project.hash_count_value()
     coverage = ch.project_coverage(project)
     # Annotate each length's remaining keyspace with an approximate time to
@@ -296,6 +298,7 @@ def run_detail(request, pk):
         'project': run.project,
         'specs': specs,
         'cracks': run.cracks.select_related('hash').all(),
+        'crack_count': run.crack_count(),
         'target_count': run.target_count(),
         'hashcat_available': hc.configured_runner().available(),
         'launch_error': request.GET.get('error'),
@@ -319,11 +322,48 @@ def run_status_json(request, pk):
         'speed_hs': str(run.speed_hs) if run.speed_hs else None,
         'speed_grouped': '{:,}'.format(int(run.speed_hs)) if run.speed_hs else None,
         'speed_h': _format_hashrate(run.speed_hs),
-        'cracks': run.cracks.count(),
+        'cracks': run.crack_count(),  # live recovered while running, else committed
         # --increment sweep position: 1-based current sub-run and the total.
         # increment_offset is already 1-based (hashcat's guess_base_offset).
         'run_index': run.increment_offset,
         'run_total': run.increment_count,
+    })
+
+
+def project_runs_status_json(request, pk):
+    """Live status/progress/cracks of a project's runs (polled by the dashboard).
+
+    Lets the Attacks table update the running row's progress and crack count in
+    place and reload once any run's status changes (queue advancing, a run
+    finishing), mirroring the detail page. Crack counts come from hashcat's live
+    ``recovered_hashes`` while running (before the potfile is imported), else the
+    committed Crack rows. Matches the dashboard's own set/order (newest 50)."""
+    from django.db.models import Count
+    project = get_object_or_404(Project, pk=pk)
+    rows = (Run.objects.filter(project=project)
+            .annotate(n_cracks=Count('cracks'))
+            .values('pk', 'status', 'progress', 'recovered', 'n_cracks')[:50])
+    active = any(r['status'] in ('running', 'queued') for r in rows)
+    live_recovered = None
+    runs = []
+    for r in rows:
+        running = r['status'] == 'running'
+        # Live recovered count while running; the committed Crack rows otherwise.
+        cracks = r['recovered'] if (running and r['recovered'] is not None) else r['n_cracks']
+        if running and r['recovered'] is not None:
+            live_recovered = r['recovered']
+        runs.append({'pk': r['pk'], 'status': r['status'],
+                     'percent': round(100.0 * (r['progress'] or 0.0)),
+                     'cracks': cracks})
+    # Project-level cracked count for the top card: live from the running run when
+    # hashcat is reporting it, else the committed project total.
+    cracked = live_recovered if live_recovered is not None else project.cracked_count()
+    total = project.hash_count_value()
+    return JsonResponse({
+        'active': active,  # whether anything can still change on its own
+        'cracked': cracked,
+        'cracked_pct': round(100.0 * cracked / total, 1) if total else 0.0,
+        'runs': runs,
     })
 
 

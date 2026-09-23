@@ -21,6 +21,7 @@ urlpatterns = [
     path("queue/resume/", views.queue_resume, name="queue_resume"),
     path("project/<int:pk>/import/", views.import_results, name="import_results"),
     path("project/<int:pk>/benchmark/", views.project_benchmark, name="project_benchmark"),
+    path("project/<int:pk>/runs.json", views.project_runs_status_json, name="project_runs_status"),
     path("project/<int:pk>/recommend.json", views.recommend_json, name="recommend"),
     path("project/<int:pk>/coverage/<int:length>.json", views.coverage_decomposition_json, name="coverage_decomposition"),
 ]

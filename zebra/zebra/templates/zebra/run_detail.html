@@ -39,6 +39,7 @@
       var pct = document.getElementById('run-pct');
       var speed = document.getElementById('run-speed');
       var runs = document.getElementById('run-runs');
+      var cracks = document.getElementById('run-cracks');
       var submitting = false;
       document.addEventListener('submit', function (e) {
         if (!e.defaultPrevented) submitting = true;  // confirm() accepted
@@ -53,6 +54,7 @@
           speed.textContent = d.speed_grouped ? '· ' + d.speed_grouped + ' H/s' : '';
           runs.textContent = (d.run_total && d.run_total > 1)
             ? '(' + d.run_index + '/' + d.run_total + ' runs) ' : '';
+          if (cracks && d.cracks != null) cracks.textContent = d.cracks;
           setTimeout(poll, 3000);
         }).catch(function () { setTimeout(poll, 5000); });  // retry on a transient error
       }
@@ -110,7 +112,7 @@
   {% endfor %}
   <tr><td>Hash type</td><td>{{ project.hashtype.name }} ({{ project.hashtype.hashcat_module }})</td></tr>
   <tr><td>Target hashes</td><td>{{ target_count }}</td></tr>
-  <tr><td>Cracks found</td><td>{{ cracks|length }}</td></tr>
+  <tr><td>Cracks found</td><td id="run-cracks">{{ crack_count }}</td></tr>
   <tr><td>Device</td><td class="muted">{{ run.device|default:"—" }}</td></tr>
   <tr><td>Speed</td><td>{% if run.speed_hs %}{{ run.speed_hs|intcomma }} H/s{% else %}—{% endif %}</td></tr>
   <tr><td>Progress</td><td>{{ run.progress|floatformat:2 }}</td></tr>

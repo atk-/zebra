@@ -126,9 +126,11 @@
 </head>
 <body>
 
-<header><a href="{% url 'index' %}">🦓 zebra</a>
-  <a href="{% url 'queue' %}" style="margin-left:16px; font-weight:400;">Queue</a>
+<header>
+  <a href="{% url 'index' %}">🦓 zebra</a>
   <span class="muted">hashcat mask coverage</span>
+  <span class="spacer"></span>
+  <a class="nav" href="{% url 'queue' %}">☰ Queue</a>
   <a class="nav" href="{% url 'settings' %}">⚙ Settings</a>
 </header>
 

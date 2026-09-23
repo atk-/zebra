@@ -206,7 +206,8 @@ def _execute(run, proc, fd, workdir, pot):
             except ValueError:
                 continue
             live = {k: v for k, v in summary.items()
-                    if k in ('progress', 'speed_hs', 'base_offset', 'base_count')}
+                    if k in ('progress', 'speed_hs', 'recovered',
+                             'base_offset', 'base_count')}
             if live:
                 hc.ingest_status(run, live)  # progress/speed only; status from exit code
 
