@@ -1,6 +1,6 @@
 from django.contrib import admin
 from .models import (Project, HashType, Hash, CharacterSet, Wildcard,
-                     Mask, Run, Crack, Benchmark, Wordlist, RuleSet)
+                     Mask, Run, Crack, Benchmark, Wordlist, RuleSet, Settings)
 
 
 @admin.register(Mask)
@@ -36,6 +36,18 @@ class CrackAdmin(admin.ModelAdmin):
 @admin.register(Benchmark)
 class BenchmarkAdmin(admin.ModelAdmin):
     list_display = ('hashtype', 'device', 'speed_hs', 'measured_at')
+
+
+@admin.register(Settings)
+class SettingsAdmin(admin.ModelAdmin):
+    list_display = ('__str__', 'hashcat_binary')
+
+    def has_add_permission(self, request):
+        # Singleton: only ever the pk=1 row, edited in place.
+        return not Settings.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 admin.site.register(Hash)

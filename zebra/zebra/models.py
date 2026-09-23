@@ -1,6 +1,36 @@
 from django.db import models
 
 
+class Settings(models.Model):
+    """Global, project-independent program settings — a single row (pk=1).
+
+    A singleton so the whole app shares one row of knobs; ``load()`` fetches (and
+    lazily creates) it. Today it only overrides the hashcat binary; future global
+    options can hang off the same row without another model or migration churn.
+    """
+    # Absolute path (or a name resolvable on PATH) to the hashcat binary to use,
+    # overriding any globally installed copy. Blank -> fall back to 'hashcat' on
+    # PATH (services.hashcat.DEFAULT_BINARY). Resolved by hashcat.configured_binary.
+    hashcat_binary = models.CharField(max_length=1024, blank=True, default='')
+
+    class Meta:
+        verbose_name = 'settings'
+        verbose_name_plural = 'settings'
+
+    def save(self, *args, **kwargs):
+        self.pk = 1  # enforce the singleton: there is only ever one settings row
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        """Return the singleton settings row, creating it on first access."""
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def __str__(self):
+        return 'zebra settings'
+
+
 class Project(models.Model):
     name = models.CharField(max_length=200, unique=True)
     description = models.CharField(max_length=8192, blank=True, null=True)

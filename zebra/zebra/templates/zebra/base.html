@@ -13,8 +13,12 @@
   * { box-sizing:border-box; }
   body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
          color:var(--fg); background:var(--bg); }
-  header { background:#111; color:#fff; padding:12px 20px; }
+  header { background:#111; color:#fff; padding:12px 20px;
+           display:flex; align-items:baseline; gap:10px; }
   header a { color:#fff; text-decoration:none; font-weight:600; }
+  header .spacer { flex:1; }
+  header .nav { font-size:14px; font-weight:500; opacity:.85; }
+  header .nav:hover { opacity:1; text-decoration:underline; }
   main { max-width:960px; margin:0 auto; padding:24px 20px 60px; }
   h1 { font-size:22px; margin:0 0 4px; }
   h2 { font-size:17px; margin:28px 0 10px; }
@@ -112,9 +116,13 @@
 </style>
 </head>
 <body>
+
 <header><a href="{% url 'index' %}">🦓 zebra</a>
   <a href="{% url 'queue' %}" style="margin-left:16px; font-weight:400;">Queue</a>
-  <span class="muted">hashcat mask coverage</span></header>
+  <span class="muted">hashcat mask coverage</span>
+  <a class="nav" href="{% url 'settings' %}">⚙ Settings</a>
+</header>
+
 <main>{% block breadcrumb %}{% endblock %}{% block content %}{% endblock %}</main>
 <script>
 // Attack-type toggle: show only the field groups whose data-modes contains the

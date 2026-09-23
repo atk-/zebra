@@ -150,6 +150,31 @@ class HashcatRunner:
         raise NotImplementedError('active launching is a future phase')
 
 
+def configured_binary():
+    """The hashcat binary to use: the global Settings override, else DEFAULT_BINARY.
+
+    Reads the ``Settings`` singleton lazily (like ``c_complement_path`` /
+    ``ingest_*``) so this module stays importable and its parsers usable without a
+    configured Django/DB. Any failure (no Django, no table yet) falls back to the
+    binary on PATH."""
+    try:
+        from ..models import Settings
+        binary = (Settings.load().hashcat_binary or '').strip()
+        if binary:
+            return binary
+    except Exception:
+        pass
+    return DEFAULT_BINARY
+
+
+def configured_runner(**kwargs):
+    """A ``HashcatRunner`` bound to the configured binary (Settings override or PATH).
+
+    DB-aware call sites should use this instead of ``HashcatRunner()`` so the
+    global Settings override actually takes effect."""
+    return HashcatRunner(binary=configured_binary(), **kwargs)
+
+
 def _charset_flags(custom_charsets):
     """Turn {"1": "?l?d", ...} into ['-1', '?l?d', ...]."""
     flags = []

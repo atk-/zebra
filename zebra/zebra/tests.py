@@ -1589,3 +1589,40 @@ class QueueViewTests(TestCase):
             self.assertTrue(launcher.is_paused())
             self.client.post('/zebra/queue/resume/')
             self.assertFalse(launcher.is_paused())
+
+
+class SettingsViewTests(TestCase):
+    """The global Settings page and the hashcat-binary override it controls."""
+
+    def test_get_renders_page(self):
+        r = self.client.get('/zebra/settings/')
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'Settings')
+
+    def test_post_saves_override_and_feeds_runner(self):
+        from .models import Settings
+        from .services import hashcat as hc
+        r = self.client.post('/zebra/settings/',
+                             {'hashcat_binary': '/opt/hashcat/hashcat.bin'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(Settings.load().hashcat_binary, '/opt/hashcat/hashcat.bin')
+        # The override is what the DB-aware runner factory now uses.
+        self.assertEqual(hc.configured_binary(), '/opt/hashcat/hashcat.bin')
+        self.assertEqual(hc.configured_runner().binary, '/opt/hashcat/hashcat.bin')
+
+    def test_blank_override_falls_back_to_path_default(self):
+        from .models import Settings
+        from .services import hashcat as hc
+        self.client.post('/zebra/settings/', {'hashcat_binary': 'x'})
+        self.client.post('/zebra/settings/', {'hashcat_binary': '   '})  # whitespace -> blank
+        self.assertEqual(Settings.load().hashcat_binary, '')
+        self.assertEqual(hc.configured_binary(), hc.DEFAULT_BINARY)
+
+    def test_settings_is_a_singleton(self):
+        from .models import Settings
+        Settings.load()
+        Settings.load()
+        s = Settings(hashcat_binary='second')
+        s.save()
+        self.assertEqual(Settings.objects.count(), 1)
+        self.assertEqual(s.pk, 1)

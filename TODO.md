@@ -71,8 +71,11 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
       worker/queue item below (this is in-process sequential, not RQ/Celery).
 - [ ] Launch **wordlist/combinator/hybrid** attacks (needs `Wordlist`/`RuleSet` paths
       validated on disk)
+
 - [ ] **Worker/queue** (RQ/Celery) so runs survive restarts / can run in parallel.
       (Orphaned-run recovery on Stop exists; a real queue does not.)
+- [x] **Global Settings page** (`/settings/`): override the hashcat binary path,
+      overriding any copy on `PATH` (`Settings` singleton → `hashcat.configured_runner`)
 - [x] File **upload** for hashlists (New project + Add hashes; combines with paste)
 - [ ] File **upload** for potfiles / `--status-json` on the import page (paste-only)
 - [ ] Detect/validate hashtype of pasted hashes (length/format heuristics)

@@ -1,10 +1,11 @@
+import shutil
 from decimal import Decimal
 
 from django.shortcuts import render, get_object_or_404, redirect
 from django.urls import reverse
 from django.http import JsonResponse
 
-from .models import Project, Mask, HashType, Hash, Run, Wordlist, RuleSet
+from .models import Project, Mask, HashType, Hash, Run, Wordlist, RuleSet, Settings
 from . import coverage_helpers as ch
 from . import run_helpers as rh
 from .services import hashcat as hc
@@ -170,7 +171,7 @@ def project_detail(request, pk):
         'runs': (Run.objects.filter(project=project).select_related('mask')
                  .prefetch_related('cracks', 'hashes', 'wordlists', 'rules')[:50]),
         'benchmark_display': _format_hashrate(project.benchmark_hs),
-        'hashcat_available': hc.HashcatRunner().available(),
+        'hashcat_available': hc.configured_runner().available(),
         'bench_message': request.GET.get('bench_msg'),
         'bench_error': request.GET.get('bench_error'),
         'reco_durations': RECO_DURATIONS,
@@ -212,7 +213,7 @@ def project_benchmark(request, pk):
         if project.hashtype is None:
             return redirect(detail + '?bench_error='
                             + quote('This project has no hash type to benchmark.'))
-        runner = hc.HashcatRunner()
+        runner = hc.configured_runner()
         if not runner.available():
             return redirect(detail + '?bench_error='
                             + quote('hashcat is not installed on this machine.'))
@@ -280,7 +281,7 @@ def run_detail(request, pk):
         'specs': specs,
         'cracks': run.cracks.select_related('hash').all(),
         'target_count': run.hashes.count(),
-        'hashcat_available': hc.HashcatRunner().available(),
+        'hashcat_available': hc.configured_runner().available(),
         'launch_error': request.GET.get('error'),
     }
     return render(request, 'zebra/run_detail.html', context)
@@ -544,7 +545,7 @@ def mask_new(request, pk):
     })
 
     module = project.hashtype.hashcat_module
-    runner = hc.HashcatRunner()
+    runner = hc.configured_runner()
     hashfile = '%s.hashes' % project.name
 
     # --- Mask (attack mode 3): exact coverage path ---
@@ -712,6 +713,33 @@ def recommend_json(request, pk):
         'target_h': _humanize_count(target),
         'recommendations': items,
     })
+
+
+def settings_view(request):
+    """Global (project-independent) program settings.
+
+    Currently one knob: an override path to the hashcat binary. On POST we save
+    the singleton, then always report whether the (now-effective) binary resolves,
+    so the user gets immediate feedback that their path actually works.
+    """
+    config = Settings.load()
+    saved = False
+    if request.method == 'POST':
+        config.hashcat_binary = request.POST.get('hashcat_binary', '').strip()
+        config.save()
+        saved = True
+    binary = hc.configured_binary()
+    resolved = shutil.which(binary)
+    context = {
+        'settings': config,
+        'saved': saved,
+        'default_binary': hc.DEFAULT_BINARY,
+        'effective_binary': binary,
+        'is_override': bool((config.hashcat_binary or '').strip()),
+        'hashcat_available': resolved is not None,
+        'resolved_path': resolved,
+    }
+    return render(request, 'zebra/settings.html', context)
 
 
 def coverage_decomposition_json(request, pk, length):

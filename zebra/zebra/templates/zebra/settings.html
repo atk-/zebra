@@ -1,0 +1,57 @@
+{% extends "zebra/base.html" %}
+{% block title %}Settings — zebra{% endblock %}
+{% block breadcrumb %}
+<nav class="breadcrumb">
+  <a href="{% url 'index' %}">Projects</a>
+  <span class="sep">/</span>
+  <span class="current">Settings</span>
+</nav>
+{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+<p class="muted">Global program settings, independent of any project.</p>
+
+{% if saved %}<div class="note ok">Settings saved.</div>{% endif %}
+
+<form method="post" class="card">
+  {% csrf_token %}
+
+  <label>Hashcat binary <span class="muted">(optional override)</span></label>
+  <input type="text" name="hashcat_binary" value="{{ settings.hashcat_binary }}"
+         placeholder="{{ default_binary }}" autofocus>
+  <p class="muted" style="margin:6px 0 0; font-size:13px">
+    Absolute path to a <code>hashcat</code> binary to use instead of the one on your
+    <code>PATH</code>. Leave blank to use the globally installed
+    <code>{{ default_binary }}</code>.
+  </p>
+
+  <div style="margin-top:14px">
+    <button class="btn" type="submit">Save</button>
+    <a class="btn secondary" href="{% url 'index' %}">Cancel</a>
+  </div>
+</form>
+
+<div class="card">
+  <h2 style="margin-top:0">Hashcat status</h2>
+  <table>
+    <tr>
+      <th>Effective binary</th>
+      <td><code>{{ effective_binary }}</code>
+        {% if is_override %}<span class="pill warn">override</span>
+        {% else %}<span class="muted">(from PATH)</span>{% endif %}</td>
+    </tr>
+    <tr>
+      <th>Resolved</th>
+      <td>
+        {% if hashcat_available %}
+          <span class="pill ok">found</span> <code>{{ resolved_path }}</code>
+        {% else %}
+          <span class="pill warn">not found</span>
+          <span class="muted">— the app still works with manual data entry; launching
+          and benchmarks are disabled until hashcat is reachable.</span>
+        {% endif %}
+      </td>
+    </tr>
+  </table>
+</div>
+{% endblock %}

@@ -107,7 +107,7 @@ def start_run(run, runner=None):
 
     Returns None on success or an error string (guard failure) to show the user.
     """
-    runner = runner or hc.HashcatRunner()
+    runner = runner or hc.configured_runner()
     if not runner.available():
         return 'hashcat is not installed on this machine.'
     if run.attack_mode != 3:
