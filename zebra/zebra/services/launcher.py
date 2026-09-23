@@ -30,6 +30,7 @@ from django.utils import timezone
 
 from ..models import Run
 from . import hashcat as hc
+from . import hashfile
 
 POLL_SECONDS = 10  # send hashcat an 's' keypress this often to refresh status
 
@@ -135,8 +136,12 @@ def start_run(run, runner=None):
     if run.project.is_file_backed:
         pot = run.project.resolve_potfile_path()
         os.makedirs(os.path.dirname(pot), exist_ok=True)
+        # Baseline = cracks already in the shared potfile before this run, so this
+        # run is credited only with what IT finds (recovered - crack_baseline).
+        run.crack_baseline = hashfile.potfile_cracked_count(pot)
     else:
         pot = os.path.join(workdir, 'zebra.pot')
+        run.crack_baseline = None
 
     argv = runner.build_run_args(
         3, run.project.hashtype.hashcat_module, hashfile=hashpath,
@@ -145,7 +150,8 @@ def start_run(run, runner=None):
                 'increment_max': run.mask.increment_max},
         extra=['--status', '--status-json', '--status-timer', str(POLL_SECONDS),
                '--potfile-path', pot, '--restore-disable',
-               '--session', _session_name(run)])
+               '--session', _session_name(run)],
+        optimized=run.optimized)
 
     # Run under a PTY so hashcat flushes status promptly and accepts 's' keypresses.
     try:
@@ -160,6 +166,7 @@ def start_run(run, runner=None):
 
     run.status = 'running'
     run.progress = 0.0
+    run.recovered = None  # clear any stale value from a prior launch of this run
     run.started_at = timezone.now()
     run.ended_at = None
     run.pid = proc.pid
@@ -170,7 +177,8 @@ def start_run(run, runner=None):
         hi = min(hi, run.mask.length) if hi is not None else run.mask.length
         run.increment_offset = 1  # 1-based, like hashcat's guess_base_offset
         run.increment_count = max(1, hi - lo + 1)
-    run.save(update_fields=['status', 'progress', 'started_at', 'ended_at', 'pid',
+    run.save(update_fields=['status', 'progress', 'recovered', 'crack_baseline',
+                            'started_at', 'ended_at', 'pid',
                             'increment_offset', 'increment_count'])
     with _lock:
         _active[run.pk] = proc
@@ -217,7 +225,14 @@ def _execute(run, proc, fd, workdir, pot):
         run.pid = None
         if run.status == 'exhausted':
             run.progress = 1.0
-        run.save(update_fields=['status', 'ended_at', 'pid', 'progress'])
+        fields = ['status', 'ended_at', 'pid', 'progress']
+        # File-backed: pin recovered to the final potfile count so this run's own
+        # crack tally (recovered - crack_baseline) is exact after finishing, even
+        # if the last status tick missed the closing cracks.
+        if run.project.is_file_backed:
+            run.recovered = hashfile.potfile_cracked_count(pot)
+            fields.append('recovered')
+        run.save(update_fields=fields)
 
         # DB-backed: import the run's potfile into Crack rows + the cracked flag.
         # File-backed: the persistent potfile IS the source of truth (no Crack

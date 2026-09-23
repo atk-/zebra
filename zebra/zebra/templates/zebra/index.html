@@ -1,5 +1,6 @@
 {% extends "zebra/base.html" %}
 {% block content %}
+{% if deleted %}<div class="note ok">Project “{{ deleted }}” was deleted.</div>{% endif %}
 <h1>Projects</h1>
 <p class="muted">Track masks run against each hashlist and see what keyspace is left.</p>
 <p><a class="btn" href="{% url 'project_new' %}">+ New project</a></p>

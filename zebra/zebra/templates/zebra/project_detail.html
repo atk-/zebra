@@ -23,6 +23,7 @@
   <button class="btn secondary" type="button" data-open-reco>Suggest mask</button>
   <a class="btn secondary" href="{% url 'hashes_add' project.pk %}">Add hashes</a>
   <a class="btn secondary" href="{% url 'import_results' project.pk %}">Import results</a>
+  &nbsp;·&nbsp; <a class="btn danger" href="{% url 'project_delete' project.pk %}">Delete project</a>
 </div>
 
 <div class="card" id="benchmark">

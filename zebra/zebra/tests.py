@@ -732,6 +732,24 @@ class LauncherExecuteTests(TransactionTestCase):
         self.assertFalse(self.h.cracked)          # DB hash untouched
         self.assertTrue(os.path.exists(pot))      # persistent potfile survives
 
+    def test_execute_file_backed_pins_recovered_to_final_potfile(self):
+        # Per-run attribution: at finalise, recovered is pinned to the final potfile
+        # count so this run's tally (recovered - crack_baseline) is exact.
+        work = tempfile.mkdtemp(); keep = tempfile.mkdtemp()
+        ext = os.path.join(keep, 'h.txt'); open(ext, 'w').write('a\n')
+        pot = os.path.join(keep, 'p.pot'); open(pot, 'w').write('a:x\nb:y\n')  # 2 cracks
+        self.project.hashfile_path = ext
+        self.project.save(update_fields=['hashfile_path'])
+        self.run.crack_baseline = 1  # 1 crack pre-existed this run
+        self.run.recovered = None
+        self.run.save(update_fields=['crack_baseline', 'recovered'])
+        stub = _write_stub(work, "exit 1\n")
+        proc = subprocess.Popen([stub], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        launcher._execute(self.run, proc, proc.stdout.fileno(), work, pot)
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.recovered, 2)      # pinned to final potfile count
+        self.assertEqual(self.run.crack_count(), 1)  # 2 total - 1 baseline = this run
+
 
 class RunLaunchTemplateTests(TestCase):
     def setUp(self):
@@ -2078,3 +2096,142 @@ class LiveCrackCountHarmonizationTests(TestCase):
         self.assertIn('id="run-cracks">2<', html)       # Specification table, first paint
         d = self.client.get('/zebra/run/%d/status.json' % run.pk).json()
         self.assertEqual(d['cracks'], 2)                # endpoint agrees
+
+
+class OptimizedKernelTests(TestCase):
+    """The -O (optimized kernels) option: default on, wired into the command."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='OPT-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='OPTP', hashtype=self.ht,
+                                              universe='0123456789')
+        Hash.objects.create(hashstring='oh1', project=self.project, cracked=False)
+        self.url = '/zebra/project/%d/mask/new/' % self.project.pk
+
+    def test_build_run_args_adds_O_when_optimized(self):
+        from .services import hashcat as hc
+        argv = hc.HashcatRunner().build_run_args(3, 0, hashfile='H',
+                                                 params={'mask': '?d?d'}, optimized=True)
+        self.assertIn('-O', argv)
+        argv = hc.HashcatRunner().build_run_args(3, 0, hashfile='H',
+                                                 params={'mask': '?d?d'}, optimized=False)
+        self.assertNotIn('-O', argv)
+
+    def test_new_attack_form_checks_optimized_by_default(self):
+        html = self.client.get(self.url).content.decode()
+        self.assertIn('name="optimized"', html)
+        self.assertIn('checked', html)  # on by default
+
+    def test_record_optimized_stores_flag_and_command(self):
+        self.client.post(self.url, {'pattern': '?d?d', 'custom_charsets': '',
+                                    'status': 'planned', 'optimized': '1',
+                                    'action': 'record'})
+        run = Run.objects.get(mask__project=self.project)
+        self.assertTrue(run.optimized)
+        self.assertIn(' -O ', run.command)
+
+    def test_record_without_optimized_uses_pure_kernels(self):
+        # Checkbox unchecked -> field absent from POST -> optimized False, no -O.
+        self.client.post(self.url, {'pattern': '?d?d', 'custom_charsets': '',
+                                    'status': 'planned', 'action': 'record'})
+        run = Run.objects.get(mask__project=self.project)
+        self.assertFalse(run.optimized)
+        self.assertNotIn('-O', run.command)
+
+
+class PerRunCrackAttributionTests(TestCase):
+    """File-backed per-run crack attribution: each run is credited only its own
+    finds, not the cumulative shared-potfile total."""
+
+    def setUp(self):
+        import tempfile as _tf
+        self.ht = HashType.objects.create(name='AT-MD5', hashcat_module=0)
+        d = _tf.mkdtemp()
+        ext = os.path.join(d, 'h.txt'); open(ext, 'w').write('a\nb\nc\nd\n')
+        self.project = Project.objects.create(name='ATP', hashtype=self.ht,
+                                              hashfile_path=ext, hash_count=4)
+        self.mask = Mask.objects.create(project=self.project, pattern='?d?d')
+
+    def _run(self, status, recovered=None, baseline=None):
+        return Run.objects.create(mask=self.mask, project=self.project, attack_mode=3,
+                                  status=status, recovered=recovered, crack_baseline=baseline)
+
+    def test_run_credited_only_its_delta(self):
+        # run1: potfile 0 -> 2 (found 2). run2: potfile 2 -> 3 (found 1).
+        r1 = self._run('exhausted', recovered=2, baseline=0)
+        r2 = self._run('exhausted', recovered=3, baseline=2)
+        self.assertEqual(r1.crack_count(), 2)
+        self.assertEqual(r2.crack_count(), 1)   # NOT 3 (the old cumulative bug)
+
+    def test_missing_baseline_reports_zero(self):
+        r = self._run('exhausted', recovered=5, baseline=None)  # legacy run
+        self.assertEqual(r.crack_count(), 0)
+
+    def test_endpoint_attributes_per_run_and_keeps_project_total(self):
+        r1 = self._run('exhausted', recovered=2, baseline=0)
+        r2 = self._run('running', recovered=3, baseline=2)
+        d = self.client.get('/zebra/project/%d/runs.json' % self.project.pk).json()
+        by = {x['pk']: x['cracks'] for x in d['runs']}
+        self.assertEqual(by[r1.pk], 2)
+        self.assertEqual(by[r2.pk], 1)          # per-run delta, not 3
+        self.assertEqual(d['cracked'], 3)       # project total stays cumulative
+
+
+class ProjectDeleteViewTests(TestCase):
+    """Strict typed-confirmation project deletion."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='DEL-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='DELPROJ', hashtype=self.ht)
+        Hash.objects.create(hashstring='dh', project=self.project, cracked=False)
+        self.mask = Mask.objects.create(project=self.project, pattern='?d?d')
+        Run.objects.create(mask=self.mask, project=self.project, attack_mode=3,
+                           status='planned')
+        self.url = '/zebra/project/%d/delete/' % self.project.pk
+        self.phrase = 'Permanently delete the project DELPROJ and all of its data'
+
+    def test_confirm_page_shows_the_required_sentence(self):
+        r = self.client.get(self.url)
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, self.phrase)
+        self.assertContains(r, "Yes, I'm sure")
+
+    def test_wrong_sentence_does_not_delete(self):
+        r = self.client.post(self.url, {'confirm_text': 'delete it'})
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'did not match')
+        self.assertTrue(Project.objects.filter(pk=self.project.pk).exists())
+
+    def test_empty_confirmation_does_not_delete(self):
+        self.client.post(self.url, {'confirm_text': ''})
+        self.assertTrue(Project.objects.filter(pk=self.project.pk).exists())
+
+    def test_exact_sentence_deletes_and_cascades(self):
+        pk = self.project.pk
+        r = self.client.post(self.url, {'confirm_text': self.phrase})
+        self.assertEqual(r.status_code, 302)
+        self.assertIn('/zebra/?deleted=', r['Location'])
+        self.assertFalse(Project.objects.filter(pk=pk).exists())
+        self.assertFalse(Run.objects.filter(project_id=pk).exists())  # cascaded
+        self.assertFalse(Hash.objects.filter(project_id=pk).exists())
+
+    def test_sentence_match_is_trimmed_but_strict(self):
+        pk = self.project.pk
+        # Leading/trailing whitespace is tolerated...
+        self.client.post(self.url, {'confirm_text': '  ' + self.phrase + '  '})
+        self.assertFalse(Project.objects.filter(pk=pk).exists())
+
+    def test_file_backed_cleans_up_managed_files_but_not_external(self):
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        ext = os.path.join(d, 'server-owned.txt'); open(ext, 'w').write('a\n')
+        p = Project.objects.create(name='FBDEL', hashtype=self.ht,
+                                   hashfile_path=ext, hashfile_managed=False)
+        pot = p.resolve_potfile_path()
+        os.makedirs(os.path.dirname(pot), exist_ok=True); open(pot, 'w').write('a:x\n')
+        phrase = 'Permanently delete the project FBDEL and all of its data'
+        self.client.post('/zebra/project/%d/delete/' % p.pk, {'confirm_text': phrase})
+        self.assertFalse(Project.objects.filter(pk=p.pk).exists())
+        self.assertFalse(os.path.exists(pot))    # zebra-managed potfile removed
+        self.assertTrue(os.path.exists(ext))     # operator's external file untouched
+        os.remove(ext)

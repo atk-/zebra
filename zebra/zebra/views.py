@@ -21,7 +21,8 @@ from urllib.parse import quote
 
 def index(request):
     projects = Project.objects.all()
-    return render(request, 'zebra/index.html', {'projects': projects})
+    return render(request, 'zebra/index.html',
+                  {'projects': projects, 'deleted': request.GET.get('deleted')})
 
 
 # Duration magnitudes offered by the recommender popup (label -> seconds).
@@ -186,7 +187,7 @@ def project_detail(request, pk):
         'cracked_pct': (100.0 * cracked / total_hashes) if total_hashes else 0.0,
         'coverage': coverage,
         'universe_chars': ch.expand_universe(project.universe),
-        'runs': (Run.objects.filter(project=project).select_related('mask')
+        'runs': (Run.objects.filter(project=project).select_related('mask', 'project')
                  .prefetch_related('cracks', 'hashes', 'wordlists', 'rules')[:50]),
         'benchmark_display': _format_hashrate(project.benchmark_hs),
         'hashcat_available': hc.configured_runner().available(),
@@ -342,16 +343,25 @@ def project_runs_status_json(request, pk):
     project = get_object_or_404(Project, pk=pk)
     rows = (Run.objects.filter(project=project)
             .annotate(n_cracks=Count('cracks'))
-            .values('pk', 'status', 'progress', 'recovered', 'n_cracks')[:50])
+            .values('pk', 'status', 'progress', 'recovered', 'crack_baseline',
+                    'n_cracks')[:50])
     active = any(r['status'] in ('running', 'queued') for r in rows)
+    file_backed = project.is_file_backed
     live_recovered = None
     runs = []
     for r in rows:
         running = r['status'] == 'running'
-        # Live recovered count while running; the committed Crack rows otherwise.
-        cracks = r['recovered'] if (running and r['recovered'] is not None) else r['n_cracks']
+        if file_backed:
+            # Shared cumulative potfile: this run's own cracks = recovered baseline.
+            if r['recovered'] is not None and r['crack_baseline'] is not None:
+                cracks = max(0, r['recovered'] - r['crack_baseline'])
+            else:
+                cracks = 0
+        else:
+            # DB-backed: live recovered while running, else committed Crack rows.
+            cracks = r['recovered'] if (running and r['recovered'] is not None) else r['n_cracks']
         if running and r['recovered'] is not None:
-            live_recovered = r['recovered']
+            live_recovered = r['recovered']  # cumulative project total (either mode)
         runs.append({'pk': r['pk'], 'status': r['status'],
                      'percent': round(100.0 * (r['progress'] or 0.0)),
                      'cracks': cracks})
@@ -476,6 +486,54 @@ def run_delete(request, pk):
     if project_pk:
         return redirect(reverse('project_detail', args=[project_pk]))
     return redirect(reverse('index'))
+
+
+def _project_delete_phrase(project):
+    """The exact sentence a user must type to confirm deleting this project."""
+    return 'Permanently delete the project %s and all of its data' % project.name
+
+
+def _cleanup_project_files(project):
+    """Remove zebra-managed files for a project being deleted (best effort).
+
+    Only files zebra owns: the per-project potfile, and an uploaded hashfile it
+    stored (``hashfile_managed``). A server-side hashfile the operator supplied by
+    path is left untouched."""
+    paths = []
+    if project.is_file_backed:
+        paths.append(project.resolve_potfile_path())
+        if project.hashfile_managed and project.hashfile_path:
+            paths.append(project.hashfile_path)
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def project_delete(request, pk):
+    """Delete a whole project behind a strict typed confirmation.
+
+    The user must type an exact, project-specific sentence and press the confirm
+    button; anything else re-renders the page and deletes nothing. Cascades remove
+    the project's hashes/masks/runs/cracks; zebra-managed files are cleaned up too.
+    """
+    project = get_object_or_404(Project, pk=pk)
+    phrase = _project_delete_phrase(project)
+    context = {'project': project, 'phrase': phrase,
+               'run_count': project.runs.count()}
+    if request.method == 'POST':
+        typed = (request.POST.get('confirm_text') or '').strip()
+        if typed != phrase:
+            context['error'] = ('The confirmation sentence did not match — the '
+                                'project was NOT deleted.')
+            context['typed'] = typed
+            return render(request, 'zebra/project_delete.html', context)
+        name = project.name
+        _cleanup_project_files(project)
+        project.delete()
+        return redirect(reverse('index') + '?deleted=' + quote(name))
+    return render(request, 'zebra/project_delete.html', context)
 
 
 def _hashlist_from_request(request):
@@ -612,6 +670,7 @@ def mask_new(request, pk):
         context['pattern'] = (request.GET.get('pattern') or '').strip()
         context['increment'] = bool(request.GET.get('increment'))
         context['increment_max'] = (request.GET.get('increment_max') or '').strip()
+        context['optimized'] = True  # optimized kernels (-O) on by default
         return render(request, 'zebra/mask_new.html', context)
 
     # --- common inputs (echoed back for re-render) ---
@@ -621,6 +680,7 @@ def mask_new(request, pk):
         attack_mode = 3
     status = request.POST.get('status') or 'planned'
     device = (request.POST.get('device') or '').strip()
+    optimized = bool(request.POST.get('optimized'))  # -O; absent (unchecked) -> off
     action = request.POST.get('action')
 
     pattern = (request.POST.get('pattern') or '').strip()
@@ -648,6 +708,7 @@ def mask_new(request, pk):
         'wordlist': wordlist, 'left_wordlist': left_wl, 'right_wordlist': right_wl,
         'left_rule': left_rule, 'right_rule': right_rule, 'rules_raw': rules_raw,
         'increment': increment_on, 'increment_max': increment_max_raw,
+        'optimized': optimized,
     })
 
     module = project.hashtype.hashcat_module
@@ -676,7 +737,7 @@ def mask_new(request, pk):
                 'benchmark_h': _humanize_count(rate),
             }
         context['command'] = runner.plan_run(
-            3, module, hashfile=hashfile, params=mask_params)
+            3, module, hashfile=hashfile, params=mask_params, optimized=optimized)
         context['can_record'] = True
         if action in ('record', 'record_run'):
             mask, _ = Mask.objects.get_or_create(
@@ -688,7 +749,7 @@ def mask_new(request, pk):
             if inc_min is not None:
                 sig_spec['increment'] = [inc_min, inc_max]
             run = Run.objects.create(
-                mask=mask, project=project, attack_mode=3,
+                mask=mask, project=project, attack_mode=3, optimized=optimized,
                 device=device or None, status=status, command=context['command'],
                 signature=sim.signature(sig_spec))
             # Snapshot targeted hashes for DB-backed projects only; a file-backed
@@ -732,7 +793,7 @@ def mask_new(request, pk):
     context['ran_similarity'] = True
     context['command'] = runner.plan_run(
         attack_mode, module, hashfile=hashfile, wordlists=wl_names,
-        rules=rule_names, params=params)
+        rules=rule_names, params=params, optimized=optimized)
     context['can_record'] = not missing
     if missing:
         context['error'] = ('This attack needs %s.' %
@@ -749,7 +810,7 @@ def mask_new(request, pk):
         if attack_mode == 1:
             params['order'] = [w.id for w in wl_objs]
         run = Run.objects.create(
-            project=project, attack_mode=attack_mode,
+            project=project, attack_mode=attack_mode, optimized=optimized,
             device=device or None, status=status, command=context['command'],
             params=params, signature=sim.signature(candidate_spec))
         run.wordlists.set(wl_objs)

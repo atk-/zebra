@@ -303,14 +303,25 @@ class Run(models.Model):
     # Canonical dedup key set on record (see services.similarity.signature).
     signature = models.CharField(max_length=512, blank=True, default='', db_index=True)
     device = models.CharField(max_length=200, null=True, blank=True)
+    # Use hashcat's optimized kernels (-O). On by default: it's faster and matches
+    # what `hashcat -b` benchmarks with (so runtime estimates line up), at the cost
+    # of a capped password/candidate length -- fine for typical mask attacks. Can be
+    # turned off per attack to use the pure kernels (unlimited length).
+    optimized = models.BooleanField(default=True)
     command = models.CharField(max_length=4096, null=True, blank=True)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='planned')
     speed_hs = models.DecimalField(max_digits=80, decimal_places=0, null=True, blank=True)
     progress = models.FloatField(default=0.0)  # 0..1 (of the current sub-run)
-    # Live recovered-hash count reported by hashcat --status-json (recovered_hashes)
-    # while the run is in flight -- lets the dashboard show cracks in real time
-    # before the potfile is imported at the end. Null until the first status tick.
+    # Recovered-hash count reported by hashcat --status-json (recovered_hashes).
+    # Live while running; for a file-backed run (shared persistent potfile) this is
+    # CUMULATIVE across runs, so per-run attribution subtracts crack_baseline below.
+    # Null until the first status tick.
     recovered = models.IntegerField(null=True, blank=True)
+    # File-backed only: potfile crack count captured at launch, so this run's own
+    # cracks = recovered - crack_baseline (hashcat preloads and counts the shared
+    # potfile, so recovered alone would credit every prior run's cracks to the
+    # latest one). Null for DB-backed runs (transient per-run potfile + Crack rows).
+    crack_baseline = models.IntegerField(null=True, blank=True)
     # Live position within a --increment sweep: which of how many length sub-runs
     # hashcat is on. offset is hashcat's 1-based guess_base_offset (1..count, as in
     # its "Guess.Queue: X/Y"); both null for a non-incremental run.
@@ -344,12 +355,17 @@ class Run(models.Model):
         return self.project.hash_count_value() if self.project else 0
 
     def crack_count(self):
-        """Crack count for display, live during the run.
+        """Cracks attributable to THIS run, for display.
 
-        While running, hashcat's ``recovered`` (persisted every status tick, before
-        the potfile is imported at the end); otherwise the committed ``Crack`` rows.
-        Keeps the dashboard and the attack page showing the same number throughout
-        a run instead of 0 until it finishes."""
+        File-backed: the shared persistent potfile is cumulative, so this run's own
+        cracks are ``recovered - crack_baseline`` (baseline captured at launch),
+        both live and after finishing. DB-backed: a transient per-run potfile means
+        hashcat's ``recovered`` is already this run's finds while running, and the
+        committed ``Crack`` rows (FK'd to this run) once it's done."""
+        if self.project_id and self.project.is_file_backed:
+            if self.recovered is not None and self.crack_baseline is not None:
+                return max(0, self.recovered - self.crack_baseline)
+            return 0
         if self.status == 'running' and self.recovered is not None:
             return self.recovered
         return self.cracks.count()

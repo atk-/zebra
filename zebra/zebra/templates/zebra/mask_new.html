@@ -92,6 +92,15 @@
   <label>Device <span class="muted">(optional, free text)</span></label>
   <input type="text" name="device" value="{{ device|default:'' }}" placeholder="RTX 4090">
 
+  <label style="display:flex; align-items:center; gap:8px; font-weight:600;">
+    <input type="checkbox" name="optimized" value="1" style="width:auto;"
+           {% if optimized %}checked{% endif %}>
+    <span>Optimized kernels (<code>-O</code>)</span>
+  </label>
+  <span class="muted" style="font-size:13px;">Faster, and matches how the benchmark is
+    measured (so runtime estimates line up), but caps the password/candidate length.
+    Uncheck to use the pure kernels (unlimited length).</span>
+
   <div style="margin-top:14px">
     <button class="btn secondary" name="action" value="preview" type="submit">Evaluate</button>
     {% if can_record %}

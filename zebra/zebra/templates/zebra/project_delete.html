@@ -1,0 +1,66 @@
+{% extends "zebra/base.html" %}
+{% block title %}Delete {{ project.name }} — zebra{% endblock %}
+{% block breadcrumb %}
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <a href="{% url 'index' %}">Projects</a>
+  <span class="sep">&rsaquo;</span>
+  <a href="{% url 'project_detail' project.pk %}">{{ project.name }}</a>
+  <span class="sep">&rsaquo;</span>
+  <span class="current" aria-current="page">Delete</span>
+</nav>
+{% endblock %}
+{% block content %}
+<h1>Delete project</h1>
+
+{% if error %}<div class="note warn">{{ error }}</div>{% endif %}
+
+<div class="note warn" style="border:1px solid var(--warn);">
+  <strong>This permanently deletes the project “{{ project.name }}”.</strong>
+  Everything below goes with it and <strong>cannot be recovered</strong>:
+  <ul style="margin:8px 0 0 18px;">
+    <li>{{ run_count }} recorded attack(s) and their run history</li>
+    {% if project.is_file_backed %}
+      <li>the per-project potfile (recovered plaintexts){% if project.hashfile_managed %},
+        and the uploaded hash file zebra stored{% endif %}</li>
+      {% if not project.hashfile_managed %}
+      <li class="muted">your external hash file (<code>{{ project.hashfile_path }}</code>)
+        is <strong>not</strong> touched — only the reference is removed</li>
+      {% endif %}
+    {% else %}
+      <li>all stored hashes and recovered plaintexts (cracks)</li>
+    {% endif %}
+    <li>coverage / similarity history and recorded masks</li>
+  </ul>
+</div>
+
+<form method="post" class="card" data-confirm-phrase="{{ phrase }}">
+  {% csrf_token %}
+  <label>To confirm, type this sentence exactly:</label>
+  <p><code class="cmd" style="white-space:normal">{{ phrase }}</code></p>
+
+  <input type="text" name="confirm_text" value="{{ typed|default:'' }}"
+         autocomplete="off" autocapitalize="off" spellcheck="false" autofocus
+         placeholder="Type the sentence above" data-confirm-input>
+
+  <div style="margin-top:14px">
+    <button class="btn danger" type="submit" data-confirm-submit disabled>Yes, I'm sure</button>
+    <a class="btn secondary" href="{% url 'project_detail' project.pk %}">Cancel</a>
+  </div>
+</form>
+
+<script>
+// Progressive enhancement: enable the destructive button only once the typed text
+// exactly matches the required sentence. The server enforces the same check, so
+// this is purely a guardrail against fat-fingered confirmations.
+(function () {
+  var form = document.querySelector('[data-confirm-phrase]');
+  if (!form) return;
+  var phrase = form.getAttribute('data-confirm-phrase');
+  var input = form.querySelector('[data-confirm-input]');
+  var btn = form.querySelector('[data-confirm-submit]');
+  function sync() { btn.disabled = input.value.trim() !== phrase; }
+  input.addEventListener('input', sync);
+  sync();
+})();
+</script>
+{% endblock %}
