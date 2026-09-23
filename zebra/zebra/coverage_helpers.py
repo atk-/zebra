@@ -117,8 +117,14 @@ def evaluate_candidate(project, pattern, custom_charsets=None,
     """Assess a candidate mask against a project's existing masks.
 
     ``increment_min`` set marks a ``--increment`` candidate: its keyspace/overlap are
-    summed over the swept length-prefixes. Returns a dict: keyspace, length, overlap,
-    marginal, overlap_pct, subsumed, incremental, increment_min, increment_max, error.
+    summed over the swept length-prefixes. For an incremental candidate, the
+    effective ``increment_min`` is auto-raised past any *leading* lengths whose
+    mask-prefix is already fully covered by exhausted runs (a sweep is a contiguous
+    range, so only a leading run can be skipped) -- e.g. after an exhaustive ``?a``
+    sweep of lengths 1-6, a new ``?d`` sweep starts at length 7. Returns a dict:
+    keyspace, length, overlap, marginal, overlap_pct, subsumed, incremental,
+    increment_min (effective), increment_min_requested, increment_skipped,
+    redundant_increment, increment_max, error.
     """
     wmap = project_wildcard_map()
     try:
@@ -127,13 +133,25 @@ def evaluate_candidate(project, pattern, custom_charsets=None,
     except cov.MaskParseError as exc:
         return {'error': str(exc)}
     incremental = increment_min is not None
-    if incremental and increment_max is None:
-        increment_max = len(positions)  # hashcat default: sweep up to the mask length
+    existing = project_covered_expansion(project, wmap)
+    requested_min = increment_min
+    increment_skipped = 0
+    redundant = False
     if incremental:
-        segments = cov.mask_prefixes(positions, increment_min, increment_max)
+        n = len(positions)
+        lo0 = max(1, increment_min)
+        hi = min(n, increment_max if increment_max is not None else n)
+        # Advance past leading length-prefixes that add nothing new (fully covered).
+        lo = lo0
+        while lo <= hi and cov.mask_keyspace(positions[:lo]) > 0 \
+                and cov.is_subsumed(positions[:lo], existing):
+            lo += 1
+        increment_skipped = lo - lo0
+        increment_min, increment_max = lo, hi
+        redundant = lo > hi  # every swept length was already covered
+        segments = [] if redundant else cov.mask_prefixes(positions, lo, hi)
     else:
         segments = [positions]
-    existing = project_covered_expansion(project, wmap)
     keyspace = sum(cov.mask_keyspace(s) for s in segments)
     marginal = sum(cov.marginal_keyspace(s, existing) for s in segments)
     overlap = keyspace - marginal
@@ -144,9 +162,12 @@ def evaluate_candidate(project, pattern, custom_charsets=None,
         'marginal': marginal,
         'overlap': overlap,
         'overlap_pct': (100.0 * overlap / keyspace) if keyspace else 0.0,
-        'subsumed': marginal == 0 and keyspace > 0,
+        'subsumed': (marginal == 0 and keyspace > 0) or redundant,
         'incremental': incremental,
-        'increment_min': increment_min,
+        'increment_min': increment_min if incremental else None,
+        'increment_min_requested': requested_min if incremental else None,
+        'increment_skipped': increment_skipped,
+        'redundant_increment': redundant,
         'increment_max': increment_max if incremental else None,
     }
 

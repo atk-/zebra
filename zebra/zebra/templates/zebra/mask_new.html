@@ -106,10 +106,11 @@
     {% if can_record %}
     <button class="btn" name="action" value="record" type="submit">Record attack</button>
     {% if hashcat_available %}
-    {# Mask attacks only: record and launch in one click, landing on the live run page. #}
+    {# Mask attacks only: record and run in one click, landing on the run page.
+       Runs immediately when idle, or queues behind any attack in progress. #}
     <span data-modes="3">
       <button class="btn" name="action" value="record_run" type="submit"
-              title="Record this attack and launch it now">Record &amp; run</button>
+              title="Record this attack and run it (queued behind any attack in progress)">Record &amp; run</button>
     </span>
     {% endif %}
     {% endif %}
@@ -126,6 +127,19 @@
      {% if evaluation.incremental %}<br><span class="muted">Incremental
        (<code>--increment</code>): sweeps lengths {{ evaluation.increment_min }}–{{ evaluation.increment_max }};
        keyspace is the sum over those lengths.</span>{% endif %}</p>
+  {% if evaluation.increment_skipped %}
+    <div class="note ok"><strong>Smart start.</strong>
+      Length{{ evaluation.increment_skipped|pluralize }}
+      {{ evaluation.increment_min_requested }}{% if evaluation.increment_skipped > 1 %}–{{ evaluation.increment_min|add:"-1" }}{% endif %}
+      {{ evaluation.increment_skipped|pluralize:"is,are" }} already fully covered, so
+      <code>--increment-min</code> was raised to <strong>{{ evaluation.increment_min }}</strong>
+      (skipping {{ evaluation.increment_skipped }} redundant length{{ evaluation.increment_skipped|pluralize }}).</div>
+  {% endif %}
+  {% if evaluation.redundant_increment %}
+    <div class="note warn"><strong>Nothing to run.</strong> Every swept length
+      ({{ evaluation.increment_min_requested }}–{{ evaluation.increment_max }}) is already
+      fully covered — this incremental attack would add nothing.</div>
+  {% endif %}
   {% if duration %}
     <p>Expected runtime <strong>~{{ duration.label }}</strong>
       <span class="muted">at {{ duration.benchmark_h }} H/s</span></p>
@@ -133,6 +147,7 @@
     <p class="muted">Set a <a href="{% url 'project_detail' project.pk %}#benchmark">benchmark</a>
       to estimate this attack's runtime.</p>
   {% endif %}
+  {% if not evaluation.redundant_increment %}
   {% if evaluation.subsumed %}
     <div class="note warn"><strong>Redundant.</strong>
       {{ evaluation.overlap|intcomma }} of {{ evaluation.keyspace|intcomma }}
@@ -146,6 +161,7 @@
   {% else %}
     <div class="note ok"><strong>All new.</strong> No overlap with exhausted keyspace —
       adds {{ evaluation.marginal|intcomma }} candidates.</div>
+  {% endif %}
   {% endif %}
   {% if command %}<p class="muted" style="margin-bottom:4px">Generated command:</p>
     <code class="cmd">{{ command }}</code>{% endif %}

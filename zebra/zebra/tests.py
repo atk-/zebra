@@ -423,7 +423,9 @@ class RunDetailViewTests(TestCase):
         self.assertNotContains(r, 'Add to queue')
         self.assertContains(r, 'nothing left to run')
 
-    def test_planned_mask_detail_shows_run_controls(self):
+    def test_planned_mask_detail_shows_single_run_button(self):
+        # One unconditional label -- the action runs when idle and queues when busy,
+        # so there's no separate "Add to queue" button to reason about.
         from unittest import mock
         self.client.post(self.url, {'attack_mode': '3', 'pattern': '?d?d',
                                     'custom_charsets': '', 'status': 'planned',
@@ -433,7 +435,7 @@ class RunDetailViewTests(TestCase):
                         return_value=True):
             r = self.client.get('/zebra/run/%d/' % run.pk)
         self.assertContains(r, 'Run attack')
-        self.assertContains(r, 'Add to queue')
+        self.assertNotContains(r, 'Add to queue')
 
 
 class RunDeleteViewTests(TestCase):
@@ -747,8 +749,9 @@ class LauncherExecuteTests(TransactionTestCase):
         proc = subprocess.Popen([stub], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         launcher._execute(self.run, proc, proc.stdout.fileno(), work, pot)
         self.run.refresh_from_db()
-        self.assertEqual(self.run.recovered, 2)      # pinned to final potfile count
-        self.assertEqual(self.run.crack_count(), 1)  # 2 total - 1 baseline = this run
+        self.assertEqual(self.run.recovered, 2)        # pinned to final potfile count
+        self.assertEqual(self.run.crack_range_end, 2)  # end of this run's row range
+        self.assertEqual(self.run.crack_count(), 1)    # rows [1, 2) = this run
 
 
 class RunLaunchTemplateTests(TestCase):
@@ -2122,6 +2125,15 @@ class OptimizedKernelTests(TestCase):
         self.assertIn('name="optimized"', html)
         self.assertIn('checked', html)  # on by default
 
+    def test_recommender_record_run_form_enables_optimized(self):
+        # The one-click "Record & run" from the suggestion popup must default -O ON,
+        # matching the form (a missing field would read as unchecked -> off).
+        from unittest import mock
+        with mock.patch('zebra.services.hashcat.HashcatRunner.available',
+                        return_value=True):
+            html = self.client.get('/zebra/project/%d/' % self.project.pk).content.decode()
+        self.assertIn('name="optimized" value="1"', html)
+
     def test_record_optimized_stores_flag_and_command(self):
         self.client.post(self.url, {'pattern': '?d?d', 'custom_charsets': '',
                                     'status': 'planned', 'optimized': '1',
@@ -2235,3 +2247,178 @@ class ProjectDeleteViewTests(TestCase):
         self.assertFalse(os.path.exists(pot))    # zebra-managed potfile removed
         self.assertTrue(os.path.exists(ext))     # operator's external file untouched
         os.remove(ext)
+
+
+class SmartIncrementTests(TestCase):
+    """--increment-min auto-raises past leading lengths already fully covered."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='SI-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='SIP', hashtype=self.ht,
+                                              universe='?a')
+
+    def _exhaust(self, pattern, inc_min=None, inc_max=None):
+        m = Mask.objects.create(project=self.project, pattern=pattern,
+                                increment_min=inc_min, increment_max=inc_max)
+        ch.compute_and_cache_keyspace(m); m.save()
+        Run.objects.create(mask=m, project=self.project, attack_mode=3,
+                           status='exhausted')
+        return m
+
+    def test_raises_min_past_fully_covered_lengths(self):
+        self._exhaust('?a?a?a?a?a?a', inc_min=1, inc_max=6)  # lengths 1-6 covered
+        ev = ch.evaluate_candidate(self.project, '?d?d?d?d?d?d?d?d?d?d',
+                                   increment_min=1, increment_max=10)
+        self.assertEqual(ev['increment_min_requested'], 1)
+        self.assertEqual(ev['increment_min'], 7)     # first uncovered length
+        self.assertEqual(ev['increment_skipped'], 6)
+        self.assertFalse(ev['redundant_increment'])
+
+    def test_fully_covered_sweep_is_redundant(self):
+        self._exhaust('?a?a?a?a?a?a', inc_min=1, inc_max=6)
+        ev = ch.evaluate_candidate(self.project, '?d?d?d?d?d',
+                                   increment_min=1, increment_max=5)
+        self.assertTrue(ev['redundant_increment'])
+        self.assertTrue(ev['subsumed'])
+
+    def test_no_adjustment_when_nothing_covered(self):
+        ev = ch.evaluate_candidate(self.project, '?d?d?d?d',
+                                   increment_min=1, increment_max=4)
+        self.assertEqual(ev['increment_min'], 1)
+        self.assertEqual(ev['increment_skipped'], 0)
+
+    def test_only_leading_contiguous_lengths_skipped(self):
+        # Cover lengths 1 and 3 but NOT 2: only length 1 (leading) can be skipped.
+        self._exhaust('?a')            # length 1
+        self._exhaust('?a?a?a')        # length 3
+        ev = ch.evaluate_candidate(self.project, '?d?d?d?d',
+                                   increment_min=1, increment_max=4)
+        self.assertEqual(ev['increment_min'], 2)   # stops at the first gap
+        self.assertEqual(ev['increment_skipped'], 1)
+
+    def test_record_stores_effective_min(self):
+        self._exhaust('?a?a?a?a?a?a', inc_min=1, inc_max=6)
+        url = '/zebra/project/%d/mask/new/' % self.project.pk
+        self.client.post(url, {'pattern': '?d?d?d?d?d?d?d?d', 'custom_charsets': '',
+                               'increment': '1', 'increment_max': '8',
+                               'status': 'planned', 'action': 'record'})
+        run = Run.objects.filter(project=self.project, attack_mode=3,
+                                 mask__pattern='?d?d?d?d?d?d?d?d').latest('pk')
+        self.assertEqual(run.mask.increment_min, 7)   # auto-raised, not 1
+        self.assertEqual(run.mask.increment_max, 8)
+        self.assertIn('--increment-min 7', run.command)
+
+    def test_redundant_sweep_is_not_recordable(self):
+        self._exhaust('?a?a?a?a?a?a', inc_min=1, inc_max=6)
+        url = '/zebra/project/%d/mask/new/' % self.project.pk
+        r = self.client.post(url, {'pattern': '?d?d?d?d', 'custom_charsets': '',
+                                   'increment': '1', 'increment_max': '4',
+                                   'status': 'planned', 'action': 'record'})
+        self.assertContains(r, 'Nothing to run')
+        self.assertFalse(Run.objects.filter(mask__pattern='?d?d?d?d').exists())
+
+
+class PotfileCrackRangeTests(TestCase):
+    """Per-run potfile row range pinpoints exactly which cracks each job made."""
+
+    def setUp(self):
+        import tempfile as _tf
+        self.ht = HashType.objects.create(name='PR-MD5', hashcat_module=0)
+        self.d = _tf.mkdtemp()
+        ext = os.path.join(self.d, 'h.txt'); open(ext, 'w').write('a\nb\nc\n')
+        self.project = Project.objects.create(name='PRP', hashtype=self.ht,
+                                              hashfile_path=ext, hash_count=3)
+        self.mask = Mask.objects.create(project=self.project, pattern='?d?d')
+        # A shared, append-only project potfile written by successive runs.
+        self.pot = self.project.resolve_potfile_path()
+        os.makedirs(os.path.dirname(self.pot), exist_ok=True)
+        open(self.pot, 'w').write('h1:alpha\nh2:beta\nh3:gamma\n')  # 3 cracks total
+
+    def tearDown(self):
+        if os.path.exists(self.pot):
+            os.remove(self.pot)
+
+    def _run(self, start, end):
+        return Run.objects.create(mask=self.mask, project=self.project, attack_mode=3,
+                                  status='exhausted', crack_baseline=start,
+                                  crack_range_end=end)
+
+    def test_potfile_cracks_returns_only_this_runs_block(self):
+        r1 = self._run(0, 2)   # rows 0-1: h1, h2
+        r2 = self._run(2, 3)   # row 2: h3
+        self.assertEqual(r1.potfile_cracks(),
+                         [('h1', 'alpha'), ('h2', 'beta')])
+        self.assertEqual(r2.potfile_cracks(), [('h3', 'gamma')])
+        self.assertEqual(r1.crack_count(), 2)
+        self.assertEqual(r2.crack_count(), 1)
+
+    def test_empty_range_returns_no_cracks(self):
+        r = self._run(3, 3)    # found nothing
+        self.assertEqual(r.potfile_cracks(), [])
+        self.assertEqual(r.crack_count(), 0)
+
+    def test_limit_caps_returned_pairs(self):
+        r = self._run(0, 3)
+        self.assertEqual(len(r.potfile_cracks(limit=2)), 2)  # capped
+        self.assertEqual(r.crack_count(), 3)                 # true count unaffected
+
+    def test_db_backed_run_has_no_potfile_cracks(self):
+        p = Project.objects.create(name='DBB', hashtype=self.ht)
+        run = Run.objects.create(project=p, attack_mode=3, status='exhausted')
+        self.assertIsNone(run.potfile_cracks())
+
+
+class RunOrQueueTests(TestCase):
+    """Unified run/queue action: run when idle, queue when a job is in progress."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='RQ-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='RQP', hashtype=self.ht)
+        Hash.objects.create(hashstring='h', project=self.project, cracked=False)
+
+    def tearDown(self):
+        with launcher._lock:
+            launcher._active.clear()
+        launcher._paused = False
+
+    def _mask_run(self, status='planned', pattern='?d?d'):
+        m = Mask.objects.create(project=self.project, pattern=pattern)
+        r = Run.objects.create(mask=m, project=self.project, attack_mode=3, status=status)
+        r.hashes.set(self.project.hash_set.all())
+        return r
+
+    def _mark_busy(self):
+        busy = self._mask_run(status='running')
+        with launcher._lock:
+            launcher._active[busy.pk] = type('P', (), {'pid': 4242})()
+        return busy
+
+    def test_would_queue_reflects_busy_state(self):
+        self.assertFalse(launcher.would_queue())      # idle
+        self._mark_busy()
+        self.assertTrue(launcher.would_queue())       # a live run is in progress
+
+    def test_run_or_queue_starts_when_idle(self):
+        run = self._mask_run()
+        with mock.patch.object(launcher, 'start_run', return_value=None) as m:
+            action, err = launcher.run_or_queue(run)
+        m.assert_called_once_with(run)
+        self.assertEqual((action, err), ('started', None))
+
+    def test_run_or_queue_queues_when_busy(self):
+        self._mark_busy()
+        run = self._mask_run(pattern='?d?d?d')
+        with mock.patch.object(launcher, 'start_run') as m:
+            action, err = launcher.run_or_queue(run)
+        m.assert_not_called()                         # never tries to start
+        self.assertEqual(action, 'queued')
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'queued')
+
+    def test_run_or_queue_surfaces_real_error(self):
+        run = self._mask_run()
+        with mock.patch.object(launcher, 'start_run',
+                               return_value='hashcat is not installed on this machine.'):
+            action, err = launcher.run_or_queue(run)
+        self.assertEqual(action, 'error')
+        self.assertIn('not installed', err)

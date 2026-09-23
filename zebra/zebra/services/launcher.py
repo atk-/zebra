@@ -38,6 +38,10 @@ POLL_SECONDS = 10  # send hashcat an 's' keypress this often to refresh status
 # targeted hashes cracked), so there is nothing left to (re)launch or queue.
 TERMINAL_STATUSES = ('exhausted', 'cracked')
 
+# start_run's one-at-a-time refusal, as a constant so run_or_queue can recognise a
+# lost race and fall back to queueing.
+BUSY_MESSAGE = 'Another attack is already running (one at a time).'
+
 
 def _session_name(run):
     """Filesystem-safe hashcat ``--session`` name identifying this run.
@@ -125,7 +129,7 @@ def start_run(run, runner=None):
     with _lock:
         reconcile_stale_runs()  # self-heal orphaned 'running' rows before the guard
         if Run.objects.filter(status='running').exists():
-            return 'Another attack is already running (one at a time).'
+            return BUSY_MESSAGE
 
     workdir = tempfile.mkdtemp(prefix='zebra-run-%d-' % run.pk)
     # File-backed: hashcat reads the external file directly (zero-copy) and writes
@@ -142,6 +146,7 @@ def start_run(run, runner=None):
     else:
         pot = os.path.join(workdir, 'zebra.pot')
         run.crack_baseline = None
+    run.crack_range_end = None  # set at finalisation (stale on a relaunch)
 
     argv = runner.build_run_args(
         3, run.project.hashtype.hashcat_module, hashfile=hashpath,
@@ -178,7 +183,7 @@ def start_run(run, runner=None):
         run.increment_offset = 1  # 1-based, like hashcat's guess_base_offset
         run.increment_count = max(1, hi - lo + 1)
     run.save(update_fields=['status', 'progress', 'recovered', 'crack_baseline',
-                            'started_at', 'ended_at', 'pid',
+                            'crack_range_end', 'started_at', 'ended_at', 'pid',
                             'increment_offset', 'increment_count'])
     with _lock:
         _active[run.pk] = proc
@@ -226,12 +231,15 @@ def _execute(run, proc, fd, workdir, pot):
         if run.status == 'exhausted':
             run.progress = 1.0
         fields = ['status', 'ended_at', 'pid', 'progress']
-        # File-backed: pin recovered to the final potfile count so this run's own
-        # crack tally (recovered - crack_baseline) is exact after finishing, even
-        # if the last status tick missed the closing cracks.
+        # File-backed: pin recovered to the final potfile count and record the end
+        # of this run's crack range. One-at-a-time execution + an append-only
+        # potfile means the run's cracks are exactly rows [crack_baseline,
+        # crack_range_end), so this pinpoints which recovered hashes it found.
         if run.project.is_file_backed:
-            run.recovered = hashfile.potfile_cracked_count(pot)
-            fields.append('recovered')
+            final = hashfile.potfile_cracked_count(pot)
+            run.recovered = final
+            run.crack_range_end = final
+            fields += ['recovered', 'crack_range_end']
         run.save(update_fields=fields)
 
         # DB-backed: import the run's potfile into Crack rows + the cracked flag.
@@ -380,6 +388,35 @@ def _advance_queue(runner=None):
         return None
     err = start_run(nxt, runner=runner)
     return None if err else nxt
+
+
+def would_queue():
+    """True if launching now would queue rather than start immediately.
+
+    That's when a run is already in progress, or the queue is paused (so an
+    auto-start won't happen). A pure read (no DB writes -- it's called on plain
+    page renders) used only to label the run/queue buttons; ``run_or_queue`` does
+    the authoritative check (with orphan reconciliation) when the action fires, so
+    a stale label self-corrects on the next request."""
+    return is_paused() or Run.objects.filter(status='running').exists()
+
+
+def run_or_queue(run):
+    """Start ``run`` now if the GPU is idle, otherwise add it to the queue.
+
+    The single "run" action used everywhere: it runs when nothing else is, and
+    queues when a job is in progress (or the queue is paused). Returns
+    ``(action, error)`` where action is 'started', 'queued', or 'error'. Real
+    problems (no hashcat, no hashes, ...) surface as ('error', msg); only a busy
+    GPU falls through to queueing."""
+    if not would_queue():
+        err = start_run(run)
+        if err is None:
+            return ('started', None)
+        if err != BUSY_MESSAGE:
+            return ('error', err)  # a genuine problem, not just "busy"
+        # Lost a race (someone started between the check and start_run) -> queue.
+    return ('queued', enqueue(run))
 
 
 def enqueue(run):

@@ -125,7 +125,7 @@
 <h2>Attacks ({{ runs|length }})</h2>
 {% if runs %}
 <table id="attacks-table" data-runs-url="{% url 'project_runs_status' project.pk %}">
-  <tr><th style="width:1.5em"></th><th>Type</th><th>Spec</th><th>Status</th><th>Hashes</th><th>Cracks</th><th>Keyspace</th><th>When</th></tr>
+  <tr><th style="width:1.5em"></th><th>Type</th><th>Spec</th><th>Status</th><th>Cracks</th><th>Keyspace</th><th>When</th></tr>
   {% for r in runs %}
   <tr data-run-id="{{ r.pk }}" data-run-status="{{ r.status }}">
     <td><a href="{% url 'run_detail' r.pk %}" title="View attack details" aria-label="View attack details">🔍</a></td>
@@ -136,7 +136,6 @@
       {% else %}<span class="pill status st-{{ r.status }}">{{ r.status }}</span>{% endif %}
       {% if r.status == 'running' %}<span class="run-progress muted" style="margin-left:6px; font-size:12px; font-variant-numeric:tabular-nums">{% widthratio r.progress 1 100 %}%</span>{% endif %}
     </td>
-    <td>{{ r.target_count }}</td>
     <td class="run-cracks">{{ r.crack_count }}</td>
     <td>{% if r.mask and r.mask.keyspace is not None %}{{ r.mask.keyspace|bignum }}{% else %}—{% endif %}</td>
     <td class="muted">{{ r.created_at }}</td>
@@ -554,10 +553,12 @@
   var csrf = modal.dataset.csrf;
   var hashcatOn = modal.dataset.hashcat === '1';
 
-  // Buttons under a suggestion. "Record & run" (when hashcat is present) is a
-  // one-click POST that records the mask and launches it, landing on the live run
-  // page; "Record this attack" still opens the form for review/editing first.
+  // Buttons under a suggestion. The one-click POST (when hashcat is present)
+  // records the mask and runs it -- immediately when idle, or queued behind any
+  // attack in progress; "Record this attack" still opens the form for review first.
   function actions(r) {
+    var label = 'Record &amp; run';
+    var title = 'Record this attack and run it (queued behind any attack in progress)';
     var review = '<a class="btn' + (hashcatOn ? ' secondary' : '')
       + '" href="' + r.record_url + '">Record this attack</a>';
     if (!hashcatOn) return review;
@@ -570,9 +571,10 @@
       + '<input type="hidden" name="attack_mode" value="3">'
       + '<input type="hidden" name="status" value="planned">'
       + '<input type="hidden" name="action" value="record_run">'
+      + '<input type="hidden" name="optimized" value="1">'  // -O on by default, like the form
       + '<input type="hidden" name="pattern" value="' + esc(r.pattern) + '">'
       + incFields
-      + '<button class="btn" type="submit" title="Record and launch now">Record &amp; run</button>'
+      + '<button class="btn" type="submit" title="' + title + '">' + label + '</button>'
       + '</form>' + review;
   }
 

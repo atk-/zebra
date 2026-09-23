@@ -300,6 +300,9 @@ def run_detail(request, pk):
         'specs': specs,
         'cracks': run.cracks.select_related('hash').all(),
         'crack_count': run.crack_count(),
+        # File-backed runs have no Crack rows; their recovered plaintexts come from
+        # the project potfile, sliced to this run's row range (capped for display).
+        'potfile_cracks': run.potfile_cracks(limit=500),
         'target_count': run.target_count(),
         'hashcat_available': hc.configured_runner().available(),
         'launch_error': request.GET.get('error'),
@@ -344,7 +347,7 @@ def project_runs_status_json(request, pk):
     rows = (Run.objects.filter(project=project)
             .annotate(n_cracks=Count('cracks'))
             .values('pk', 'status', 'progress', 'recovered', 'crack_baseline',
-                    'n_cracks')[:50])
+                    'crack_range_end', 'n_cracks')[:50])
     active = any(r['status'] in ('running', 'queued') for r in rows)
     file_backed = project.is_file_backed
     live_recovered = None
@@ -352,9 +355,12 @@ def project_runs_status_json(request, pk):
     for r in rows:
         running = r['status'] == 'running'
         if file_backed:
-            # Shared cumulative potfile: this run's own cracks = recovered baseline.
-            if r['recovered'] is not None and r['crack_baseline'] is not None:
-                cracks = max(0, r['recovered'] - r['crack_baseline'])
+            # Shared cumulative potfile: this run's own cracks are the block
+            # [crack_baseline, end), where end is the recorded range end once
+            # finished, else the live recovered count.
+            end = r['crack_range_end'] if r['crack_range_end'] is not None else r['recovered']
+            if end is not None and r['crack_baseline'] is not None:
+                cracks = max(0, end - r['crack_baseline'])
             else:
                 cracks = 0
         else:
@@ -378,12 +384,12 @@ def project_runs_status_json(request, pk):
 
 
 def run_start(request, pk):
-    """Launch a mask attack with hashcat (POST-only)."""
+    """Run a mask attack now, or queue it if a job is already in progress (POST)."""
     run = get_object_or_404(Run, pk=pk)
     detail = reverse('run_detail', args=[pk])
     if request.method != 'POST':
         return redirect(detail)
-    err = launcher.start_run(run)
+    _action, err = launcher.run_or_queue(run)
     return redirect(detail + ('?error=' + quote(err) if err else ''))
 
 
@@ -722,10 +728,13 @@ def mask_new(request, pk):
         context['evaluation'] = evaluation
         if evaluation.get('error'):
             return render(request, 'zebra/mask_new.html', context)
-        # Concrete max (evaluate defaults a blank increment-max to the mask length).
+        # Effective increment bounds: evaluate defaults a blank max to the mask
+        # length and auto-raises the min past leading fully-covered lengths.
         inc_max = evaluation.get('increment_max')
+        inc_min_eff = evaluation.get('increment_min')
+        redundant_inc = evaluation.get('redundant_increment')
         mask_params = {'mask': pattern, 'custom_charsets': custom,
-                       'increment_min': inc_min, 'increment_max': inc_max}
+                       'increment_min': inc_min_eff, 'increment_max': inc_max}
         # Expected runtime = keyspace / benchmark (for an incremental run, keyspace is
         # the sum over swept lengths). Only when a benchmark is set for the project.
         if project.benchmark_hs and evaluation.get('keyspace'):
@@ -738,16 +747,17 @@ def mask_new(request, pk):
             }
         context['command'] = runner.plan_run(
             3, module, hashfile=hashfile, params=mask_params, optimized=optimized)
-        context['can_record'] = True
-        if action in ('record', 'record_run'):
+        # A fully-covered incremental sweep has no lengths left to run.
+        context['can_record'] = not redundant_inc
+        if not redundant_inc and action in ('record', 'record_run'):
             mask, _ = Mask.objects.get_or_create(
                 project=project, pattern=pattern, custom_charsets=custom,
-                increment_min=inc_min, increment_max=inc_max)
+                increment_min=inc_min_eff, increment_max=inc_max)
             ch.compute_and_cache_keyspace(mask)
             mask.save()
             sig_spec = {'attack_mode': 3, 'mask': pattern}
-            if inc_min is not None:
-                sig_spec['increment'] = [inc_min, inc_max]
+            if inc_min_eff is not None:
+                sig_spec['increment'] = [inc_min_eff, inc_max]
             run = Run.objects.create(
                 mask=mask, project=project, attack_mode=3, optimized=optimized,
                 device=device or None, status=status, command=context['command'],
@@ -762,7 +772,7 @@ def mask_new(request, pk):
             # launch guard failure (no hashcat, one already running, ...) is shown
             # as a banner on the run page, where the run can still be queued.
             if action == 'record_run':
-                err = launcher.start_run(run)
+                _act, err = launcher.run_or_queue(run)  # runs now, or queues if busy
                 dest = reverse('run_detail', args=[run.pk])
                 return redirect(dest + ('?error=' + quote(err) if err else ''))
             return redirect(reverse('project_detail', args=[project.pk]))

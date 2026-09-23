@@ -317,11 +317,16 @@ class Run(models.Model):
     # CUMULATIVE across runs, so per-run attribution subtracts crack_baseline below.
     # Null until the first status tick.
     recovered = models.IntegerField(null=True, blank=True)
-    # File-backed only: potfile crack count captured at launch, so this run's own
-    # cracks = recovered - crack_baseline (hashcat preloads and counts the shared
-    # potfile, so recovered alone would credit every prior run's cracks to the
-    # latest one). Null for DB-backed runs (transient per-run potfile + Crack rows).
+    # File-backed only: the half-open row range [crack_baseline, crack_range_end)
+    # this run contributed to the shared persistent potfile. Because runs execute
+    # one at a time and the potfile is append-only, each run's cracks form a solid
+    # block, so these two indices pinpoint exactly which recovered hashes it found
+    # (and this run's crack count is crack_range_end - crack_baseline). crack_baseline
+    # is the potfile line count captured at launch (inclusive start); crack_range_end
+    # the count after it finished (exclusive end). Null for DB-backed runs, which
+    # attribute cracks via per-run Crack rows instead.
     crack_baseline = models.IntegerField(null=True, blank=True)
+    crack_range_end = models.IntegerField(null=True, blank=True)
     # Live position within a --increment sweep: which of how many length sub-runs
     # hashcat is on. offset is hashcat's 1-based guess_base_offset (1..count, as in
     # its "Guess.Queue: X/Y"); both null for a non-incremental run.
@@ -363,12 +368,52 @@ class Run(models.Model):
         hashcat's ``recovered`` is already this run's finds while running, and the
         committed ``Crack`` rows (FK'd to this run) once it's done."""
         if self.project_id and self.project.is_file_backed:
-            if self.recovered is not None and self.crack_baseline is not None:
-                return max(0, self.recovered - self.crack_baseline)
-            return 0
+            if self.crack_baseline is None:
+                return 0
+            # Authoritative end once finished; live recovered while still running.
+            end = self.crack_range_end
+            if end is None:
+                end = self.recovered
+            return max(0, end - self.crack_baseline) if end is not None else 0
         if self.status == 'running' and self.recovered is not None:
             return self.recovered
         return self.cracks.count()
+
+    def potfile_cracks(self, limit=None):
+        """The (hash, plaintext) pairs THIS run recovered, sliced from the project
+        potfile by its stored row range (file-backed runs only).
+
+        Streams the potfile and collects only rows [crack_baseline, crack_range_end)
+        (non-empty lines, matching how the indices were counted), stopping early --
+        so a huge potfile is never loaded whole. ``limit`` caps the returned pairs
+        for display. Returns a list of (hash, plaintext) tuples, or None when the
+        run has no recorded range (DB-backed, or unfinished) or the potfile is gone.
+        """
+        if not (self.project_id and self.project.is_file_backed):
+            return None
+        start, end = self.crack_baseline, self.crack_range_end
+        if start is None or end is None:
+            return None
+        if end <= start:
+            return []
+        from .services import hashcat as hc
+        out, idx = [], 0
+        try:
+            with open(self.project.resolve_potfile_path(), encoding='utf-8',
+                      errors='ignore') as f:
+                for line in f:
+                    if not line.strip():
+                        continue  # blanks aren't counted in the range indices
+                    if idx >= end:
+                        break
+                    if idx >= start:
+                        out.append(line.rstrip('\n'))
+                        if limit is not None and len(out) >= limit:
+                            break
+                    idx += 1
+        except OSError:
+            return None
+        return hc.parse_potfile('\n'.join(out))
 
     def describe(self):
         """Human-readable one-line summary of what this run searched."""

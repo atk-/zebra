@@ -79,11 +79,7 @@
       {% csrf_token %}
       <button class="btn" type="submit">Run attack</button>
     </form>
-    <form method="post" action="{% url 'run_enqueue' run.pk %}" style="display:inline">
-      {% csrf_token %}
-      <button class="btn secondary" type="submit">Add to queue</button>
-    </form>
-    <span class="muted">Run now, or queue it to run after other attacks.</span>
+    <span class="muted">Runs now, or is queued behind any attack already in progress.</span>
   {% elif run.attack_mode != 3 %}
     <div class="note muted">Launching this attack type isn't supported yet — it needs
       the wordlist/rule files on disk. Mask attacks (-a 3) can be run from here.</div>
@@ -132,5 +128,18 @@
       <td class="muted">{{ c.found_at }}</td></tr>
   {% endfor %}
 </table>
+{% elif potfile_cracks %}
+<h2>Cracks from this attack ({{ crack_count }})</h2>
+<p class="muted">Recovered from the project potfile, rows
+  {{ run.crack_baseline }}–{{ run.crack_range_end }}.</p>
+<table>
+  <tr><th>Hash</th><th>Plaintext</th></tr>
+  {% for h, plain in potfile_cracks %}
+  <tr><td><code>{{ h }}</code></td><td><code>{{ plain }}</code></td></tr>
+  {% endfor %}
+</table>
+{% if crack_count > potfile_cracks|length %}
+  <p class="muted">…showing the first {{ potfile_cracks|length }} of {{ crack_count }}.</p>
+{% endif %}
 {% endif %}
 {% endblock %}
