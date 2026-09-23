@@ -51,7 +51,10 @@
   .pill.status { text-transform:capitalize; font-weight:600; }
   .pill.st-planned   { background:#eef1f5; color:#475569; }  /* slate  */
   .pill.st-queued    { background:#e8eafd; color:#3b3fb5; }  /* indigo */
-  .pill.st-running   { background:#e0f2fe; color:#0369a1; }  /* sky    */
+  .pill.st-running   { background:#e0f2fe; color:#0369a1;     /* sky    */
+         animation:pulse-badge 1.6s ease-in-out infinite; }
+  @keyframes pulse-badge { 0%,100% { opacity:1; } 50% { opacity:.5; } }
+  @media (prefers-reduced-motion: reduce) { .pill.st-running { animation:none; } }
   .pill.st-exhausted { background:var(--ok-bg); color:var(--ok); }      /* green  */
   .pill.st-cracked   { background:#f3e8fd; color:#7c3aed; }  /* violet */
   .pill.st-aborted   { background:var(--warn-bg); color:var(--warn); }  /* amber  */
