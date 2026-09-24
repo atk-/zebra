@@ -162,6 +162,7 @@ def _coverage_total(coverage, rate):
 
 
 def project_detail(request, pk):
+    launcher.adopt_live_orphans()  # adopt live orphans lazily (non-mutating on GET)
     project = get_object_or_404(Project, pk=pk)
     hashes = project.hash_set.all()
     # Counts route through the project so a file-backed project reports its cached
@@ -256,6 +257,7 @@ def project_benchmark(request, pk):
 
 def run_detail(request, pk):
     """Detail page for one recorded attack: its specs and the exact command."""
+    launcher.adopt_live_orphans()  # adopt live orphans lazily (non-mutating on GET)
     run = get_object_or_404(
         Run.objects.select_related('mask', 'project', 'project__hashtype'), pk=pk)
     p = run.params or {}
@@ -305,6 +307,12 @@ def run_detail(request, pk):
         'potfile_cracks': run.potfile_cracks(limit=500),
         'target_count': run.target_count(),
         'hashcat_available': hc.configured_runner().available(),
+        # Recovery: whether a running row is being tracked by a potfile watcher
+        # (contact lost, cracks live but progress frozen), and whether an ended run
+        # has a checkpoint we can resume from.
+        'adopted': (run.status == 'running' and run.pk not in launcher._active
+                    and launcher._run_is_live(run)),
+        'recovery_ready': run.recovery_ready(),
         'launch_error': request.GET.get('error'),
     }
     return render(request, 'zebra/run_detail.html', context)
@@ -403,6 +411,16 @@ def run_stop(request, pk):
     return redirect(detail + ('?error=' + quote(err) if err else ''))
 
 
+def run_resume(request, pk):
+    """Resume a dead attack from its hashcat checkpoint (POST-only)."""
+    run = get_object_or_404(Run, pk=pk)
+    detail = reverse('run_detail', args=[pk])
+    if request.method != 'POST':
+        return redirect(detail)
+    err = launcher.resume_run(run)
+    return redirect(detail + ('?error=' + quote(err) if err else ''))
+
+
 def _queue_back(request, pk):
     """Where to return after a queue action: the form's 'next', else run detail."""
     return request.POST.get('next') or reverse('run_detail', args=[pk])
@@ -474,6 +492,7 @@ def queue_resume(request):
 
 def queue(request):
     """The machine-wide attack queue: what's running, what's next, ETA to clear it."""
+    launcher.adopt_live_orphans()  # adopt live orphans lazily (non-mutating on GET)
     running = (Run.objects.filter(status='running')
                .select_related('mask', 'project').first())
     queued = list(Run.objects.filter(status='queued')
@@ -509,6 +528,10 @@ def run_delete(request, pk):
         return redirect(reverse('run_detail', args=[pk]))
     project_pk = run.project_id
     mask = run.mask
+    # Remove this run's recovery files (its checkpoint, and per-run potfile for
+    # DB-backed; never a file-backed project's shared potfile).
+    launcher._cleanup_run_files(
+        run, drop_potfile=not (run.project and run.project.is_file_backed))
     run.delete()
     # Tidy up a mode-3 mask left with no runs (created for this attack alone).
     if mask and not mask.runs.exists():
@@ -534,6 +557,13 @@ def _cleanup_project_files(project):
         paths.append(project.resolve_potfile_path())
         if project.hashfile_managed and project.hashfile_path:
             paths.append(project.hashfile_path)
+    # Per-run recovery files (checkpoints + DB-backed per-run potfiles); the cascade
+    # drops the rows but not these on-disk files.
+    for run in project.runs.all():
+        if run.restore_path:
+            paths.append(run.restore_path)
+        if not project.is_file_backed and run.potfile_path:
+            paths.append(run.potfile_path)
     for p in paths:
         try:
             os.remove(p)

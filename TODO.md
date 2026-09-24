@@ -74,8 +74,14 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
 - [ ] Launch **wordlist/combinator/hybrid** attacks (needs `Wordlist`/`RuleSet` paths
       validated on disk)
 
-- [ ] **Worker/queue** (RQ/Celery) so runs survive restarts / can run in parallel.
-      (Orphaned-run recovery on Stop exists; a real queue does not.)
+- [x] **Crash / rogue-process recovery**: runs are spawned detached (survive a zebra
+      restart) with a persistent potfile + `--session`/`--restore-file-path`. Lost
+      contact is recovered by adopting a live orphan (potfile-tail watcher) or, for a
+      dead one, a **Resume from checkpoint** button (`hashcat --restore`). See
+      `services/launcher.py` (`reconcile_stale_runs`/`adopt_live_orphans`/`_adopt`/
+      `resume_run`) and `DESIGN.md` §6b.
+- [ ] **Worker/queue** (RQ/Celery) so runs can run in parallel (survival + recovery
+      now handled above; a real queue would add parallelism/robustness).
 - [x] **Global Settings page** (`/settings/`): override the hashcat binary path,
       overriding any copy on `PATH` (`Settings` singleton → `hashcat.configured_runner`)
 - [x] File **upload** for hashlists (New project + Add hashes; combines with paste)

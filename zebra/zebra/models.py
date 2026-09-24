@@ -347,6 +347,14 @@ class Run(models.Model):
     # when the run isn't queued. Lower position runs first.
     queue_position = models.IntegerField(null=True, blank=True)
     pid = models.IntegerField(null=True, blank=True)  # OS pid while running (launcher)
+    # Recovery: the files/name a launched run owns, stored so contact can be regained
+    # after a server restart or a lost reader thread. ``session`` is hashcat's
+    # --session name; ``potfile_path`` the (persistent) potfile this run writes to;
+    # ``restore_path`` its --restore-file-path checkpoint. Empty on legacy rows, which
+    # therefore opt out of recovery. See services.launcher (adopt watcher / resume).
+    session = models.CharField(max_length=4096, blank=True, default='')
+    potfile_path = models.CharField(max_length=4096, blank=True, default='')
+    restore_path = models.CharField(max_length=4096, blank=True, default='')
     started_at = models.DateTimeField(null=True, blank=True)
     ended_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, null=True)
@@ -358,6 +366,11 @@ class Run(models.Model):
     @property
     def attack_mode_label(self):
         return dict(self.ATTACK_MODES).get(self.attack_mode, str(self.attack_mode))
+
+    def recovery_ready(self):
+        """True if this run has a hashcat checkpoint we could resume from."""
+        import os
+        return bool(self.restore_path) and os.path.isfile(self.restore_path)
 
     def target_count(self):
         """How many hashes this run targeted, for display.

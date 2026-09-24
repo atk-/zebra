@@ -25,6 +25,7 @@ import signal
 import tempfile
 import threading
 
+from django.conf import settings as dj_settings
 from django.db import connection
 from django.utils import timezone
 
@@ -62,6 +63,9 @@ def _session_name(run):
 
 # run_id -> subprocess.Popen for the currently-running attack(s).
 _active = {}
+# run_ids of orphaned-but-live runs re-adopted after a lost reader thread/restart:
+# we can't re-attach hashcat's status stream, so a watcher tails the potfile instead.
+_adopted = set()
 _lock = threading.Lock()
 
 
@@ -124,27 +128,34 @@ def start_run(run, runner=None):
         return 'This project has no hashes to attack.'
     if run.project.hashtype is None:
         return 'This project has no hash type set.'
+    # Reconcile OUTSIDE the lock: it may adopt a live orphan, which acquires _lock
+    # (not reentrant). The authoritative one-at-a-time check stays inside the lock.
+    reconcile_stale_runs()
     with _lock:
-        reconcile_stale_runs()  # self-heal orphaned 'running' rows before the guard
         if Run.objects.filter(status='running').exists():
             return BUSY_MESSAGE
 
     workdir = tempfile.mkdtemp(prefix='zebra-run-%d-' % run.pk)
-    # File-backed: hashcat reads the external file directly (zero-copy) and writes
-    # to a *persistent* per-project potfile (kept outside workdir, so it survives
-    # this run's cleanup and lets hashcat auto-skip already-cracked hashes next
-    # time). DB-backed: materialize hashes into workdir and use a transient potfile.
+    session = _session_name(run)
+    # File-backed: hashcat reads the external file directly (zero-copy) and writes to
+    # a *persistent per-project* potfile; this run is credited its delta over the
+    # baseline. DB-backed: materialize hashes into workdir, and use a *persistent
+    # per-run* potfile (run-<pk>.pot, outside workdir so it survives cleanup and stays
+    # tail-able after a restart) whose whole contents are this run's cracks -- so no
+    # baseline (kept None; recovered = count - (baseline or 0) works for both).
     hashpath = run.project.launch_hashfile(workdir)
     if run.project.is_file_backed:
         pot = run.project.resolve_potfile_path()
-        os.makedirs(os.path.dirname(pot), exist_ok=True)
-        # Baseline = cracks already in the shared potfile before this run, so this
-        # run is credited only with what IT finds (recovered - crack_baseline).
         run.crack_baseline = hashfile.potfile_cracked_count(pot)
     else:
-        pot = os.path.join(workdir, 'zebra.pot')
+        pot = os.path.join(dj_settings.ZEBRA_DATA_DIR, 'potfiles', 'run-%d.pot' % run.pk)
         run.crack_baseline = None
+    os.makedirs(os.path.dirname(pot), exist_ok=True)
     run.crack_range_end = None  # set at finalisation (stale on a relaunch)
+    # Persistent checkpoint so a dead run can be resumed (kept outside workdir).
+    restore_path = os.path.join(dj_settings.ZEBRA_DATA_DIR, 'restore', session + '.restore')
+    os.makedirs(os.path.dirname(restore_path), exist_ok=True)
+    run.session, run.potfile_path, run.restore_path = session, pot, restore_path
 
     argv = runner.build_run_args(
         3, run.project.hashtype.hashcat_module, hashfile=hashpath,
@@ -152,27 +163,16 @@ def start_run(run, runner=None):
                 'increment_min': run.mask.increment_min,
                 'increment_max': run.mask.increment_max},
         extra=['--status', '--status-json', '--status-timer', str(POLL_SECONDS),
-               '--potfile-path', pot, '--restore-disable',
-               '--session', _session_name(run)],
+               '--potfile-path', pot, '--session', session,
+               '--restore-file-path', restore_path],
         optimized=run.optimized)
-
-    # Run under a PTY so hashcat flushes status promptly and accepts 's' keypresses.
-    try:
-        import subprocess
-        master_fd, slave_fd = pty.openpty()
-        proc = subprocess.Popen(argv, cwd=workdir, stdin=slave_fd, stdout=slave_fd,
-                                stderr=slave_fd, close_fds=True)
-        os.close(slave_fd)  # the child holds its own copy
-    except OSError as exc:
-        shutil.rmtree(workdir, ignore_errors=True)
-        return 'Failed to launch hashcat: %s' % exc
 
     run.status = 'running'
     run.progress = 0.0
     run.recovered = None  # clear any stale value from a prior launch of this run
     run.started_at = timezone.now()
     run.ended_at = None
-    run.pid = proc.pid
+    run.pid = None
     # Seed the increment sweep counter so "(1/N runs)" shows before the first
     # status arrives; hashcat's live guess_base_offset/count refine it as it runs.
     if run.mask and run.mask.is_incremental:
@@ -182,7 +182,30 @@ def start_run(run, runner=None):
         run.increment_count = max(1, hi - lo + 1)
     run.save(update_fields=['status', 'progress', 'recovered', 'crack_baseline',
                             'crack_range_end', 'started_at', 'ended_at', 'pid',
+                            'session', 'potfile_path', 'restore_path',
                             'increment_offset', 'increment_count'])
+    return _spawn_and_track(run, argv, pot, workdir)
+
+
+def _spawn_and_track(run, argv, pot, workdir):
+    """Spawn hashcat under a PTY, register it in ``_active``, start the reader thread.
+
+    Detached (``start_new_session=True``) so the child survives a zebra restart and
+    keeps cracking -- recovery re-adopts it via the potfile. Sets ``run.pid`` and
+    persists it. Returns None on success, else an error string (workdir cleaned)."""
+    try:
+        import subprocess
+        master_fd, slave_fd = pty.openpty()
+        proc = subprocess.Popen(argv, cwd=workdir, stdin=slave_fd, stdout=slave_fd,
+                                stderr=slave_fd, close_fds=True, start_new_session=True)
+        os.close(slave_fd)  # the child holds its own copy
+    except OSError as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        run.status = 'error'
+        run.save(update_fields=['status'])
+        return 'Failed to launch hashcat: %s' % exc
+    run.pid = proc.pid
+    run.save(update_fields=['pid'])
     with _lock:
         _active[run.pk] = proc
     threading.Thread(target=_execute, args=(run, proc, master_fd, workdir, pot),
@@ -251,6 +274,11 @@ def _execute(run, proc, fd, workdir, pot):
                     hc.ingest_cracks(run.project, pairs, run)
             except FileNotFoundError:
                 pass
+        # Clean finalize: the run's cracks are committed (Crack rows for DB-backed,
+        # the shared potfile for file-backed) and the checkpoint is spent, so drop
+        # this run's recovery files. Skipped on the exception path so a crashed
+        # finalize leaves the potfile/restore intact for recovery.
+        _cleanup_run_files(run, drop_potfile=not run.project.is_file_backed)
     except Exception as exc:  # never let the thread die silently
         run.status = 'error'
         run.ended_at = timezone.now()
@@ -272,17 +300,39 @@ def _execute(run, proc, fd, workdir, pot):
         connection.close()
 
 
-def _pid_is_hashcat(pid):
+def _cleanup_run_files(run, drop_potfile):
+    """Best-effort removal of a run's recovery files (restore + its per-run potfile).
+
+    Never removes a file-backed project's *shared* potfile (``drop_potfile`` is False
+    there). Called on a clean finalize and on run delete."""
+    paths = [run.restore_path] if run.restore_path else []
+    if drop_potfile and run.potfile_path:
+        paths.append(run.potfile_path)
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _pid_is_hashcat(pid, session=None):
     """Best-effort check that ``pid`` is a live hashcat process (Linux /proc).
 
-    Guards the orphan-recovery path from signalling an unrelated process that has
-    since reused the recorded pid. Returns False if the pid is gone, not ours, or
-    /proc is unreadable (non-Linux)."""
+    Guards the recovery paths from signalling/adopting an unrelated process that has
+    since reused the recorded pid. When ``session`` is given, its ``--session`` name
+    must also appear in the cmdline, so we only ever adopt THIS run's hashcat (not a
+    different run's). Returns False if the pid is gone, not ours, or /proc is
+    unreadable (non-Linux)."""
+    if not pid:
+        return False
     try:
         with open('/proc/%d/cmdline' % pid, 'rb') as f:
-            return b'hashcat' in f.read()
+            cmdline = f.read()
     except OSError:
         return False
+    if b'hashcat' not in cmdline:
+        return False
+    return session is None or session.encode() in cmdline
 
 
 def _run_is_live(run):
@@ -292,30 +342,130 @@ def _run_is_live(run):
     live hashcat process. A ``running`` row that is neither is *orphaned*: its
     worker thread was lost to a server restart, or it was never really launched
     (e.g. a stale row from a crash, which has no pid at all)."""
-    if run.pk in _active:
+    if run.pk in _active or run.pk in _adopted:
         return True
-    return bool(run.pid) and _pid_is_hashcat(run.pid)
+    return bool(run.pid) and _pid_is_hashcat(run.pid, run.session or None)
 
 
 def reconcile_stale_runs():
-    """Abort orphaned ``running`` rows so they stop deadlocking the launcher.
+    """Reconcile orphaned ``running`` rows so the launcher self-heals.
 
-    The one-at-a-time guard treats *any* ``running`` row as the active attack, so a
-    single orphan (a restart, a crash, or a row that never really launched) blocks
-    every future launch with "another attack is already running" -- with no obvious
-    Stop button to clear it. Sweeping orphans to ``aborted`` here, lazily, right
-    before the guard is checked, makes the state machine self-healing. Returns the
-    number of runs reconciled."""
-    reconciled = 0
+    An orphan is a ``running`` row this process isn't tracking (a server restart, a
+    lost reader thread, or a stale row that never really launched). For each:
+
+    * **still-live** (its pid is our hashcat, by session) -> **adopt** it: a watcher
+      resumes crack tracking from the potfile (see ``_adopt``). It stays ``running``,
+      so the one-at-a-time guard still blocks new launches.
+    * **dead** -> mark ``aborted`` (as before). Its restore checkpoint, if any, stays
+      on disk so it can be resumed. This clears the guard.
+
+    Returns the number of dead orphans aborted."""
+    aborted = 0
     for run in Run.objects.filter(status='running'):
-        if _run_is_live(run):
+        if run.pk in _active or run.pk in _adopted:
+            continue  # already tracked by this process
+        if run.potfile_path and run.pid and _pid_is_hashcat(run.pid, run.session or None):
+            _adopt(run)  # live orphan -> tail its potfile
             continue
         run.status = 'aborted'
         run.pid = None
         run.ended_at = timezone.now()
         run.save(update_fields=['status', 'pid', 'ended_at'])
-        reconciled += 1
-    return reconciled
+        aborted += 1
+    return aborted
+
+
+def recover_orphans():
+    """Startup entry point: reconcile/adopt any orphaned runs (see reconcile)."""
+    return reconcile_stale_runs()
+
+
+def adopt_live_orphans():
+    """Adopt live orphaned runs *without* aborting dead ones -- safe on a GET.
+
+    Starts a potfile watcher for any 'running' row backed by a live hashcat we
+    aren't tracking (thread lost without a restart). It never mutates a dead/stale
+    row (that's reconcile_stale_runs' job, on the action paths), so calling it on a
+    page render can't wrongly abort a run."""
+    for run in Run.objects.filter(status='running'):
+        if run.pk in _active or run.pk in _adopted:
+            continue
+        if run.potfile_path and run.pid and _pid_is_hashcat(run.pid, run.session or None):
+            _adopt(run)
+
+
+def _adopt(run):
+    """Start a watcher that recovers a live orphaned run via its potfile.
+
+    hashcat's status stream can't be re-attached, but because only one hashcat runs
+    at a time, potfile growth is unambiguously this run's cracks. The watcher tails
+    the potfile for the live crack count and finalises when the pid disappears."""
+    with _lock:
+        if run.pk in _active or run.pk in _adopted:
+            return
+        _adopted.add(run.pk)
+    threading.Thread(target=_adopt_watch, args=(run,), daemon=True).start()
+
+
+def _adopt_potfile_count(run):
+    """This run's crack count from its potfile (delta over baseline for file-backed)."""
+    return max(0, hashfile.potfile_cracked_count(run.potfile_path) - (run.crack_baseline or 0))
+
+
+def _adopt_tick(run):
+    """One watcher pass: refresh the live crack count from the potfile.
+
+    For DB-backed, also import any new potfile lines into Crack rows (idempotent)."""
+    run.recovered = _adopt_potfile_count(run)
+    run.save(update_fields=['recovered'])
+    if not run.project.is_file_backed:
+        try:
+            with open(run.potfile_path, encoding='utf-8') as f:
+                pairs = hc.parse_potfile(f.read())
+            if pairs:
+                hc.ingest_cracks(run.project, pairs, run)
+        except FileNotFoundError:
+            pass
+
+
+def _adopt_finalize(run):
+    """Finalise an adopted run once its process is gone (no exit code available).
+
+    We can't confirm exhaustion without the stream, so this is ``aborted`` + a note
+    -- except when every targeted hash was recovered, which we can safely call
+    ``cracked``. Crack tracking is pinned from the potfile."""
+    _adopt_tick(run)  # final crack count
+    count = hashfile.potfile_cracked_count(run.potfile_path)
+    run.recovered = max(0, count - (run.crack_baseline or 0))
+    run.crack_range_end = count if run.project.is_file_backed else run.crack_range_end
+    run.ended_at = timezone.now()
+    run.pid = None
+    if run.recovered and run.recovered >= run.target_count():
+        run.status = 'cracked'
+    else:
+        run.status = 'aborted'
+        run.comment = ('%s | recovered via potfile after lost contact; '
+                       'progress/exhaustion unknown' % (run.comment or '')).strip(' |')[:1000]
+    run.save(update_fields=['status', 'recovered', 'crack_range_end', 'ended_at',
+                            'pid', 'comment'])
+
+
+def _adopt_watch(run):
+    """Watcher thread: tail the potfile until the process exits, then finalise."""
+    import time
+    try:
+        while _pid_is_hashcat(run.pid, run.session or None):
+            time.sleep(POLL_SECONDS)
+            try:
+                _adopt_tick(run)
+            except Exception:
+                pass  # a transient error mustn't kill the watcher
+        _adopt_finalize(run)
+    finally:
+        with _lock:
+            _adopted.discard(run.pk)
+        _advance_queue()
+        connection.close()
 
 
 def stop_run(run):
@@ -351,6 +501,37 @@ def stop_run(run):
         run.ended_at = timezone.now()
         run.save(update_fields=['status', 'pid', 'ended_at'])
     return None
+
+
+def resume_run(run, runner=None):
+    """Resume a dead run from its hashcat checkpoint. Returns None or an error string.
+
+    Relaunches ``hashcat --session <name> --restore``: hashcat replays the original
+    command line (potfile + status flags) from the restore file, so crack attribution
+    continues and full live streaming comes back via the normal ``_execute`` path
+    (real exit code -> correct exhausted/cracked finalise). Guarded so it never runs
+    while the process is still alive or another attack is running."""
+    runner = runner or hc.configured_runner()
+    if not runner.available():
+        return 'hashcat is not installed on this machine.'
+    if not run.recovery_ready():
+        return 'No checkpoint to resume from.'
+    if _pid_is_hashcat(run.pid, run.session or None):
+        return 'This attack is still running.'
+    reconcile_stale_runs()  # lockless (may adopt); the real guard is inside the lock
+    with _lock:
+        if Run.objects.filter(status='running').exists():
+            return BUSY_MESSAGE
+
+    workdir = tempfile.mkdtemp(prefix='zebra-resume-%d-' % run.pk)
+    argv = [runner.binary, '--session', run.session, '--restore',
+            '--restore-file-path', run.restore_path]
+    run.status = 'running'
+    run.ended_at = None
+    run.pid = None
+    run.crack_range_end = None
+    run.save(update_fields=['status', 'ended_at', 'pid', 'crack_range_end'])
+    return _spawn_and_track(run, argv, run.potfile_path, workdir)
 
 
 # --- attack queue -----------------------------------------------------------

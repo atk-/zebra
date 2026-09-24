@@ -264,13 +264,26 @@ Runs a recorded **mask** attack with hashcat from the attack page (first cut).
   2/3/4 aborted, else error`); cracks are imported from the run's potfile
   (`parse_potfile` → `ingest_cracks`). `Run.pid` + an in-process registry back the
   **Stop** button (SIGINT = hashcat's clean checkpoint-abort).
-- **Self-healing orphans:** a server restart (or a stale/bogus `running` row that
-  was never really launched) leaves a `running` run with no worker thread. Rather
-  than deadlocking every future launch behind the one-at-a-time guard,
-  `reconcile_stale_runs()` sweeps such rows to `aborted` lazily, right before the
-  guard is checked in `start_run` and `_advance_queue` (a run counts as live only if
-  it's in the in-process registry or its `pid` is a live hashcat process). Stop still
-  works for an explicit recovery; the fully robust fix is the worker/queue below.
+- **Orphan recovery (restart / lost contact).** A run is spawned **detached**
+  (`start_new_session=True`) with a persistent per-run potfile, hashcat `--session`,
+  and `--restore-file-path` (all stored on the `Run`), so the process **survives a
+  zebra restart and keeps cracking** (verified: a detached child ignores the
+  reader's PTY closing). When contact is lost (restart, or a dead reader thread),
+  `reconcile_stale_runs()` classifies each untracked `running` row by whether its
+  `pid` is *our* hashcat (cmdline must contain both `hashcat` and the run's
+  `--session` name, defeating PID reuse):
+  - **live** → `_adopt()` it: a watcher thread tails the potfile for the live crack
+    count (unambiguous under one-at-a-time; DB-backed also re-ingests to `Crack`
+    rows) and finalises when the pid disappears — `aborted` + note, or `cracked`
+    if every targeted hash was recovered (no exit code is available, so exhaustion
+    is never claimed). Progress/speed can't be recovered without the stream.
+  - **dead** → `aborted`, leaving the `--restore` checkpoint on disk so the run
+    page offers **Resume from checkpoint** (`resume_run` relaunches `hashcat
+    --session <n> --restore`, which replays the original command line and restores
+    full live streaming — also works for a run you deliberately Stopped).
+  Recovery fires lazily: `adopt_live_orphans()` (non-mutating, GET-safe) on the
+  dashboard/queue/run-detail views, and full `reconcile_stale_runs()` on the
+  launch/queue action paths. The fully robust fix is still the worker/queue below.
 
 ## 7. Extensibility seams (designed, not built)
 

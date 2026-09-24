@@ -14,6 +14,7 @@ urlpatterns = [
     path("run/<int:pk>/status.json", views.run_status_json, name="run_status"),
     path("run/<int:pk>/start/", views.run_start, name="run_start"),
     path("run/<int:pk>/stop/", views.run_stop, name="run_stop"),
+    path("run/<int:pk>/resume/", views.run_resume, name="run_resume"),
     path("run/<int:pk>/enqueue/", views.run_enqueue, name="run_enqueue"),
     path("run/<int:pk>/dequeue/", views.run_dequeue, name="run_dequeue"),
     path("run/<int:pk>/move/", views.run_move, name="run_move"),

@@ -23,6 +23,11 @@
       <span id="run-speed">{% if run.speed_hs %}· {{ run.speed_hs|intcomma }} H/s{% endif %}</span>
       · <span id="run-pct">{% widthratio run.progress 1 100 %}</span>%</p>
     <div class="bar"><span id="run-bar" style="width:{% widthratio run.progress 1 100 %}%"></span></div>
+    {% if adopted %}
+    <div class="note warn" style="margin-top:10px">Contact with the process was lost —
+      showing the live crack count read from the potfile; progress and speed are
+      unavailable until it finishes (or you Stop and resume it).</div>
+    {% endif %}
     <form method="post" action="{% url 'run_stop' run.pk %}" style="margin-top:12px"
           onsubmit="return confirm('Stop this attack?');">
       {% csrf_token %}
@@ -75,11 +80,17 @@
       {% if run.status == 'exhausted' %}its keyspace has been searched to the end{% else %}its target hashes were cracked{% endif %},
       so there's nothing left to run.</div>
   {% elif run.attack_mode == 3 and hashcat_available %}
+    {% if recovery_ready %}
+    <form method="post" action="{% url 'run_resume' run.pk %}" style="display:inline">
+      {% csrf_token %}
+      <button class="btn" type="submit">Resume from checkpoint</button>
+    </form>
+    {% endif %}
     <form method="post" action="{% url 'run_start' run.pk %}" style="display:inline">
       {% csrf_token %}
-      <button class="btn" type="submit">Run attack</button>
+      <button class="btn{% if recovery_ready %} secondary{% endif %}" type="submit">Run attack{% if recovery_ready %} (restart){% endif %}</button>
     </form>
-    <span class="muted">Runs now, or is queued behind any attack already in progress.</span>
+    <span class="muted">{% if recovery_ready %}Resume continues from where it stopped; Run restarts from the beginning.{% else %}Runs now, or is queued behind any attack already in progress.{% endif %}</span>
   {% elif run.attack_mode != 3 %}
     <div class="note muted">Launching this attack type isn't supported yet — it needs
       the wordlist/rule files on disk. Mask attacks (-a 3) can be run from here.</div>

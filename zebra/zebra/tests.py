@@ -2749,3 +2749,141 @@ class ComplementViewTests(TestCase):
         self.assertEqual(d2['queued'], 0)
         # The length is now fully covered by queued masks -> zero untried keyspace.
         self.assertEqual(ch.project_complement_masks(self.project, 4)['summary']['untried'], 0)
+
+
+class RunRecoveryTests(TestCase):
+    """Recovering contact with orphaned/rogue hashcat runs (adopt + resume)."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='RC-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='RCP', hashtype=self.ht)
+        for hs in ('h1', 'h2', 'h3'):
+            Hash.objects.create(hashstring=hs, project=self.project, cracked=False)
+        self.mask = Mask.objects.create(project=self.project, pattern='?d?d')
+
+    def tearDown(self):
+        with launcher._lock:
+            launcher._active.clear(); launcher._adopted.clear()
+
+    def _run(self, **kw):
+        run = Run.objects.create(mask=self.mask, project=self.project, attack_mode=3,
+                                 status=kw.pop('status', 'running'), **kw)
+        run.hashes.set(self.project.hash_set.all())
+        return run
+
+    def _fake_hashcat(self, session):
+        # A live process whose /proc cmdline contains 'hashcat' and the session name.
+        # Run /bin/sleep directly with a crafted argv[0] (sleep ignores it, reads the
+        # duration from argv[1]) -- a single execve, so no shebang/startup race.
+        import time
+        proc = subprocess.Popen(['hashcat --session %s' % session, '30'],
+                                executable='/bin/sleep')
+        for _ in range(50):  # wait for /proc cmdline to reflect the exec'd argv
+            try:
+                if b'hashcat' in open('/proc/%d/cmdline' % proc.pid, 'rb').read():
+                    break
+            except OSError:
+                pass
+            time.sleep(0.01)
+        return proc
+
+    def test_pid_is_hashcat_session_match(self):
+        proc = self._fake_hashcat('zebra-rc-a1')
+        try:
+            self.assertTrue(launcher._pid_is_hashcat(proc.pid))
+            self.assertTrue(launcher._pid_is_hashcat(proc.pid, 'zebra-rc-a1'))
+            self.assertFalse(launcher._pid_is_hashcat(proc.pid, 'zebra-other'))
+        finally:
+            proc.kill(); proc.wait()
+        self.assertFalse(launcher._pid_is_hashcat(proc.pid, 'zebra-rc-a1'))
+
+    def test_adopt_tick_reads_potfile(self):
+        d = tempfile.mkdtemp()
+        pot = os.path.join(d, 'run.pot'); open(pot, 'w').write('h1:a\nh2:b\n')
+        run = self._run(potfile_path=pot, crack_baseline=None, session='s')
+        launcher._adopt_tick(run)
+        run.refresh_from_db()
+        self.assertEqual(run.recovered, 2)             # from potfile
+        self.assertEqual(run.cracks.count(), 2)        # DB-backed -> Crack rows ingested
+
+    def test_adopt_finalize_aborted_with_note(self):
+        d = tempfile.mkdtemp()
+        pot = os.path.join(d, 'run.pot'); open(pot, 'w').write('h1:a\n')  # 1 of 3
+        run = self._run(potfile_path=pot, session='s')
+        launcher._adopt_finalize(run)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'aborted')
+        self.assertIn('recovered via potfile', run.comment)
+        self.assertEqual(run.recovered, 1)
+        self.assertIsNone(run.pid)
+
+    def test_adopt_finalize_cracked_when_all_recovered(self):
+        d = tempfile.mkdtemp()
+        pot = os.path.join(d, 'run.pot'); open(pot, 'w').write('h1:a\nh2:b\nh3:c\n')
+        run = self._run(potfile_path=pot, session='s')
+        launcher._adopt_finalize(run)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'cracked')        # recovered >= target (3)
+
+    def test_reconcile_adopts_live_orphan(self):
+        run = self._run(pid=4242, potfile_path='/tmp/x.pot', session='s')
+        with mock.patch.object(launcher, '_pid_is_hashcat', return_value=True), \
+             mock.patch.object(launcher, '_adopt') as adopt:
+            aborted = launcher.reconcile_stale_runs()
+        adopt.assert_called_once()
+        self.assertEqual(aborted, 0)                   # live orphan not aborted
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'running')
+
+    def test_reconcile_aborts_dead_orphan(self):
+        run = self._run(pid=4242, potfile_path='/tmp/x.pot', session='s')
+        with mock.patch.object(launcher, '_pid_is_hashcat', return_value=False):
+            self.assertEqual(launcher.reconcile_stale_runs(), 1)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'aborted')
+
+    def test_adopt_live_orphans_never_aborts(self):
+        run = self._run(pid=4242, potfile_path='/tmp/x.pot', session='s')
+        with mock.patch.object(launcher, '_pid_is_hashcat', return_value=False), \
+             mock.patch.object(launcher, '_adopt') as adopt:
+            launcher.adopt_live_orphans()              # dead -> left alone (GET-safe)
+        adopt.assert_not_called()
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'running')        # not mutated
+
+    def test_resume_run_guards_and_argv(self):
+        d = tempfile.mkdtemp()
+        restore = os.path.join(d, 's.restore'); open(restore, 'w').write('x')
+        run = self._run(status='aborted', pid=None, session='s',
+                        potfile_path=os.path.join(d, 'r.pot'), restore_path=restore)
+        runner = hc.HashcatRunner(binary=_write_stub(d, 'exit 0\n'))
+        # refuses while a hashcat with this session is still alive
+        with mock.patch.object(launcher, '_pid_is_hashcat', return_value=True):
+            self.assertIn('still running', launcher.resume_run(run, runner=runner))
+        # refuses when another run is already running
+        self._run(status='running', pid=1, session='busy')
+        with mock.patch.object(launcher, '_pid_is_hashcat',
+                               side_effect=lambda pid, session=None: pid == 1), \
+             mock.patch.object(launcher, 'reconcile_stale_runs'):
+            self.assertIn('already running', launcher.resume_run(run, runner=runner))
+        Run.objects.filter(session='busy').delete()
+        # valid resume -> builds the --restore argv (spawn captured)
+        captured = {}
+        def _fake_spawn(r, argv, pot, workdir):
+            captured['argv'] = argv; return None
+        with mock.patch.object(launcher, '_pid_is_hashcat', return_value=False), \
+             mock.patch.object(launcher, '_spawn_and_track', side_effect=_fake_spawn):
+            self.assertIsNone(launcher.resume_run(run, runner=runner))
+        self.assertIn('--restore', captured['argv'])
+        self.assertIn('--restore-file-path', captured['argv'])
+        self.assertIn('s', captured['argv'])           # session
+
+    def test_start_run_stores_persistent_recovery_files(self):
+        run = self._run(status='planned', pid=None)
+        runner = hc.HashcatRunner(binary=_write_stub(tempfile.mkdtemp(), 'exit 0\n'))
+        with mock.patch.object(launcher, '_spawn_and_track', return_value=None):
+            self.assertIsNone(launcher.start_run(run, runner=runner))
+        run.refresh_from_db()
+        self.assertTrue(run.session.startswith('zebra'))
+        self.assertIn('/potfiles/run-%d.pot' % run.pk, run.potfile_path)  # persistent
+        self.assertTrue(run.restore_path.endswith(run.session + '.restore'))
