@@ -11,19 +11,21 @@ reasoning for them. For a high-level overview see `CLAUDE.md`; for planned work 
   before spending GPU time on it.
 - **Secondary value:** ordinary campaign bookkeeping (projects, hashlists, cracked
   results) with as little ceremony as possible.
-- **Explicitly out of scope (for now):** launching/managing Hashcat jobs, a
-  next-mask recommender, multi-user/auth, distributed cracking. These are designed
-  *for* but not *built* (see §7 and `TODO.md`).
+- **Now also built (were once out of scope):** an active launcher that runs and
+  manages mask jobs — a machine-wide sequential queue with an Off/On/Auto master
+  switch, autopilot, and crash recovery (§6b/§6c) — and a budget-based next-mask
+  recommender plus an untried-region "fill gaps" generator (§3/§7).
+- **Still out of scope:** multi-user/auth, a real worker/queue (RQ/Celery) for
+  parallelism, distributed cracking (see `TODO.md`).
 
 ## 2. Key decisions
 
-### 2.1 Hybrid Hashcat integration (read-only), launcher-ready
-zebra reads from Hashcat (benchmarks, keyspace cross-check, result import) but does
-not launch jobs. This gives most of the value at a fraction of the complexity of
-process/queue management, and keeps the app usable when Hashcat isn't installed.
-The `Run` model already carries the live-run fields (`status`, `progress`,
-`speed_hs`, `started_at`/`ended_at`) and `HashcatRunner` exposes `plan()` today with
-`launch()`/`poll()` as explicit stubs — so an active launcher is an additive change.
+### 2.1 Hybrid Hashcat integration (reads + an active launcher)
+`services/hashcat.py` stays a thin, read-only wrapper (benchmarks, keyspace
+cross-check, result-import parsers) and the app still works with no `hashcat` binary
+(manual data entry). The **active launcher** that actually runs jobs is a separate
+module, `services/launcher.py` (§6b/§6c) — it builds argv via
+`HashcatRunner.build_run_args`, so `hashcat.py` itself never spawns a process.
 
 ### 2.2 Exact coverage from day one (atom decomposition)
 We compute *exact* union coverage rather than approximations. This is tractable
@@ -150,9 +152,10 @@ masks (stored in `Run.params`) never leak into coverage-by-length.
 - **`CharacterSet` / `Wildcard`** — user-definable charsets and mask symbols; the
   engine consumes wildcard symbol→characters maps.
 - **`Mask`** — the central object: `project` FK, `pattern`, optional
-  `custom_charsets` (JSON), derived `length`, cached `keyspace` (Decimal). A mask
-  counts as **covered only when it has an `exhausted` run** (see
-  `coverage_helpers.covered_masks`), not merely by existing.
+  `custom_charsets` (JSON), derived `length`, cached `keyspace` (Decimal), and
+  optional `increment_min`/`increment_max` (a `--increment` sweep expands to its
+  length-prefixes). A mask counts as **covered only when it has an `exhausted` run**
+  (see `coverage_helpers.covered_masks`), not merely by existing.
 - **`Wordlist` / `RuleSet`** — global reusable references (name, path, optional
   line/rule count) for non-mask attacks; enable usage stats and future hybrid
   keyspace. Identity is the normalized basename.
@@ -160,15 +163,22 @@ masks (stored in `Run.params`) never leak into coverage-by-length.
   belong to a project — backfilled from `mask.project` in migration 0007), `mask` FK
   (mode-3 only; feeds coverage), `attack_mode` (0/1/3/6/7), `wordlists`/`rules` M2M,
   `params` JSON (combinator order + inline `-j`/`-k`; hybrid mask + charsets),
-  `signature` (canonical dedup key), `device`, generated `command` (its `-m` comes
-  from `project.hashtype`), `status` (`planned/running/exhausted/aborted/cracked/error`), `speed_hs`,
-  `progress`, timing, `hashes` M2M. Runs are M2M to individual hashes so new hashes
-  added to a project are naturally flagged as not-yet-covered. `describe()` renders a
-  per-mode one-line spec for the dashboard.
+  `signature` (canonical dedup key), `device`, `optimized` (`-O`, default on),
+  generated `command` (its `-m` comes from `project.hashtype`), `status`
+  (`planned/queued/running/exhausted/aborted/cracked/error`), `speed_hs`, `progress`,
+  live-crack fields (`recovered`, and `crack_baseline`/`crack_range_end` pinpointing
+  this run's slice of a shared potfile), `queue_position`, `hashes` M2M, and launch/
+  recovery bookkeeping (`pid`, `session`, `potfile_path`, `restore_path` — §6b). Runs
+  are M2M to individual hashes (DB-backed only) so new hashes are flagged
+  not-yet-covered. `describe()` renders a per-mode one-line spec for the dashboard.
 - **`Crack`** — recovered plaintext for a hash (`hash` FK, `plaintext`, `run` FK,
   `found_at`); richer than the bare `cracked` bool, which is kept as a fast flag.
+  (File-backed projects skip `Crack` rows — their potfile is the source of truth.)
 - **`Benchmark`** — measured `speed_hs` per `hashtype`/`device`; grounds runtime
-  estimates now and the recommender later (`feasible = speed × time_budget`).
+  estimates and the recommender's budget sizing (`feasible = speed × time_budget`).
+- **`Settings`** — a singleton (pk=1, `Settings.load()`): program-wide options
+  independent of any project — the hashcat-binary override, the queue master switch
+  `queue_mode` (`off`/`on`/`auto`), and `auto_task_seconds` (autopilot task length).
 
 **One hash type per project.** `Project.hashtype` fixes the type (a hashcat run takes
 one `-m`); `Hash` and `Run` carry no type of their own and inherit it. Coverage scope
@@ -205,19 +215,23 @@ on one nullable field:
   (`Project.resolve_potfile_path()` → `ZEBRA_DATA_DIR/potfiles/project-<pk>.pot`,
   passed to hashcat as `--potfile-path`) as the source of truth — **no `Crack` rows,
   no `cracked` bool**. Cracked count = potfile line count. A persistent potfile also
-  makes hashcat auto-skip already-cracked hashes on later runs. The launcher keeps the
-  potfile **outside** the per-run `workdir`, so `rmtree(workdir)` never deletes it; DB-
-  backed runs keep their transient in-workdir potfile + `ingest_cracks`. The Run↔Hash
+  makes hashcat auto-skip already-cracked hashes on later runs. DB-backed runs still
+  ingest their potfile into `Crack` rows — but they too now write to a **persistent
+  per-run potfile** (`ZEBRA_DATA_DIR/potfiles/run-<pk>.pot`, stored on the `Run` and
+  kept outside the `workdir` that `rmtree` deletes) so a run orphaned by a restart is
+  still tail-able for recovery (§6b); it's removed on a clean finalize. The Run↔Hash
   M2M is **skipped** for file-backed projects (millions of join rows won't scale).
 - Backward compatible: existing projects have `hashfile_path IS NULL`, so every method
   takes the DB branch — behavior is identical to before. No data migration.
 
 ## 5. Hashcat service (`services/hashcat.py`)
 
-A thin, optional, read-only wrapper:
+A thin, optional, read-only wrapper (the active launcher lives in `services/launcher.py`,
+§6b):
 
-- `HashcatRunner.available()` / `benchmark()` / `keyspace()` / `plan()`, with
-  `launch()`/`poll()` reserved for the future active launcher.
+- `HashcatRunner.available()` / `benchmark()` / `keyspace()` / `plan()` /
+  `build_run_args()` / `plan_run()` (the latter two build argv the launcher spawns;
+  `-O` optimized kernels and `--increment` flags included).
 - Pure parsers — `parse_potfile`, `parse_status_json`, `parse_benchmark` — kept
   DB-free and unit-friendly.
 - DB-side ingest — `ingest_cracks`, `ingest_status` — import models lazily so the
@@ -244,7 +258,8 @@ A thin, optional, read-only wrapper:
 
 ## 6b. Active launcher (`services/launcher.py`)
 
-Runs a recorded **mask** attack with hashcat from the attack page (first cut).
+Runs a recorded **mask** attack with hashcat — from the attack page, the queue, or
+autopilot (§6c). Mask attacks only (other modes need on-disk wordlist/rule files).
 
 - **Background thread**, not a blocking request: `start_run` spawns hashcat and a
   daemon thread streams `--status-json` into the `Run` (progress/speed via the
@@ -285,14 +300,28 @@ Runs a recorded **mask** attack with hashcat from the attack page (first cut).
   dashboard/queue/run-detail views, and full `reconcile_stale_runs()` on the
   launch/queue action paths. The fully robust fix is still the worker/queue below.
 
+## 6c. Attack queue, master switch, and autopilot (`services/launcher.py`, `autopilot.py`)
+
+A machine-wide, **in-process sequential** queue (the GPU is one exclusive resource):
+`enqueue`/`dequeue`/`move` reorder planned mask runs; when the active run finalises,
+`_advance_queue` starts the next (lowest `queue_position`). The header **master
+switch** (`Settings.queue_mode`) has three states: **off** (don't auto-start —
+`is_paused`), **on** (run queued attacks), **auto** (also *fill* an empty queue).
+In **auto**, `autopilot.next_auto_run` picks an eligible project (hashtype +
+benchmark + hashes) and records the top recommender suggestion sized to
+`auto_task_seconds`, so the machine keeps finding new keyspace unattended. This is
+distinct from the deferred RQ/Celery worker (§7) — it's a single-process chain, not
+parallel or restart-durable on its own (recovery in §6b covers restarts).
+
 ## 7. Extensibility seams (designed, not built)
 
-- **Recommender** (`services/recommend.py`, future): rank uncovered masks by
-  hit-probability from a corpus (Hashcat `masks/*.hcmask` or PACK), filter by
-  `Benchmark`-derived time budget, exclude covered/subsumed masks.
+- **Recommender corpus:** the budget-based recommender (`services/recommend.py`) and
+  the untried-region "fill gaps" generator (`coverage.complement_boxes`) are **built**;
+  still open is ranking by real-world hit-probability from a mask corpus (Hashcat
+  `masks/*.hcmask` or PACK) rather than budget + novelty.
 - **Launcher, next increments:** launch wordlist/combinator/hybrid attacks (needs
   `Wordlist.path`/`RuleSet.path` validated on disk); a **worker/queue** (RQ/Celery)
-  so runs survive restarts and can be parallelised.
+  for parallelism (survival + recovery are handled in §6b).
 
 ## 8. Testing
 

@@ -39,15 +39,27 @@ mask keyspace, not just a list of commands.
   full specification and the exact hashcat command used.
 - **Run mask attacks** — from an attack's detail page, launch hashcat in the
   background (`services/launcher.py`); the page shows live progress and settles to
-  the final status (exhausted/cracked/aborted) with cracks imported. Mask attacks
-  only for now; one run at a time. Requires the real `hashcat` binary.
+  the final status (exhausted/cracked/aborted) with cracks imported. Optimized
+  kernels (`-O`) on by default (matches the benchmark). Mask attacks only for now;
+  one run at a time. Requires the real `hashcat` binary.
+- **Queue & automation** — a machine-wide sequential attack **queue** (reorder,
+  remove, cumulative ETA) with an **Off / On / Auto** master switch in the header;
+  **Auto** keeps the queue full with recommender-suggested attacks. Runs are spawned
+  **detached** and survive a zebra restart, with **crash/rogue recovery**: adopt a
+  live orphan by tailing its potfile, or **Resume from checkpoint** (`--restore`) a
+  dead one.
+- **Suggest & fill gaps** — a budget-based mask **recommender** ("Suggest mask": a
+  mask of roughly a chosen runtime that overlaps least with prior work), and **"Fill
+  gaps"** — the exact complement masks covering a length's *untried* keyspace.
 - **Result import** — paste a Hashcat potfile (`hash:plain`) to mark hashes cracked;
   parse `--status-json` output.
 
 zebra is **hybrid** with respect to Hashcat: it reads from the binary (keyspace
-cross-check, benchmarks, result import) but does **not** launch or manage cracking
-jobs. The data model and run state machine are shaped so an active launcher can be
-added later without rework. See `DESIGN.md`.
+cross-check, benchmarks, result import) **and** actively runs and manages mask
+attacks (queue, autopilot, recovery — `services/launcher.py`). It still degrades
+gracefully when `hashcat` is absent, working from manual data entry and recorded
+commands. Program-wide options (hashcat binary override, Auto task length) live on a
+**Settings** page (`/settings/`, a `Settings` singleton). See `DESIGN.md`.
 
 ## Running it
 

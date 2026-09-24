@@ -38,8 +38,8 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
 - [x] Coverage/redundancy driven off **exhausted** runs (`covered_masks`); planned
       etc. don't count
 - [x] Dashboard **Attacks** table (mask, status, hashtype, #hashes, cracks, keyspace, when)
-- [~] Edit/delete a run: **delete** exists (with orphaned-run recovery via Stop);
-      edit / re-open an exhausted run still open
+- [~] Edit/delete a run: **delete** exists; crash/rogue-run recovery is its own
+      feature (see Hashcat integration below). Edit / re-open an exhausted run still open
 - [~] Capture real **wall-clock/speed** on a run: launcher fills `speed_hs` /
       timing from `--status-json`; manual entry from the UI still open
 - [x] Per-run cracked-plaintext drill-down (run detail lists this run's cracks)
@@ -69,8 +69,16 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
       from its page in a background thread; live progress; final status + crack import
 - [x] **Attack queue / playbook**: queue planned mask runs and chain them sequentially
       unattended (auto-start next on finish), machine-wide, with cumulative ETA,
-      reorder, remove, and pause/resume (`/zebra/queue/`). Distinct from the
-      worker/queue item below (this is in-process sequential, not RQ/Celery).
+      reorder, remove (`/zebra/queue/`). Distinct from the worker/queue item below
+      (this is in-process sequential, not RQ/Celery).
+- [x] **Queue master switch (Off / On / Auto)** in the header (`Settings.queue_mode`):
+      Off pauses, On runs queued attacks, **Auto** keeps the queue full via
+      `autopilot.py` (records the top recommender suggestion sized to
+      `Settings.auto_task_seconds`) — set on the Settings page.
+- [x] **Optimized kernels (`-O`)** default per run, with a per-attack toggle
+      (`Run.optimized`) so runtimes match the `-O` benchmark.
+- [x] **Smart `--increment`**: auto-raise `--increment-min` past leading lengths
+      already fully covered/queued (`coverage_helpers.evaluate_candidate`).
 - [ ] Launch **wordlist/combinator/hybrid** attacks (needs `Wordlist`/`RuleSet` paths
       validated on disk)
 
@@ -119,7 +127,10 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
 - [x] **Record & run** in one click: from the recommender popup or the Evaluate
       panel, record a mask attack and launch it, landing on the live run page
       (mask mode + hashcat only; non-mask degrades to plain record)
-- [ ] **Edit/delete** projects, masks, hashes from the UI (admin-only today)
+- [x] **Delete a project** from the UI, behind a strict typed-confirmation page
+      (removes zebra-managed potfiles/hashfiles/checkpoints); **delete a run** too.
+- [ ] **Edit** projects, masks, hashes from the UI, and delete masks/hashes
+      (admin-only today)
 - [ ] Mask **input validation feedback** inline (live keyspace as you type)
       (Evaluate button gives keyspace/overlap/runtime on submit; not yet live)
 - [ ] Pagination / search for large hashlists and mask lists
