@@ -2582,3 +2582,170 @@ class AutoPilotTests(TestCase):
             self.assertIsNone(launcher._advance_queue())   # nothing queued, no fill
         start.assert_not_called()
         self.assertFalse(Run.objects.exists())
+
+
+class ComplementEngineTests(SimpleTestCase):
+    """Pure complement math: exact untried-region cover as boxes/masks."""
+
+    def _vol(self, box):
+        v = 1
+        for s in box:
+            v *= len(s)
+        return v
+
+    def test_untried_volume_matches_invariant(self):
+        U = cov.expand_charset('?a')
+        covered = [P('?l?l?a?a'), P('?d?d?a?a')]
+        res = cov.complement_boxes(covered, U, 4)
+        self.assertEqual(res['untried'], 74447225)             # 95^4 - (26²+10²)·95²
+        self.assertFalse(res['truncated'])
+        self.assertEqual(sum(self._vol(b) for b in res['boxes']), res['untried'])
+
+    def test_empty_covered_is_whole_space(self):
+        U = cov.expand_charset('?d')
+        res = cov.complement_boxes([], U, 3)
+        self.assertEqual(res['untried'], 1000)
+        self.assertEqual(sum(self._vol(b) for b in res['boxes']), 1000)
+
+    def test_fully_covered_has_no_gaps(self):
+        U = cov.expand_charset('?d')
+        res = cov.complement_boxes([P('?d?d')], U, 2)
+        self.assertEqual(res['untried'], 0)
+        self.assertEqual(res['boxes'], [])
+
+    def test_boxes_disjoint_from_covered(self):
+        U = cov.expand_charset('?a')
+        covered = [P('?l?l?a?a'), P('?d?d?a?a')]
+        res = cov.complement_boxes(covered, U, 4)
+        for box in res['boxes']:
+            for cm in covered:
+                # a box overlaps a covered mask only if every position intersects
+                self.assertTrue(any(not (set(box[p]) & set(cm[p])) for p in range(4)))
+
+    def test_merge_preserves_volume_and_cuts_count(self):
+        U = cov.expand_charset('?a')
+        res = cov.complement_boxes([P('?l?l?a?a'), P('?d?d?a?a')], U, 4)
+        merged = cov.merge_boxes(res['boxes'])
+        self.assertEqual(sum(self._vol(b) for b in merged), res['untried'])
+
+    def test_builtin_expansion_is_builtin_only_and_exact(self):
+        U = cov.expand_charset('?a')
+        res = cov.complement_boxes([P('?l?l?a?a'), P('?d?d?a?a')], U, 4)
+        boxes = [b for box in res['boxes'] for b in cov.expand_box_builtins(box)]
+        self.assertEqual(sum(self._vol(b) for b in boxes), res['untried'])
+        builtins = {frozenset(cov.BUILTIN_CHARSETS[s]) for s in 'ludsahH'}
+        for box in boxes:
+            for s in box:
+                self.assertTrue(s in builtins or len(s) == 1)   # single class or literal
+            for pat, custom in cov.render_box(box):
+                self.assertEqual(custom, {})                    # no custom charsets
+
+    def test_render_builtin_and_custom(self):
+        u = frozenset(cov.BUILTIN_CHARSETS['u'])
+        s = frozenset(cov.BUILTIN_CHARSETS['s'])
+        a = frozenset(cov.BUILTIN_CHARSETS['a'])
+        [(pat, custom)] = cov.render_box((u | s, a, a, a))
+        self.assertEqual(pat, '?1?a?a?a')
+        self.assertEqual(custom, {'1': '?u?s'})
+
+    def test_render_splits_when_over_four_slots(self):
+        B = {c: frozenset(cov.BUILTIN_CHARSETS[c]) for c in 'luds'}
+        # five positions, each a distinct multi-class (custom) set -> needs >4 slots
+        box = (B['l'] | B['u'], B['l'] | B['d'], B['u'] | B['d'],
+               B['u'] | B['s'], B['d'] | B['s'])
+        masks = cov.render_box(box)
+        self.assertGreater(len(masks), 1)                       # had to split
+        total = 1
+        for st in box:
+            total *= len(st)
+        got = 0
+        for pat, custom in masks:
+            self.assertLessEqual(len(custom), 4)                # within hashcat's limit
+            self.assertNotIn('?c', pat)
+            got += cov.mask_keyspace(cov.parse_mask(pat, custom_charsets=custom))
+        self.assertEqual(got, total)                            # split preserves union
+
+    def test_cap_truncates_without_emitting_covered(self):
+        U = cov.expand_charset('?a')
+        res = cov.complement_boxes([P('?l?l?a?a'), P('?d?d?a?a')], U, 4, box_cap=1)
+        self.assertTrue(res['truncated'])
+        self.assertGreater(res['omitted_boxes'], 0)
+        # shown boxes still lie entirely in the untried region
+        self.assertLessEqual(sum(self._vol(b) for b in res['boxes']), res['untried'])
+
+
+class ComplementViewTests(TestCase):
+    """Fill-gaps glue, endpoint, record round-trip, and Queue-all."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='CX-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='CXP', hashtype=self.ht,
+                                              universe='?a', benchmark_hs=10**9)
+        Hash.objects.create(hashstring='a' * 32, project=self.project)
+
+    def _exhaust(self, pattern):
+        m = Mask.objects.create(project=self.project, pattern=pattern)
+        Run.objects.create(mask=m, project=self.project, attack_mode=3, status='exhausted')
+        return m
+
+    def _plan(self, pattern):
+        m = Mask.objects.create(project=self.project, pattern=pattern)
+        Run.objects.create(mask=m, project=self.project, attack_mode=3, status='planned')
+        return m
+
+    def test_glue_requires_universe(self):
+        p = Project.objects.create(name='NOUNIV', hashtype=self.ht)
+        self.assertEqual(ch.project_complement_masks(p, 4), {'error': 'no-universe'})
+
+    def test_glue_excludes_planned_and_queued(self):
+        self._exhaust('?l?l?a?a')
+        self._plan('?d?d?a?a')                     # planned counts as tried
+        res = ch.project_complement_masks(self.project, 4)
+        self.assertEqual(res['summary']['untried'], 74447225)  # both excluded
+
+    def test_json_compact_and_builtins(self):
+        self._exhaust('?l?l?a?a'); self._exhaust('?d?d?a?a')
+        d = self.client.get('/zebra/project/%d/complement/4.json?style=compact'
+                            % self.project.pk).json()
+        self.assertTrue(d['ok'])
+        self.assertEqual(d['summary']['untried'], '74447225')  # string (JS precision)
+        self.assertTrue(any(m['custom_charsets'] for m in d['masks']))
+        b = self.client.get('/zebra/project/%d/complement/4.json?style=builtins'
+                            % self.project.pk).json()
+        self.assertTrue(all(m['custom_charsets'] == {} for m in b['masks']))
+
+    def test_record_url_round_trips_custom_charsets(self):
+        self._exhaust('?l?l?a?a'); self._exhaust('?d?d?a?a')
+        d = self.client.get('/zebra/project/%d/complement/4.json'
+                            % self.project.pk).json()
+        m = next(x for x in d['masks'] if x['custom_charsets'])
+        r = self.client.get(m['record_url'])                   # follow the Record link
+        self.assertContains(r, m['pattern'])
+        self.assertContains(r, m['custom_charsets_raw'])       # e.g. "1=?u?s" in textarea
+
+    def test_record_run_persists_custom_charsets(self):
+        from unittest import mock
+        with mock.patch('zebra.views.launcher.run_or_queue',
+                        return_value=('queued', None)):
+            self.client.post('/zebra/project/%d/mask/new/' % self.project.pk,
+                             {'attack_mode': '3', 'pattern': '?1?a?a?a',
+                              'custom_charsets': '1=?u?s', 'status': 'planned',
+                              'optimized': '1', 'action': 'record_run'})
+        mask = Mask.objects.get(project=self.project, pattern='?1?a?a?a')
+        self.assertEqual(mask.custom_charsets, {'1': '?u?s'})
+
+    def test_queue_all_enqueues_and_is_idempotent(self):
+        from unittest import mock
+        self._exhaust('?l?l?a?a'); self._exhaust('?d?d?a?a')
+        url = '/zebra/project/%d/complement/4/queue' % self.project.pk
+        with mock.patch('zebra.views.launcher.enqueue', return_value=None):
+            d1 = self.client.post(url, {'style': 'compact'}).json()
+            self.assertGreater(d1['queued'], 0)              # queued the gap masks
+            self.assertEqual(d1['skipped'], 0)
+            self.assertEqual(Run.objects.filter(project=self.project,
+                             status='planned').count(), d1['queued'])
+            # Re-run: the just-queued masks now count as tried, so no gaps remain.
+            d2 = self.client.post(url, {'style': 'compact'}).json()
+        self.assertEqual(d2['queued'], 0)
+        # The length is now fully covered by queued masks -> zero untried keyspace.
+        self.assertEqual(ch.project_complement_masks(self.project, 4)['summary']['untried'], 0)

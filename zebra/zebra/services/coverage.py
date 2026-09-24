@@ -432,3 +432,250 @@ def coverage_decomposition(masks, universe=None, cell_cap=20000):
         'marginals': marginals,
         'truncated': truncated,
     }
+
+
+# --- Complement ("untried region") masks ------------------------------------
+#
+# Given a length L, the character universe U, and the masks already tried, build
+# a set of masks whose union is EXACTLY U^L minus the union of tried boxes -- the
+# gaps not yet searched. The complement of a union of axis-aligned boxes is itself
+# a union of boxes, and a hashcat mask IS a box, so each complement box renders to
+# one mask. We fold U into the atom partition (every char in U becomes an atom,
+# including chars no tried mask uses), then subtract each tried box from the full
+# box U^L, keeping a disjoint list.
+
+COMPLEMENT_BOX_CAP = 20000   # max boxes carried during subtraction (compute bound)
+COMPLEMENT_MASK_CAP = 200    # max masks returned to the caller (display bound)
+
+_BUILTIN_SETS = {sym: frozenset(BUILTIN_CHARSETS[sym]) for sym in 'ludsahH'}
+
+
+def _box_volume(box, weights):
+    """Candidate count of a box (list of per-position atom bitmasks)."""
+    vol = 1
+    for b in box:
+        vol *= _popweight(b, weights)
+    return vol
+
+
+def _box_difference(box, other):
+    """Disjoint boxes whose union is ``box`` minus ``other`` (<= len(box) boxes).
+
+    Orthogonal "staircase" split: where the boxes overlap in every position, peel
+    off -- one position at a time -- the slab of ``box`` outside ``other`` at that
+    position while pinning earlier positions to the overlap. Each result box is
+    nonempty, pairwise disjoint, and disjoint from ``other``.
+    """
+    inter = [box[i] & other[i] for i in range(len(box))]
+    if any(x == 0 for x in inter):
+        return [list(box)]  # disjoint in some position -> box survives whole
+    out = []
+    for p in range(len(box)):
+        diff = box[p] & ~other[p]
+        if diff:
+            out.append(inter[:p] + [diff] + list(box[p + 1:]))
+    return out
+
+
+def complement_boxes(covered, universe, length, box_cap=COMPLEMENT_BOX_CAP):
+    """Untried region (U^length minus the union of ``covered`` masks) as boxes.
+
+    ``covered`` : parsed masks (lists of frozensets) -- only those of ``length`` are
+                  used; each position is clipped to ``universe``.
+    ``universe``: the in-scope character set (complement is relative to it).
+    Returns a dict whose ``boxes`` is a list of per-position char-set tuples
+    (frozenset), sorted largest-first, whose union is the untried region (exact
+    unless ``truncated``). With no truncation,
+    ``sum(box volumes) == len(U)**length - union_keyspace(clipped covered)``.
+    """
+    U = frozenset(universe)
+    total = len(U) ** length
+
+    clipped = []
+    for m in covered:
+        if len(m) != length:
+            continue
+        cm = [frozenset(s) & U for s in m]
+        if all(cm):  # a position emptied by clipping -> mask covers nothing in U
+            clipped.append(cm)
+    covered_vol = union_keyspace(clipped) if clipped else 0
+
+    # Atom-partition U with every clipped position-set, so every char of U is an atom.
+    distinct = [U] + [s for m in clipped for s in m]
+    atoms, bits = _atom_sets(distinct)
+    weights = [len(a) for a in atoms]
+    index = {s: bits[i] for i, s in enumerate(distinct)}
+    full = bits[0]  # U's bitmask == OR of every atom
+    covered_boxes = [[index[s] for s in m] for m in clipped]
+
+    remaining = [[full] * length]
+    omitted_boxes = omitted_keyspace = 0
+    truncated = False
+    for c in covered_boxes:
+        nxt = []
+        for b in remaining:
+            nxt.extend(_box_difference(b, c))
+        remaining = nxt
+        if len(remaining) > box_cap:
+            remaining.sort(key=lambda bx: _box_volume(bx, weights), reverse=True)
+            dropped = remaining[box_cap:]
+            omitted_boxes += len(dropped)
+            omitted_keyspace += sum(_box_volume(bx, weights) for bx in dropped)
+            remaining = remaining[:box_cap]
+            truncated = True
+
+    remaining.sort(key=lambda bx: _box_volume(bx, weights), reverse=True)
+    shown = sum(_box_volume(bx, weights) for bx in remaining)
+
+    def _chars(bmask):
+        s = set()
+        for aid in _atoms_in(bmask):
+            s |= atoms[aid]
+        return frozenset(s)
+    boxes = [tuple(_chars(b) for b in box) for box in remaining]
+
+    return {
+        'length': length, 'total': total, 'covered': covered_vol,
+        'untried': total - covered_vol, 'boxes': boxes, 'shown': shown,
+        'omitted_boxes': omitted_boxes, 'omitted_keyspace': omitted_keyspace,
+        'truncated': truncated,
+    }
+
+
+def merge_boxes(boxes):
+    """Merge boxes identical in all-but-one position (Quine-McCluskey cube merge).
+
+    Boxes are per-position char-set tuples. Greedy to a fixpoint: two boxes that
+    agree everywhere except one position combine into one whose differing position
+    is the union. Inputs are disjoint and agree elsewhere, so the merged volume is
+    exactly the sum -- union is preserved while the mask count shrinks.
+    """
+    boxes = [tuple(frozenset(s) for s in b) for b in boxes]
+    changed = True
+    while changed:
+        changed = False
+        out, used = [], [False] * len(boxes)
+        for i in range(len(boxes)):
+            if used[i]:
+                continue
+            bi = boxes[i]
+            for j in range(i + 1, len(boxes)):
+                if used[j]:
+                    continue
+                bj = boxes[j]
+                diff = [p for p in range(len(bi)) if bi[p] != bj[p]]
+                if len(diff) == 1:
+                    p = diff[0]
+                    merged = list(bi)
+                    merged[p] = bi[p] | bj[p]
+                    bi = tuple(merged)
+                    used[j] = True
+                    changed = True
+            out.append(bi)
+        boxes = out
+    return boxes
+
+
+def _split_builtin_pieces(charset):
+    """A char-set as pieces: a single builtin class if it is one, else disjoint
+    core classes (?l ?u ?d ?s) it contains plus one singleton per leftover char."""
+    s = frozenset(charset)
+    for sym in ('a', 'l', 'u', 'd', 's', 'h', 'H'):
+        if s == _BUILTIN_SETS[sym]:
+            return [s]
+    pieces, rest = [], set(s)
+    for sym in ('l', 'u', 'd', 's'):
+        cls = _BUILTIN_SETS[sym]
+        if cls <= rest:
+            pieces.append(cls)
+            rest -= cls
+    pieces += [frozenset({ch}) for ch in sorted(rest)]
+    return pieces or [s]
+
+
+def expand_box_builtins(box):
+    """Expand a box into builtin-only boxes (no custom charsets).
+
+    Each position is split into whole-builtin classes / single-char literals; the
+    Cartesian product over positions yields boxes whose every position is a single
+    builtin token or literal. A position that is exactly a builtin (incl. ?a) is
+    kept whole. Irregular multi-char subsets of a class (exotic universe) fall back
+    to their component singletons, so builtin-only is exact for clean universes.
+    """
+    per_pos = [_split_builtin_pieces(s) for s in box]
+    return [tuple(combo) for combo in product(*per_pos)]
+
+
+def _builtin_token(s):
+    """'?x' if ``s`` exactly equals a builtin class, else None."""
+    for sym in ('a', 'l', 'u', 'd', 's', 'h', 'H'):
+        if s == _BUILTIN_SETS[sym]:
+            return '?' + sym
+    return None
+
+
+def _charset_def(s):
+    """A hashcat -1..-4 definition string for ``s``, preferring builtin sub-tokens.
+
+    Peels the disjoint core classes (?l ?u ?d ?s) contained in ``s``, then appends
+    any remaining characters as literals (``??`` for a literal '?'). Never ?a/?c."""
+    rest, parts = set(s), []
+    for sym in ('l', 'u', 'd', 's'):
+        cls = _BUILTIN_SETS[sym]
+        if cls <= rest:
+            parts.append('?' + sym)
+            rest -= cls
+    parts += ['??' if ch == '?' else ch for ch in sorted(rest)]
+    return ''.join(parts)
+
+
+def _position_token(s, wildcard_rev):
+    """('token', str) for a direct ?token/literal, or ('custom', defstr)."""
+    bt = _builtin_token(s)
+    if bt:
+        return ('token', bt)
+    if s in wildcard_rev:
+        return ('token', '?' + wildcard_rev[s])
+    if len(s) == 1:
+        ch = next(iter(s))
+        if ch == '?':
+            return ('token', '??')
+        if ch.isprintable() and ch != ' ':
+            return ('token', ch)
+    return ('custom', _charset_def(s))
+
+
+def render_box(box, wildcard_map=None):
+    """Render a box (per-position char-sets) to hashcat masks.
+
+    Returns a list of ``(pattern, custom_charsets)`` -- normally one element, more
+    only when a single mask would need >4 custom-charset slots and is split. Each
+    position becomes a ?token (builtin/project wildcard), a literal, or a custom
+    charset (-1..-4) whose definition prefers builtin sub-tokens. ?c is never
+    emitted, so it never collides with substitute_c's launch-time slot.
+    """
+    wildcard_rev = {frozenset(v): k for k, v in (wildcard_map or {}).items()}
+    return _render_box([frozenset(s) for s in box], wildcard_rev)
+
+
+def _render_box(box, wildcard_rev):
+    tokens = [_position_token(s, wildcard_rev) for s in box]
+    defs = []
+    for kind, val in tokens:
+        if kind == 'custom' and val not in defs:
+            defs.append(val)
+    if len(defs) <= 4:
+        slot_of = {d: str(i + 1) for i, d in enumerate(defs)}
+        custom = {slot: d for d, slot in slot_of.items()}
+        pattern = ''.join(val if kind == 'token' else '?' + slot_of[val]
+                          for kind, val in tokens)
+        return [(pattern, custom)]
+    # >4 distinct custom defs: turn one custom position into builtin/singleton
+    # pieces (strictly fewer custom positions per sub-box -> terminates).
+    cand = next(p for p in range(len(box)) if tokens[p][0] == 'custom')
+    out = []
+    for piece in _split_builtin_pieces(box[cand]):
+        sub = list(box)
+        sub[cand] = piece
+        out.extend(_render_box(sub, wildcard_rev))
+    return out

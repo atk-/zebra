@@ -102,6 +102,12 @@ Public surface:
 - `marginal_keyspace` / `is_subsumed` / `overlap_keyspace` — redundancy checks used
   by the mask-planning UI.
 - `coverage_by_length(masks, universe)` — per-length `{covered, total, masks}`.
+- `complement_boxes(covered, universe, length)` — the **untried region**
+  (`U^length` minus the tried boxes) as a disjoint set of boxes, via orthogonal
+  box-subtraction (staircase difference) with a cap-and-drop-smallest bound;
+  `merge_boxes` (Quine-McCluskey cube merge) compacts it and `render_box` emits each
+  box as a hashcat mask (`?token`/literal, or a `-1..-4` custom charset, never `?c`).
+  Powers the "Fill gaps" UI via `coverage_helpers.project_complement_masks`.
 
 **Complexity note.** Union-of-boxes volume is #P-hard in general dimension, but here
 dimension = password length (small, ~6–12) and atoms per position are few, so

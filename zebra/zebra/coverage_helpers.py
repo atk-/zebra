@@ -242,6 +242,64 @@ def project_recommendations(project, target, top_n=8):
     return rec.recommend(int(target), existing, token_sizes, top_n=top_n)
 
 
+def project_complement_masks(project, length, style='compact',
+                             mask_cap=cov.COMPLEMENT_MASK_CAP):
+    """Masks covering the untried region of ``length`` within the project universe.
+
+    "Tried" = exhausted + planned/queued/running (like the recommender), so the
+    gaps are only genuinely-new keyspace. ``style`` is 'compact' (merge gaps into
+    fewest masks, custom charsets for multi-class positions) or 'builtins'
+    (builtin-only, no custom charsets, possibly many more). Returns
+    ``{'error': 'no-universe'}`` when the project has no universe, else
+    ``{error, length, style, items, summary}`` where each item is
+    ``{pattern, custom_charsets, keyspace, length, covers}`` sorted largest-first.
+    """
+    universe = expand_universe(project.universe)
+    if not universe:
+        return {'error': 'no-universe'}
+    wmap = project_wildcard_map()
+    covered = [m for m in project_planned_expansion(project, wmap) if len(m) == length]
+    res = cov.complement_boxes(covered, universe, length)
+
+    if style == 'builtins':
+        # No merge: merging builtin pieces back together would re-create the very
+        # multi-class (custom) positions builtin-only mode exists to avoid.
+        boxes = [b for box in res['boxes'] for b in cov.expand_box_builtins(box)]
+    else:
+        boxes = cov.merge_boxes(res['boxes'])
+
+    def _vol(box):
+        v = 1
+        for s in box:
+            v *= len(s)
+        return v
+
+    boxes.sort(key=_vol, reverse=True)
+    omitted_gaps, omitted_keyspace = res['omitted_boxes'], res['omitted_keyspace']
+    if len(boxes) > mask_cap:
+        for box in boxes[mask_cap:]:
+            omitted_gaps += 1
+            omitted_keyspace += _vol(box)
+        boxes = boxes[:mask_cap]
+
+    items = []
+    for box in boxes:
+        for pattern, custom in cov.render_box(box, wmap):
+            positions = cov.parse_mask(pattern, custom_charsets=custom, wildcard_map=wmap)
+            items.append({'pattern': pattern, 'custom_charsets': custom,
+                          'keyspace': cov.mask_keyspace(positions),
+                          'length': length, 'covers': str(length)})
+    return {
+        'error': None, 'length': length, 'style': style, 'items': items,
+        'summary': {
+            'total': res['total'], 'untried': res['untried'],
+            'shown': res['untried'] - omitted_keyspace,
+            'omitted_gaps': omitted_gaps, 'omitted_keyspace': omitted_keyspace,
+            'truncated': bool(omitted_gaps),
+        },
+    }
+
+
 # --- Search-space decomposition (visualization glue) ------------------------
 #
 # Wraps cov.coverage_decomposition with human-readable atom labels/colors and

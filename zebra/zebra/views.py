@@ -700,6 +700,9 @@ def mask_new(request, pk):
         context['pattern'] = (request.GET.get('pattern') or '').strip()
         context['increment'] = bool(request.GET.get('increment'))
         context['increment_max'] = (request.GET.get('increment_max') or '').strip()
+        # Custom charsets ride along as newline-joined "key=def" lines (the format
+        # the POST handler parses) so a complement/suggested mask keeps its -1..-4.
+        context['custom_charsets_raw'] = request.GET.get('custom_charsets') or ''
         context['optimized'] = True  # optimized kernels (-O) on by default
         return render(request, 'zebra/mask_new.html', context)
 
@@ -985,3 +988,100 @@ def coverage_decomposition_json(request, pk, length):
     """
     project = get_object_or_404(Project, pk=pk)
     return JsonResponse(ch.project_length_decomposition(project, length))
+
+
+def _custom_charsets_raw(custom):
+    """Encode a {"1":def,...} dict as the newline "key=def" form the form parses."""
+    return '\n'.join('%s=%s' % (k, custom[k]) for k in sorted(custom))
+
+
+def complement_json(request, pk, length):
+    """Masks covering the untried region of ``length`` (feeds the Fill-gaps modal).
+
+    ``?style=compact|builtins``. Keyspaces are strings (JS precision). Each mask
+    carries a ``record_url`` and ``custom_charsets_raw`` so the modal's Record link
+    and Record&run POST preserve its -1..-4 definitions through the record flow.
+    """
+    project = get_object_or_404(Project, pk=pk)
+    style = request.GET.get('style')
+    style = style if style in ('compact', 'builtins') else 'compact'
+    res = ch.project_complement_masks(project, length, style)
+    if res.get('error') == 'no-universe':
+        return JsonResponse({'ok': False, 'error': 'no-universe'})
+    rate = int(project.benchmark_hs) if project.benchmark_hs else 0
+    masks = []
+    for it in res['items']:
+        cc = it['custom_charsets']
+        cc_raw = _custom_charsets_raw(cc)
+        record_url = reverse('mask_new', args=[project.pk]) + '?pattern=' + quote(it['pattern'])
+        if cc:
+            record_url += '&custom_charsets=' + quote(cc_raw)
+        masks.append({
+            'pattern': it['pattern'],
+            'custom_charsets': cc,
+            'custom_charsets_raw': cc_raw,
+            'keyspace': str(it['keyspace']),
+            'keyspace_h': _humanize_count(it['keyspace']) or '0',
+            'covers': it['covers'],
+            'est_label': _format_duration(it['keyspace'] / rate) if rate else None,
+            'record_url': record_url,
+        })
+    s = res['summary']
+    return JsonResponse({
+        'ok': True, 'length': res['length'], 'style': res['style'], 'masks': masks,
+        'summary': {
+            'total': str(s['total']), 'untried': str(s['untried']),
+            'untried_h': _humanize_count(s['untried']) or '0',
+            'shown': str(s['shown']),
+            'omitted_gaps': s['omitted_gaps'],
+            'omitted_keyspace': str(s['omitted_keyspace']),
+            'omitted_h': _humanize_count(s['omitted_keyspace']) or '0',
+            'truncated': s['truncated'],
+        },
+    })
+
+
+def complement_queue(request, pk, length):
+    """Record every untried-region mask for ``length`` and enqueue it (POST).
+
+    Recomputes the set server-side (never trusts the client), skips masks already
+    recorded/queued, and enqueues the rest (which runs the first immediately when
+    the queue is idle). Returns {queued, skipped}.
+    """
+    project = get_object_or_404(Project, pk=pk)
+    if request.method != 'POST':
+        return redirect(reverse('project_detail', args=[pk]))
+    style = request.POST.get('style')
+    style = style if style in ('compact', 'builtins') else 'compact'
+    res = ch.project_complement_masks(project, length, style)
+    if res.get('error') == 'no-universe':
+        return JsonResponse({'ok': False, 'error': 'no-universe'})
+    module = project.hashtype.hashcat_module if project.hashtype else 0
+    runner = hc.configured_runner()
+    hashfile = '%s.hashes' % project.name
+    queued = skipped = 0
+    for it in res['items']:
+        pattern, custom = it['pattern'], it['custom_charsets']
+        signature = sim.signature({'attack_mode': 3, 'mask': pattern})
+        # Skip if this exact mask is already recorded/queued/running/done.
+        if Run.objects.filter(project=project, attack_mode=3,
+                              signature=signature).exclude(
+                              status__in=('aborted', 'error')).exists():
+            skipped += 1
+            continue
+        mask, _ = Mask.objects.get_or_create(
+            project=project, pattern=pattern, custom_charsets=custom,
+            increment_min=None, increment_max=None)
+        ch.compute_and_cache_keyspace(mask)
+        mask.save()
+        command = runner.plan_run(3, module, hashfile=hashfile,
+                                  params={'mask': pattern, 'custom_charsets': custom},
+                                  optimized=True)
+        run = Run.objects.create(mask=mask, project=project, attack_mode=3,
+                                 optimized=True, status='planned', command=command,
+                                 signature=signature)
+        if not project.is_file_backed:
+            run.hashes.set(project.hash_set.all())
+        launcher.enqueue(run)
+        queued += 1
+    return JsonResponse({'ok': True, 'queued': queued, 'skipped': skipped})

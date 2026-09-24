@@ -17,10 +17,12 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
 - [ ] **Visualize remaining vs. covered** more richly (per-length stacked bars,
       log-scale option — keyspaces span many orders of magnitude). Per-length
       search-space decomposition viz exists; a cross-length rollup chart does not.
-- [ ] **Suggest uncovered mask boxes** for a given length (decompose the uncovered
-      region into candidate masks). NOTE: the budget recommender (below) suggests
-      what to run next by class composition; a true uncovered-region decomposition
-      is still open.
+- [x] **Suggest uncovered mask boxes** for a given length ("Fill gaps"): exact
+      complement of the tried region within the universe, rendered as masks
+      (`coverage.complement_boxes`/`merge_boxes`/`render_box` →
+      `coverage_helpers.project_complement_masks` → `complement.json` + per-length
+      modal). Compact (custom-charset) or builtin-only; exact-under-a-cap; "Queue
+      all gaps"; excludes exhausted+planned/queued.
 - [x] Support **`--increment`** variable-length masks (expand to length-prefixes):
       recorded, launchable, coverage per swept length, recommender-aware
 - [~] Handle **`?b`/binary and non-printable** universes in the UI: added `?b`

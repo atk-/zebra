@@ -107,6 +107,10 @@
     <td>
       <div class="bar"><span style="width:{{ row.percent|floatformat:4 }}%"></span></div>
       <span class="muted">{{ row.percent|floatformat:4 }}%</span>
+      {% if project.universe %}
+      <button class="btn secondary" type="button" data-fill-gaps data-length="{{ row.length }}"
+              style="padding:2px 8px; font-size:12px; margin-left:8px;">Fill gaps</button>
+      {% endif %}
     </td>
   </tr>
   <tr class="cov-detail" id="cov-panel-{{ row.length }}" hidden>
@@ -482,6 +486,27 @@
   </div>
 </div>
 
+<div class="modal-backdrop" id="gaps-modal" hidden
+     data-urlbase="{% url 'complement' project.pk 0 %}"
+     data-queuebase="{% url 'complement_queue' project.pk 0 %}"
+     data-recordurl="{% url 'mask_new' project.pk %}"
+     data-hashcat="{% if hashcat_available %}1{% endif %}"
+     data-csrf="{{ csrf_token }}">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="gaps-title">
+    <div class="modal-head">
+      <h3 id="gaps-title">Fill gaps</h3>
+      <button class="modal-close" type="button" data-close-gaps aria-label="Close">&times;</button>
+    </div>
+    <p class="muted" style="margin:6px 0 0">Masks covering the untried keyspace for
+      this length that you haven't run or queued yet.</p>
+    <div class="seg" id="gaps-style">
+      <button type="button" data-style="compact" class="active">Compact</button>
+      <button type="button" data-style="builtins">Builtins only</button>
+    </div>
+    <div id="gaps-body"></div>
+  </div>
+</div>
+
 <script>
 // Recommender popup: on choosing a duration, fetch ranked mask suggestions and
 // render them. Keyspace counts arrive as strings (JS integer precision) and are
@@ -619,6 +644,141 @@
         + '</div>';
     });
     body.innerHTML = html;
+  }
+})();
+</script>
+
+<script>
+// Fill-gaps popup: for a chosen length, fetch the complement masks (untried
+// keyspace) and render them like recommendations. Keyspaces arrive as strings
+// (JS precision); all set math is server-side. custom_charsets ride through the
+// record link / Record&run POST so -1..-4 definitions survive recording.
+(function () {
+  var modal = document.getElementById('gaps-modal');
+  if (!modal) return;
+  var body = document.getElementById('gaps-body');
+  var styleSeg = modal.querySelectorAll('#gaps-style button');
+  var recordUrl = modal.dataset.recordurl;
+  var hashcatOn = modal.dataset.hashcat === '1';
+  var csrf = modal.dataset.csrf;
+  var length = null, style = 'compact';
+
+  function grp(s) { return String(s).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+  // Swap the "0" length placeholder in the templated URL for the chosen length,
+  // matching both .../complement/0.json and .../complement/0/queue.
+  function urlFor(base) { return base.replace(/\/0(\.json|\/queue)$/, '/' + length + '$1'); }
+  function open() { modal.hidden = false; }
+  function close() { modal.hidden = true; body.innerHTML = ''; }
+  document.querySelectorAll('[data-fill-gaps]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      length = b.dataset.length; open(); run();
+    });
+  });
+  modal.querySelectorAll('[data-close-gaps]').forEach(function (b) {
+    b.addEventListener('click', close);
+  });
+  modal.addEventListener('click', function (e) { if (e.target === modal) close(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !modal.hidden) close();
+  });
+  styleSeg.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      styleSeg.forEach(function (b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      style = btn.dataset.style; run();
+    });
+  });
+
+  function run() {
+    body.innerHTML = '<p class="muted">Computing&hellip;</p>';
+    fetch(urlFor(modal.dataset.urlbase) + '?style=' + style)
+      .then(function (r) { return r.json(); }).then(render)
+      .catch(function (e) { body.innerHTML = '<p class="viz-note">Failed: ' + esc(e) + '</p>'; });
+  }
+
+  function ccChips(cc) {
+    var keys = Object.keys(cc || {}).sort();
+    if (!keys.length) return '';
+    return ' ' + keys.map(function (k) {
+      return '<span class="pill" style="background:#eef;color:#334">-' + esc(k)
+        + ' ' + esc(cc[k]) + '</span>';
+    }).join(' ');
+  }
+
+  function maskActions(m) {
+    var review = '<a class="btn' + (hashcatOn ? ' secondary' : '')
+      + '" href="' + m.record_url + '">Record this attack</a>';
+    if (!hashcatOn) return review;
+    var form = '<form method="post" action="' + recordUrl + '" style="display:inline; margin-right:8px">'
+      + '<input type="hidden" name="csrfmiddlewaretoken" value="' + esc(csrf) + '">'
+      + '<input type="hidden" name="attack_mode" value="3">'
+      + '<input type="hidden" name="status" value="planned">'
+      + '<input type="hidden" name="action" value="record_run">'
+      + '<input type="hidden" name="optimized" value="1">'
+      + '<input type="hidden" name="pattern" value="' + esc(m.pattern) + '">'
+      + '<input type="hidden" name="custom_charsets" value="' + esc(m.custom_charsets_raw) + '">'
+      + '<button class="btn" type="submit" title="Record and run/queue">Record &amp; run</button>'
+      + '</form>';
+    return form + review;
+  }
+
+  function queueAll() {
+    var f = new FormData();
+    f.append('csrfmiddlewaretoken', csrf);
+    f.append('style', style);
+    fetch(urlFor(modal.dataset.queuebase), { method: 'POST', body: f })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.ok) { alert('Queued ' + d.queued + ' gap mask(s)' +
+          (d.skipped ? ', skipped ' + d.skipped + ' already recorded' : '') + '.');
+          location.reload(); }
+        else { alert('Failed: ' + (d.error || 'unknown')); }
+      }).catch(function (e) { alert('Failed: ' + e); });
+  }
+
+  function render(d) {
+    if (!d.ok) {
+      if (d.error === 'no-universe') {
+        body.innerHTML = '<div class="note warn">Set a project <b>universe</b> first —'
+          + ' the untried region is defined relative to the in-scope character set.</div>';
+      } else {
+        body.innerHTML = '<div class="note warn">' + esc(d.error) + '</div>';
+      }
+      return;
+    }
+    var s = d.summary, masks = d.masks || [];
+    var html = '<p class="muted" style="margin:12px 0 4px">Length <b>' + esc(d.length)
+      + '</b> · <b>' + esc(s.untried_h) + '</b> untried candidates in <b>'
+      + masks.length + '</b> mask(s).</p>';
+    if (s.omitted_gaps) {
+      html += '<div class="viz-note">' + s.omitted_gaps + ' smaller gap(s) ('
+        + esc(s.omitted_h) + ' candidates) not shown (capped).</div>';
+    }
+    if (!masks.length) {
+      html += '<p class="muted">No gaps — this length is fully covered by tried/queued masks.</p>';
+      body.innerHTML = html;
+      return;
+    }
+    if (hashcatOn) {
+      html += '<p><button class="btn" type="button" data-queue-all>Queue all gaps ('
+        + masks.length + ')</button></p>';
+    }
+    masks.forEach(function (m, i) {
+      html += '<div class="reco' + (i === 0 ? ' top' : '') + '">'
+        + '<div class="reco-pattern">' + esc(m.pattern) + ccChips(m.custom_charsets) + '</div>'
+        + '<div class="reco-meta">keyspace <b>' + esc(m.keyspace_h) + '</b> ('
+        + grp(m.keyspace) + ' candidates)'
+        + (m.est_label ? ' &middot; est. runtime <b>~' + esc(m.est_label) + '</b>' : '')
+        + '</div>' + maskActions(m) + '</div>';
+    });
+    body.innerHTML = html;
+    var qa = body.querySelector('[data-queue-all]');
+    if (qa) qa.addEventListener('click', queueAll);
   }
 })();
 </script>

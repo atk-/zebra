@@ -26,4 +26,6 @@ urlpatterns = [
     path("project/<int:pk>/runs.json", views.project_runs_status_json, name="project_runs_status"),
     path("project/<int:pk>/recommend.json", views.recommend_json, name="recommend"),
     path("project/<int:pk>/coverage/<int:length>.json", views.coverage_decomposition_json, name="coverage_decomposition"),
+    path("project/<int:pk>/complement/<int:length>.json", views.complement_json, name="complement"),
+    path("project/<int:pk>/complement/<int:length>/queue", views.complement_queue, name="complement_queue"),
 ]
