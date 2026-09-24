@@ -2,6 +2,9 @@
 from pathlib import Path
 
 HASHTYPES_TSV = Path(__file__).resolve().parent / 'hashtypes.tsv'
+# Charset file holding every byte of ?c (the perfect complement of ?a). hashcat has
+# no native ?c token, so mask runs that use ?c bind a custom -1..-4 slot to this file.
+C_COMPLEMENT_HCCHR = Path(__file__).resolve().parent / 'b_complement.hcchr'
 
 
 def load_hashtypes(path=None):

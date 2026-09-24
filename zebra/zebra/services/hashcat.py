@@ -1,14 +1,13 @@
 """Thin, optional, read-only wrapper around the ``hashcat`` binary.
 
-Hybrid design: zebra *reads* from hashcat (benchmarks, keyspace cross-check,
-result import) but does not launch or manage long cracking jobs. Everything here
+zebra *reads* from hashcat here (benchmarks, keyspace cross-check, result import)
+and builds argv (``build_run_args`` / ``plan_run``); the *active* launcher that
+actually spawns and manages jobs lives in ``services/launcher.py``. Everything here
 degrades gracefully when hashcat is not installed, so the rest of the app keeps
 working with purely manual data entry.
 
-The ``HashcatRunner`` class is the seam a future *active* launcher plugs into:
-``plan()`` / ``import_*`` exist today; ``launch()`` / ``poll()`` are stubs.
-Parsing helpers (``parse_potfile`` / ``parse_status_json``) are pure and DB-free;
-the ``ingest_*`` functions apply parsed results to the Django models.
+Parsing helpers (``parse_potfile`` / ``parse_status_json`` / ``parse_benchmark``)
+are pure and DB-free; the ``ingest_*`` functions apply parsed results to the models.
 """
 
 import json
@@ -148,13 +147,6 @@ class HashcatRunner:
             attack_mode, module, hashfile=hashfile, wordlists=wordlists,
             rules=rules, params=params, device=device, optimized=optimized))
 
-    # -- future active launcher (seam) --------------------------------------
-    def launch(self, *a, **k):  # pragma: no cover - future work
-        raise NotImplementedError('active launching is a future phase')
-
-    def poll(self, *a, **k):  # pragma: no cover - future work
-        raise NotImplementedError('active launching is a future phase')
-
 
 def configured_binary():
     """The hashcat binary to use: the global Settings override, else DEFAULT_BINARY.
@@ -193,7 +185,7 @@ def c_complement_path():
     """Absolute path to the ?c-complement charset file (b_complement.hcchr).
 
     Read from the ``ZEBRA_C_COMPLEMENT_PATH`` setting when Django is configured,
-    else fall back to the copy shipped at the repo root."""
+    else fall back to the copy bundled in the app's data package."""
     try:
         from django.conf import settings
         path = getattr(settings, 'ZEBRA_C_COMPLEMENT_PATH', None)
@@ -201,9 +193,8 @@ def c_complement_path():
             return str(path)
     except Exception:
         pass
-    import os
-    return os.path.abspath(os.path.join(
-        os.path.dirname(__file__), '..', '..', '..', 'b_complement.hcchr'))
+    from ..data import C_COMPLEMENT_HCCHR
+    return str(C_COMPLEMENT_HCCHR)
 
 
 def substitute_c(mask, custom_charsets, c_path):

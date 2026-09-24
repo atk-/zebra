@@ -17,8 +17,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Charset file holding every byte of ?c (the perfect complement of ?a). hashcat
 # has no native ?c token, so mask runs that use ?c bind a custom -1..-4 slot to
-# this file. Shipped at the repo root, one level above BASE_DIR (the project dir).
-ZEBRA_C_COMPLEMENT_PATH = BASE_DIR.parent / 'b_complement.hcchr'
+# this file. Bundled in the app's reference-data package (zebra/data/); override
+# here to point at a different copy.
+ZEBRA_C_COMPLEMENT_PATH = BASE_DIR / 'zebra' / 'data' / 'b_complement.hcchr'
 
 # Root for zebra-managed data files: uploaded-and-stored hashfiles
 # (data/hashfiles/) and persistent per-project potfiles (data/potfiles/) for
