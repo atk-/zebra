@@ -20,18 +20,22 @@
     {% elif queued_count %}&middot; <span class="muted">ETA needs a benchmark on each project</span>{% endif %}
   </div>
   <div style="margin-left:auto;">
-    {% if paused %}
-      <span class="pill warn">paused</span>
-      <form method="post" action="{% url 'queue_resume' %}" style="display:inline">
-        {% csrf_token %}<button class="btn" type="submit">Resume queue</button>
-      </form>
-    {% else %}
-      <form method="post" action="{% url 'queue_pause' %}" style="display:inline">
-        {% csrf_token %}<button class="btn secondary" type="submit">Pause queue</button>
-      </form>
-    {% endif %}
+    <form method="post" action="{% url 'queue_set_mode' %}" style="margin:0">
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{% url 'queue' %}">
+      <span class="qseg">
+        <span class="qseg-label">Queue</span>
+        <button type="submit" name="mode" value="off"  class="qseg-btn off{% if queue_mode == 'off' %} active{% endif %}">Off</button>
+        <button type="submit" name="mode" value="on"   class="qseg-btn on{% if queue_mode == 'on' %} active{% endif %}">On</button>
+        <button type="submit" name="mode" value="auto" class="qseg-btn auto{% if queue_mode == 'auto' %} active{% endif %}">Auto</button>
+      </span>
+    </form>
   </div>
 </div>
+{% if queue_mode == 'auto' %}
+<p class="muted" style="margin-top:0">Auto-pilot is on: when the queue empties, a fresh
+  suggested attack (~{{ auto_task_minutes }} min) is added automatically.</p>
+{% endif %}
 
 {% if running %}
 <h2>Running now</h2>

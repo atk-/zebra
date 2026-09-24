@@ -2469,52 +2469,116 @@ class RecommenderPipelineTests(TestCase):
 
 
 class QueueMasterSwitchTests(TestCase):
-    """The header master switch: persistent pause, no auto-advance while off."""
+    """The header master switch: three persistent modes (off / on / auto)."""
 
     def tearDown(self):
-        launcher.set_queue_paused(False)
+        launcher.set_queue_mode('on')
 
-    def test_pause_state_persists_on_settings(self):
+    def test_mode_persists_on_settings(self):
         from zebra.models import Settings
-        launcher.pause_queue()
+        launcher.set_queue_mode('off')
         self.assertTrue(launcher.is_paused())
-        self.assertTrue(Settings.load().queue_paused)     # persisted, not process-local
-        launcher.resume_queue()
-        self.assertFalse(Settings.load().queue_paused)
+        self.assertEqual(Settings.load().queue_mode, 'off')  # persisted
+        launcher.set_queue_mode('auto')
+        self.assertTrue(launcher.is_auto())
+        self.assertFalse(launcher.is_paused())
 
-    def test_header_shows_switch_state(self):
-        on = self.client.get('/zebra/').content.decode()
-        self.assertIn('Queue on', on)
-        self.assertNotIn('qswitch-btn off', on)
-        launcher.pause_queue()
-        off = self.client.get('/zebra/').content.decode()
-        self.assertIn('Queue off', off)
-        self.assertIn('qswitch-btn off', off)
+    def test_header_shows_active_mode(self):
+        launcher.set_queue_mode('auto')
+        html = self.client.get('/zebra/').content.decode()
+        self.assertIn('qseg-btn auto active', html)
+        self.assertNotIn('qseg-btn off active', html)
 
-    def test_toggle_endpoint_flips_and_returns_to_next(self):
+    def test_mode_endpoint_sets_and_returns_to_next(self):
         with mock.patch.object(launcher, '_advance_queue', return_value=None):
-            r = self.client.post('/zebra/queue/toggle/', {'next': '/zebra/settings/'})
+            r = self.client.post('/zebra/queue/mode/',
+                                 {'mode': 'off', 'next': '/zebra/settings/'})
             self.assertRedirects(r, '/zebra/settings/', fetch_redirect_response=False)
             self.assertTrue(launcher.is_paused())
-            self.client.post('/zebra/queue/toggle/', {'next': '/zebra/'})
-            self.assertFalse(launcher.is_paused())
+            self.client.post('/zebra/queue/mode/', {'mode': 'auto', 'next': '/zebra/'})
+            self.assertTrue(launcher.is_auto())
 
-    def test_toggle_rejects_offsite_next(self):
+    def test_mode_endpoint_rejects_offsite_next(self):
         with mock.patch.object(launcher, '_advance_queue', return_value=None):
-            r = self.client.post('/zebra/queue/toggle/', {'next': '//evil.example'})
+            r = self.client.post('/zebra/queue/mode/',
+                                 {'mode': 'off', 'next': '//evil.example'})
         self.assertRedirects(r, '/zebra/queue/', fetch_redirect_response=False)
 
-    def test_paused_queue_does_not_auto_advance(self):
+    def test_off_does_not_auto_advance(self):
         ht = HashType.objects.create(name='MS-MD5', hashcat_module=0)
         p = Project.objects.create(name='MSP', hashtype=ht)
         Hash.objects.create(hashstring='h', project=p, cracked=False)
         mask = Mask.objects.create(project=p, pattern='?d?d')
         run = Run.objects.create(mask=mask, project=p, attack_mode=3, status='planned')
         run.hashes.set(p.hash_set.all())
-        launcher.pause_queue()
+        launcher.set_queue_mode('off')
         with mock.patch.object(launcher, 'start_run', return_value=None) as m:
             launcher.enqueue(run)                 # queued, but not started (off)
             self.assertIsNone(launcher._advance_queue())
             m.assert_not_called()
         run.refresh_from_db()
         self.assertEqual(run.status, 'queued')    # waits until switched on
+
+    def test_settings_page_sets_auto_task_length(self):
+        from zebra.models import Settings
+        self.client.post('/zebra/settings/',
+                         {'hashcat_binary': '', 'auto_task_minutes': '15'})
+        self.assertEqual(Settings.load().auto_task_seconds, 900)
+
+
+class AutoPilotTests(TestCase):
+    """Auto mode fills an empty queue with a fresh suggested attack."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='AP-HT', hashcat_module=222)
+        self.project = Project.objects.create(name='autop', hashtype=self.ht,
+                                              universe='?l?u?d', benchmark_hs=10**10)
+        Hash.objects.create(hashstring='a' * 32, project=self.project)
+
+    def tearDown(self):
+        launcher.set_queue_mode('on')
+
+    def test_build_auto_run_records_a_suggested_attack(self):
+        from zebra import autopilot
+        run = autopilot.build_auto_run(self.project, seconds=3600)
+        self.assertIsNotNone(run)
+        self.assertEqual(run.attack_mode, 3)
+        self.assertIsNotNone(run.mask)
+        self.assertTrue(run.optimized)
+        self.assertEqual(run.comment, 'auto-pilot')
+
+    def test_auto_task_sized_to_configured_length(self):
+        from zebra import autopilot
+        from zebra.models import Settings
+        s = Settings.load(); s.auto_task_seconds = 60; s.save()
+        run = autopilot.build_auto_run(self.project)   # uses Settings default
+        ks = int(run.mask.keyspace)
+        # keyspace should land near benchmark_hs * 60 (well under the 1h target's).
+        self.assertLess(ks, 10**10 * 3600)
+
+    def test_eligible_requires_benchmark_and_hashes(self):
+        from zebra import autopilot
+        Project.objects.create(name='nobench', hashtype=self.ht)  # no benchmark
+        names = {p.name for p in autopilot._eligible_projects()}
+        self.assertIn('autop', names)
+        self.assertNotIn('nobench', names)
+
+    def test_advance_auto_fills_when_queue_empty(self):
+        # Auto mode + empty queue + idle -> a suggested run is created and started.
+        launcher.set_queue_mode('auto')
+        with mock.patch('zebra.services.hashcat.HashcatRunner.available',
+                        return_value=True), \
+             mock.patch.object(launcher, 'start_run', return_value=None) as start:
+            started = launcher._advance_queue()
+        self.assertIsNotNone(started)               # auto-pilot produced a run
+        self.assertEqual(started.comment, 'auto-pilot')
+        start.assert_called_once()
+
+    def test_on_mode_does_not_auto_fill(self):
+        launcher.set_queue_mode('on')
+        with mock.patch('zebra.services.hashcat.HashcatRunner.available',
+                        return_value=True), \
+             mock.patch.object(launcher, 'start_run', return_value=None) as start:
+            self.assertIsNone(launcher._advance_queue())   # nothing queued, no fill
+        start.assert_not_called()
+        self.assertFalse(Run.objects.exists())

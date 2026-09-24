@@ -449,13 +449,14 @@ def _safe_next(request):
     return None
 
 
-def queue_toggle(request):
-    """Flip the queue master switch (POST); return to the page it was used from."""
+def queue_set_mode(request):
+    """Set the queue master switch to off/on/auto (POST); return to the same page."""
     if request.method == 'POST':
-        if launcher.is_paused():
-            launcher.resume_queue()
-        else:
-            launcher.pause_queue()
+        mode = request.POST.get('mode')
+        if mode in ('off', 'on', 'auto'):
+            launcher.set_queue_mode(mode)
+            if mode in ('on', 'auto'):
+                launcher._advance_queue()  # kick the queue (and auto-fill if empty)
     return redirect(_safe_next(request) or reverse('queue'))
 
 
@@ -496,6 +497,7 @@ def queue(request):
         'queued_count': len(queued),
         'total_eta': _format_duration(cumulative) if items and all_have_eta else None,
         'paused': launcher.is_paused(),
+        'auto_task_minutes': Settings.load().auto_task_seconds // 60,
         'recent': recent,
     })
 
@@ -952,6 +954,12 @@ def settings_view(request):
     saved = False
     if request.method == 'POST':
         config.hashcat_binary = request.POST.get('hashcat_binary', '').strip()
+        # Auto-pilot task length, entered in minutes (min 1); stored as seconds.
+        try:
+            minutes = max(1, int(request.POST.get('auto_task_minutes') or 60))
+        except ValueError:
+            minutes = 60
+        config.auto_task_seconds = minutes * 60
         config.save()
         saved = True
     binary = hc.configured_binary()
@@ -959,6 +967,7 @@ def settings_view(request):
     context = {
         'settings': config,
         'saved': saved,
+        'auto_task_minutes': config.auto_task_seconds // 60,
         'default_binary': hc.DEFAULT_BINARY,
         'effective_binary': binary,
         'is_override': bool((config.hashcat_binary or '').strip()),

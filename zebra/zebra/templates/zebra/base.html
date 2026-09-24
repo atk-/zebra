@@ -20,14 +20,17 @@
   header .nav { font-size:14px; font-weight:500; opacity:.85; }
   header .nav:hover { opacity:1; text-decoration:underline; }
   header form.qswitch { margin:0; }
-  .qswitch-btn { display:inline-flex; align-items:center; gap:6px; cursor:pointer;
-         background:#1f2937; color:#e5e7eb; border:1px solid #374151;
-         border-radius:999px; padding:3px 11px; font:500 13px system-ui,sans-serif; }
-  .qswitch-btn:hover { border-color:#4b5563; }
-  .qswitch-dot { width:8px; height:8px; border-radius:50%; background:#22c55e;
-         box-shadow:0 0 6px #22c55e; }
-  .qswitch-btn.off { color:#9ca3af; }
-  .qswitch-btn.off .qswitch-dot { background:#6b7280; box-shadow:none; }
+  .qseg { display:inline-flex; align-items:center; gap:6px; background:#1f2937;
+         border:1px solid #374151; border-radius:999px; padding:3px 5px 3px 9px; }
+  .qseg-label { font:600 11px system-ui,sans-serif; letter-spacing:.04em;
+         text-transform:uppercase; color:#9ca3af; }
+  .qseg-btn { cursor:pointer; background:none; border:0; color:#9ca3af;
+         border-radius:999px; padding:2px 9px; font:500 12.5px system-ui,sans-serif; }
+  .qseg-btn:hover { color:#e5e7eb; }
+  .qseg-btn.active { color:#fff; }
+  .qseg-btn.active.off   { background:#4b5563; }
+  .qseg-btn.active.on    { background:#15803d; }
+  .qseg-btn.active.auto  { background:#1d4ed8; }
   main { max-width:960px; margin:0 auto; padding:24px 20px 60px; }
   h1 { font-size:22px; margin:0 0 4px; }
   h2 { font-size:17px; margin:28px 0 10px; }
@@ -142,13 +145,15 @@
   <a href="{% url 'index' %}">🦓 zebra</a>
   <span class="muted">hashcat mask coverage</span>
   <span class="spacer"></span>
-  <form method="post" action="{% url 'queue_toggle' %}" class="qswitch">
+  <form method="post" action="{% url 'queue_set_mode' %}" class="qswitch">
     {% csrf_token %}
     <input type="hidden" name="next" value="{{ request.get_full_path }}">
-    <button type="submit" class="qswitch-btn{% if queue_paused %} off{% endif %}"
-            title="{% if queue_paused %}Queue is off — click to turn on and pick up queued attacks{% else %}Queue is on — click to turn off (running attack keeps going){% endif %}">
-      <span class="qswitch-dot"></span>{% if queue_paused %}Queue off{% else %}Queue on{% endif %}
-    </button>
+    <span class="qseg" title="Queue master switch — Off: pause · On: run queued attacks · Auto: keep the queue full with suggested attacks">
+      <span class="qseg-label">Queue</span>
+      <button type="submit" name="mode" value="off"  class="qseg-btn off{% if queue_mode == 'off' %} active{% endif %}">Off</button>
+      <button type="submit" name="mode" value="on"   class="qseg-btn on{% if queue_mode == 'on' %} active{% endif %}">On</button>
+      <button type="submit" name="mode" value="auto" class="qseg-btn auto{% if queue_mode == 'auto' %} active{% endif %}">Auto</button>
+    </span>
   </form>
   <a class="nav" href="{% url 'queue' %}">☰ Queue</a>
   <a class="nav" href="{% url 'settings' %}">⚙ Settings</a>

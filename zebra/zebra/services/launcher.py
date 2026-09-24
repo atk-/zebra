@@ -360,17 +360,34 @@ def stop_run(run):
 # lowest-position queued run is auto-started. The GPU is a single resource, so the
 # queue spans all projects and honours the same one-at-a-time guarantee.
 
+def queue_mode():
+    """The persisted queue master switch: 'off', 'on', or 'auto'."""
+    return Settings.load().queue_mode
+
+
 def is_paused():
-    """Whether the queue master switch is off (persisted on the Settings row)."""
-    return Settings.load().queue_paused
+    """Whether the queue won't auto-start anything (master switch 'off')."""
+    return queue_mode() == 'off'
+
+
+def is_auto():
+    """Whether auto-pilot is on: keep the queue full with suggested attacks."""
+    return queue_mode() == 'auto'
+
+
+def set_queue_mode(mode):
+    """Set the persisted queue master switch ('off'/'on'/'auto'), no side effects."""
+    if mode not in ('off', 'on', 'auto'):
+        raise ValueError('bad queue mode: %r' % mode)
+    s = Settings.load()
+    if s.queue_mode != mode:
+        s.queue_mode = mode
+        s.save(update_fields=['queue_mode'])
 
 
 def set_queue_paused(paused):
-    """Set the persisted queue master switch without side effects."""
-    s = Settings.load()
-    if s.queue_paused != bool(paused):
-        s.queue_paused = bool(paused)
-        s.save(update_fields=['queue_paused'])
+    """Back-compat two-state setter: off when paused, else on."""
+    set_queue_mode('off' if paused else 'on')
 
 
 def _next_queued():
@@ -391,10 +408,32 @@ def _advance_queue(runner=None):
     if Run.objects.filter(status='running').exists():
         return None
     nxt = _next_queued()
+    if nxt is None and is_auto():
+        nxt = _fill_auto()  # queue empty + auto-pilot: create a fresh suggested run
     if nxt is None:
         return None
     err = start_run(nxt, runner=runner)
     return None if err else nxt
+
+
+def _fill_auto():
+    """Create a queued auto-pilot run (a fresh suggested attack), or None.
+
+    Only when hashcat is available -- an auto task is worthless if it can't launch.
+    The run is marked 'queued' so a failed start leaves it in the queue (the next
+    advance retries it) rather than spawning another."""
+    if not hc.configured_runner().available():
+        return None
+    from .. import autopilot
+    run = autopilot.next_auto_run()
+    if run is None:
+        return None
+    last = (Run.objects.filter(status='queued')
+            .order_by('-queue_position').first())
+    run.queue_position = (last.queue_position + 1) if last and last.queue_position else 1
+    run.status = 'queued'
+    run.save(update_fields=['status', 'queue_position'])
+    return run
 
 
 def would_queue():

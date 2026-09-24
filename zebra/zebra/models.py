@@ -12,11 +12,17 @@ class Settings(models.Model):
     # overriding any globally installed copy. Blank -> fall back to 'hashcat' on
     # PATH (services.hashcat.DEFAULT_BINARY). Resolved by hashcat.configured_binary.
     hashcat_binary = models.CharField(max_length=1024, blank=True, default='')
-    # Master switch for the attack queue. When True the queue won't auto-start the
-    # next run (a run already in progress keeps going); flip it back on to resume.
-    # Persisted (not process-local) so it survives a restart -- a deliberate global
-    # off shouldn't silently turn back on. Read via launcher.is_paused().
-    queue_paused = models.BooleanField(default=False)
+    # Master switch for the attack queue (persisted, so it survives a restart --
+    # a deliberate global setting shouldn't silently change):
+    #   off  -- don't auto-start anything (a run already in progress keeps going)
+    #   on   -- run the recorded/queued attacks in order
+    #   auto -- like 'on', plus: whenever the queue empties, fill it with a fresh
+    #           suggested attack (see services.autopilot). Read via launcher.
+    QUEUE_MODES = [('off', 'Off'), ('on', 'On'), ('auto', 'Auto')]
+    queue_mode = models.CharField(max_length=4, choices=QUEUE_MODES, default='on')
+    # Approximate wall-clock length (seconds) of a task auto-pilot starts: the
+    # recommender sizes each mask to keyspace ~= benchmark_hs * this.
+    auto_task_seconds = models.PositiveIntegerField(default=3600)
 
     class Meta:
         verbose_name = 'settings'

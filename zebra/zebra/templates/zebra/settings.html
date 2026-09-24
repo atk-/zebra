@@ -25,6 +25,15 @@
     <code>{{ default_binary }}</code>.
   </p>
 
+  <label style="margin-top:18px">Auto-pilot task length <span class="muted">(minutes)</span></label>
+  <input type="number" name="auto_task_minutes" min="1" step="1"
+         value="{{ auto_task_minutes }}" style="max-width:160px">
+  <p class="muted" style="margin:6px 0 0; font-size:13px">
+    Approximate wall-clock length of each attack the queue's <strong>Auto</strong>
+    mode starts: the mask is sized so its keyspace ÷ the project's benchmark speed is
+    about this long.
+  </p>
+
   <div style="margin-top:14px">
     <button class="btn" type="submit">Save</button>
     <a class="btn secondary" href="{% url 'index' %}">Cancel</a>
