@@ -126,52 +126,150 @@
 {% endif %}
 
 <h2>Attacks ({{ runs|length }})</h2>
-{% if runs %}
-<table id="attacks-table" data-runs-url="{% url 'project_runs_status' project.pk %}">
-  <tr><th style="width:1.5em"></th><th>Type</th><th>Spec</th><th>Status</th><th>Cracks</th><th>Keyspace</th><th>When</th></tr>
-  {% for r in runs %}
-  <tr data-run-id="{{ r.pk }}" data-run-status="{{ r.status }}">
-    <td><a href="{% url 'run_detail' r.pk %}" title="View attack details" aria-label="View attack details">🔍</a></td>
-    <td class="muted">-a{{ r.attack_mode }} {{ r.attack_mode_label }}</td>
-    <td><code>{{ r.describe }}</code></td>
-    <td class="run-status" style="white-space:nowrap">
-      {% if r.status == 'queued' %}<a class="pill status st-queued" href="{% url 'queue' %}" style="text-decoration:none">{{ r.status }}</a>
-      {% else %}<span class="pill status st-{{ r.status }}">{{ r.status }}</span>{% endif %}
-      {% if r.status == 'running' %}<span class="run-progress muted" style="margin-left:6px; font-size:12px; font-variant-numeric:tabular-nums">{% widthratio r.progress 1 100 %}%</span>{% endif %}
-    </td>
-    <td class="run-cracks">{{ r.crack_count }}</td>
-    <td>{% if r.mask and r.mask.keyspace is not None %}{{ r.mask.keyspace|bignum }}{% else %}—{% endif %}</td>
-    <td class="muted">{{ r.created_at }}</td>
-  </tr>
+{% if run_groups %}
+<style>
+  .attack-tabs { display:flex; flex-wrap:wrap; gap:4px; margin:0 0 10px;
+                 border-bottom:1px solid var(--line); }
+  .attack-tab { cursor:pointer; background:none; border:1px solid transparent;
+                border-bottom:0; border-radius:8px 8px 0 0; padding:6px 12px;
+                margin-bottom:-1px; font:500 13.5px system-ui,sans-serif; color:var(--muted); }
+  .attack-tab:hover { color:var(--fg); }
+  .attack-tab[aria-selected="true"] { color:var(--fg); background:var(--card);
+                border-color:var(--line); border-bottom-color:var(--card); font-weight:600; }
+  .attack-tab .cnt { color:var(--muted); font-weight:400; }
+  .attacks-table th.sortable { cursor:pointer; user-select:none; white-space:nowrap; }
+  .attacks-table th.sortable::after { content:'⇅'; opacity:.3; margin-left:5px; font-size:11px; }
+  .attacks-table th.sortable[aria-sort="ascending"]::after  { content:'↑'; opacity:1; }
+  .attacks-table th.sortable[aria-sort="descending"]::after { content:'↓'; opacity:1; }
+  /* Mask spec: literals plain, wildcards bold + hue-coded (matches the coverage viz). */
+  .mask-spec .mlit { color:var(--muted); }
+  .mask-spec .mch  { font-weight:700; }
+  .mask-spec .mch-d { color:var(--atom-d); }
+  .mask-spec .mch-l { color:var(--atom-l); }
+  .mask-spec .mch-u { color:var(--atom-u); }
+  .mask-spec .mch-s { color:var(--atom-s); }
+  .mask-spec .mch-x { color:var(--atom-x); }  /* ?a ?b ?h ?H */
+  .mask-spec .mch-c { color:#e11d48; }        /* custom ?1–?4 */
+</style>
+<div id="attacks" data-runs-url="{% url 'project_runs_status' project.pk %}">
+  <div class="attack-tabs" role="tablist" aria-label="Attacks by type">
+    {% for g in run_groups %}
+    <button class="attack-tab" type="button" role="tab" id="attack-tab-{{ g.mode }}"
+            aria-controls="attack-panel-{{ g.mode }}" data-panel="attack-panel-{{ g.mode }}"
+            aria-selected="{% if forloop.first %}true{% else %}false{% endif %}">
+      {{ g.label }} <span class="cnt">({{ g.count }})</span>
+    </button>
+    {% endfor %}
+  </div>
+  {% for g in run_groups %}
+  <div class="attack-panel" id="attack-panel-{{ g.mode }}" role="tabpanel"
+       aria-labelledby="attack-tab-{{ g.mode }}"{% if not forloop.first %} hidden{% endif %}>
+    <table class="attacks-table">
+      <thead>
+      <tr>
+        <th style="width:1.5em"></th><th>Spec</th><th>Status</th>
+        <th class="sortable" data-sort="num">Cracks</th>
+        {% if g.mode == 3 %}<th class="sortable" data-sort="num" title="Mask length (max length for an incremental mask)">Length</th>{% endif %}
+        {% if g.mode == 3 %}<th class="sortable" data-sort="num">Keyspace</th>{% endif %}
+        <th class="sortable" data-sort="num">When</th>
+      </tr>
+      </thead>
+      <tbody>
+      {% for r in g.runs %}
+      <tr data-run-id="{{ r.pk }}" data-run-status="{{ r.status }}">
+        <td><a href="{% url 'run_detail' r.pk %}" title="View attack details" aria-label="View attack details">🔍</a></td>
+        <td>{% if g.mode == 3 and r.mask %}<code class="mask-spec" title="{{ r.describe }}">{{ r.mask|mask_spec }}</code>{% else %}<code>{{ r.describe }}</code>{% endif %}</td>
+        <td class="run-status" style="white-space:nowrap">
+          {% if r.status == 'queued' %}<a class="pill status st-queued" href="{% url 'queue' %}" style="text-decoration:none">{{ r.status }}</a>
+          {% else %}<span class="pill status st-{{ r.status }}">{{ r.status }}</span>{% endif %}
+          {% if r.status == 'running' %}<span class="run-progress muted" style="margin-left:6px; font-size:12px; font-variant-numeric:tabular-nums">{% widthratio r.progress 1 100 %}%</span>{% endif %}
+        </td>
+        <td class="run-cracks" data-sort-value="{{ r.crack_count }}">{{ r.crack_count }}</td>
+        {% if g.mode == 3 %}<td data-sort-value="{% if r.mask %}{{ r.mask.max_length }}{% else %}0{% endif %}" style="font-variant-numeric:tabular-nums">{% if r.mask %}{% if r.mask.is_incremental %}<span title="increment {{ r.mask.increment_min }}–{{ r.mask.increment_max|default:r.mask.length }}">≤{{ r.mask.max_length }}</span>{% else %}{{ r.mask.max_length }}{% endif %}{% else %}—{% endif %}</td>{% endif %}
+        {% if g.mode == 3 %}<td data-sort-value="{% if r.mask and r.mask.keyspace is not None %}{{ r.mask.keyspace }}{% else %}-1{% endif %}">{% if r.mask and r.mask.keyspace is not None %}{{ r.mask.keyspace|bignum }}{% else %}—{% endif %}</td>{% endif %}
+        <td class="muted" data-sort-value="{{ r.created_at|date:'U' }}" style="white-space:nowrap">{{ r.created_at }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
   {% endfor %}
-</table>
+</div>
 <script>
-// Live-refresh the Attacks table like the detail page: poll the project's run
-// statuses, update the running row's progress % in place, and do a single full
-// reload when any run's status changes (queue advancing, a run finishing) so the
-// coverage/cracked numbers and badges stay consistent. Stops when nothing is
-// active (no running/queued run left to change on its own).
+// Tab switching: show one attack-mode panel at a time.
 (function () {
-  var table = document.getElementById('attacks-table');
-  if (!table) return;
+  var root = document.getElementById('attacks');
+  if (!root) return;
+  var tabs = Array.prototype.slice.call(root.querySelectorAll('.attack-tab'));
+  tabs.forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      tabs.forEach(function (t) {
+        var sel = t === tab;
+        t.setAttribute('aria-selected', sel ? 'true' : 'false');
+        var panel = document.getElementById(t.dataset.panel);
+        if (panel) panel.hidden = !sel;
+      });
+    });
+  });
+})();
+// Column sorting: click a .sortable header to sort that table's <tbody> by the cell's
+// data-sort-value (numeric when data-sort="num", else text). Click again to reverse.
+(function () {
+  function cellValue(td, numeric) {
+    var v = td && td.dataset.sortValue != null ? td.dataset.sortValue
+          : (td ? td.textContent.trim() : '');
+    return numeric ? (parseFloat(v) || 0) : v.toLowerCase();
+  }
+  document.querySelectorAll('.attacks-table').forEach(function (table) {
+    var head = table.tHead, body = table.tBodies[0];
+    if (!head || !body) return;
+    var ths = head.rows[0].cells;
+    Array.prototype.forEach.call(ths, function (th, idx) {
+      if (!th.classList.contains('sortable')) return;
+      th.addEventListener('click', function () {
+        var asc = th.getAttribute('aria-sort') !== 'ascending';
+        var numeric = th.dataset.sort === 'num';
+        var rows = Array.prototype.slice.call(body.rows);
+        rows.sort(function (a, b) {
+          var av = cellValue(a.cells[idx], numeric), bv = cellValue(b.cells[idx], numeric);
+          return (av < bv ? -1 : av > bv ? 1 : 0) * (asc ? 1 : -1);
+        });
+        rows.forEach(function (r) { body.appendChild(r); });
+        Array.prototype.forEach.call(ths, function (o) { o.removeAttribute('aria-sort'); });
+        th.setAttribute('aria-sort', asc ? 'ascending' : 'descending');
+      });
+    });
+  });
+})();
+// Live-refresh across ALL tabs: poll the project's run statuses, update the running
+// row's progress % in place, and do a single full reload when any run's status
+// changes (queue advancing, a run finishing) so the coverage/cracked numbers and
+// badges stay consistent. Stops when nothing is active.
+(function () {
+  var root = document.getElementById('attacks');
+  if (!root) return;
+  function rows() { return root.querySelectorAll('[data-run-status]'); }
   function anyActive() {
-    return Array.prototype.some.call(table.querySelectorAll('[data-run-status]'), function (tr) {
+    return Array.prototype.some.call(rows(), function (tr) {
       var s = tr.getAttribute('data-run-status');
       return s === 'running' || s === 'queued';
     });
   }
-  if (!anyActive()) return;  // nothing can change; leave the static table alone
+  if (!anyActive()) return;  // nothing can change; leave the static tables alone
   function poll() {
-    fetch(table.dataset.runsUrl).then(function (r) { return r.json(); }).then(function (d) {
+    fetch(root.dataset.runsUrl).then(function (r) { return r.json(); }).then(function (d) {
       var changed = false;
       (d.runs || []).forEach(function (run) {
-        var tr = table.querySelector('tr[data-run-id="' + run.pk + '"]');
+        var tr = root.querySelector('tr[data-run-id="' + run.pk + '"]');
         if (!tr) { changed = true; return; }  // a new run appeared -> reload
         if (tr.getAttribute('data-run-status') !== run.status) changed = true;
         var prog = tr.querySelector('.run-progress');
         if (prog && run.status === 'running') prog.textContent = run.percent + '%';
         var cr = tr.querySelector('.run-cracks');
-        if (cr && run.cracks != null) cr.textContent = run.cracks;
+        if (cr && run.cracks != null) {
+          cr.textContent = run.cracks;
+          cr.setAttribute('data-sort-value', run.cracks);  // keep sorting consistent
+        }
       });
       // Live project-level cracked count / % in the header card.
       var pc = document.getElementById('proj-cracked');

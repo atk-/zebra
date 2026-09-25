@@ -1651,6 +1651,39 @@ class BignumFilterTests(SimpleTestCase):
         self.assertEqual(bignum('—'), '—')
 
 
+class MaskSpecFilterTests(SimpleTestCase):
+    """mask_spec: strip the '?', bold + colour-code wildcards, escape literals."""
+
+    def _spec(self, pattern, imin=None, imax=None, length=None):
+        from types import SimpleNamespace
+        from .templatetags.zebra_extras import mask_spec
+        m = SimpleNamespace(pattern=pattern, increment_min=imin, increment_max=imax,
+                            length=length if length is not None else len(pattern),
+                            is_incremental=imin is not None)
+        return str(mask_spec(m))
+
+    def test_wildcards_lose_qmark_and_are_bolded_and_coloured(self):
+        html = self._spec('abc?d?d?d?s')
+        self.assertNotIn('?', html)                              # no question marks left
+        self.assertEqual(html.count('<b class="mch mch-d">d</b>'), 3)
+        self.assertIn('<b class="mch mch-s">s</b>', html)        # symbol wildcard
+        self.assertIn('<span class="mlit">a</span>', html)       # literal kept plain
+
+    def test_charset_classes_map_to_hues(self):
+        self.assertIn('mch-l">l', self._spec('?l'))
+        self.assertIn('mch-u">u', self._spec('?u'))
+        self.assertIn('mch-x">a', self._spec('?a'))              # ?a -> broad/other
+        self.assertIn('mch-c">1', self._spec('?1'))              # custom charset
+
+    def test_literal_question_mark_and_escaping(self):
+        self.assertEqual(self._spec('??').count('?'), 1)         # ?? -> one literal ?
+        self.assertIn('&lt;', self._spec('<'))                   # literal '<' escaped
+        self.assertNotIn('<span class="mlit"><', self._spec('<'))
+
+    def test_incremental_suffix(self):
+        self.assertIn('(incr 1–3)', self._spec('?l?l?l', imin=1, imax=3))
+
+
 class RemainingEtaTests(TestCase):
     """The Remaining column shows an approximate time-to-exhaust when benchmarked."""
 
@@ -2221,6 +2254,83 @@ class ProjectRunsStatusTests(TestCase):
         self.assertEqual(html.count('class="run-progress'), 1)
 
 
+class AttacksTableTabsTests(TestCase):
+    """The dashboard attacks table is tabbed per attack mode (no Type column)."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='AT-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='ATTABS', hashtype=self.ht)
+        Hash.objects.create(hashstring='h', project=self.project, cracked=False)
+        self.mask = Mask.objects.create(project=self.project, pattern='?d?d', keyspace=100)
+
+    def _html(self):
+        return self.client.get('/zebra/project/%d/' % self.project.pk).content.decode()
+
+    def _mask_run(self, status='exhausted'):
+        return Run.objects.create(mask=self.mask, project=self.project,
+                                  attack_mode=3, status=status)
+
+    def _straight_run(self, status='planned'):
+        return Run.objects.create(project=self.project, attack_mode=0, status=status)
+
+    def test_tab_per_present_mode_and_no_type_column(self):
+        self._mask_run()
+        self._straight_run()
+        html = self._html()
+        self.assertIn('id="attack-tab-3"', html)      # a Mask tab
+        self.assertIn('id="attack-tab-0"', html)      # a Straight tab
+        self.assertNotIn('<th>Type</th>', html)       # the Type column is gone
+
+    def test_keyspace_column_only_in_mask_tab(self):
+        self._mask_run()
+        self._straight_run()
+        # Keyspace is a mask-only column, so its header appears exactly once.
+        self.assertEqual(self._html().count('>Keyspace</th>'), 1)
+
+    def test_length_column_only_in_mask_tab(self):
+        self._mask_run()
+        self._straight_run()
+        # Length is a mask-only column (the marker is unique to the attacks table --
+        # the coverage table above also has a plain "Length" header).
+        self.assertEqual(self._html().count('title="Mask length'), 1)
+
+    def test_length_column_shows_mask_length(self):
+        m = Mask.objects.create(project=self.project, pattern='?d?d?d', length=3, keyspace=1000)
+        Run.objects.create(mask=m, project=self.project, attack_mode=3, status='exhausted')
+        html = self._html()
+        self.assertIn('>Length</th>', html)
+        self.assertIn('data-sort-value="3"', html)   # sortable numeric length
+
+    def test_incremental_mask_shows_max_length(self):
+        m = Mask.objects.create(project=self.project, pattern='?l?l?l?l?l?l?l?l',
+                                length=8, increment_min=1, increment_max=6)
+        Run.objects.create(mask=m, project=self.project, attack_mode=3, status='planned')
+        html = self._html()
+        self.assertIn('≤6', html)                     # top of the sweep, not 8
+        self.assertIn('data-sort-value="6"', html)
+
+    def test_length_and_when_headers_are_sortable(self):
+        self._mask_run()
+        html = self._html()
+        self.assertIn('title="Mask length', html)     # the sortable Length header
+        self.assertIn('>When</th>', html)             # a When column to sort by
+        self.assertIn('class="sortable"', html)
+
+    def test_single_mode_shows_only_its_tab(self):
+        self._mask_run('planned')
+        html = self._html()
+        self.assertIn('id="attack-tab-3"', html)
+        self.assertNotIn('id="attack-tab-0"', html)
+
+    def test_group_runs_by_mode_orders_mask_first(self):
+        from zebra.views import _group_runs_by_mode
+        runs = [self._straight_run(), self._mask_run()]
+        groups = _group_runs_by_mode(runs)
+        self.assertEqual([g['mode'] for g in groups], [3, 0])  # Mask leads
+        self.assertEqual(groups[0]['label'], 'Mask')
+        self.assertEqual([g['count'] for g in groups], [1, 1])
+
+
 class LiveCrackCountHarmonizationTests(TestCase):
     """Live crack counts show on first paint (not 0 until a poll), everywhere."""
 
@@ -2250,7 +2360,7 @@ class LiveCrackCountHarmonizationTests(TestCase):
         html = self.client.get('/zebra/project/%d/' % self.project.pk).content.decode()
         # Top card cracked count and the run's Cracks cell reflect recovered at paint.
         self.assertIn('id="proj-cracked">2<', html)
-        self.assertIn('class="run-cracks">2<', html)
+        self.assertIn('class="run-cracks" data-sort-value="2">2<', html)
 
     def test_run_detail_and_status_json_show_live_cracks(self):
         run = self._running(recovered=2)

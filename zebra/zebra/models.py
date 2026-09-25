@@ -242,6 +242,17 @@ class Mask(models.Model):
     def is_incremental(self):
         return self.increment_min is not None
 
+    @property
+    def max_length(self):
+        """The longest candidate length this mask produces.
+
+        Plain mask: its position count. Incremental: the top of the length sweep --
+        ``increment_max`` capped at the pattern length, or the pattern length when the
+        sweep is open-ended (increment_max unset)."""
+        if self.is_incremental and self.increment_max is not None:
+            return min(self.increment_max, self.length or self.increment_max)
+        return self.length
+
     def __str__(self):
         return self.pattern
 

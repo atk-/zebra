@@ -106,8 +106,7 @@
     {% if can_record %}
     <button class="btn" name="action" value="record" type="submit">Record attack</button>
     {% if hashcat_available %}
-    {# Mask attacks only: record and run in one click, landing on the run page.
-       Runs immediately when idle, or queues behind any attack in progress. #}
+    {# Mask attacks only: record and run in one click, landing on the run page. Runs immediately when idle, or queues behind any attack in progress. #}
     <span data-modes="3">
       <button class="btn" name="action" value="record_run" type="submit"
               title="Record this attack and run it (queued behind any attack in progress)">Record &amp; run</button>

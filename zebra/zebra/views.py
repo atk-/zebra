@@ -162,6 +162,27 @@ def _coverage_total(coverage, rate):
     }
 
 
+# The attacks table is tabbed by attack mode so each mode can show its own columns
+# (e.g. only Mask has a Keyspace). Mask leads; the rest follow the declared order.
+_RUN_MODE_ORDER = [3, 0, 1, 6, 7]
+
+
+def _group_runs_by_mode(runs):
+    """Group an ordered run list into per-attack-mode tabs (order preserved within).
+
+    Returns a list of {mode, label, count, runs} dicts, Mask first, then the other
+    modes in their declared order, then any unrecognized mode last. Empty when there
+    are no runs."""
+    labels = dict(Run.ATTACK_MODES)
+    by_mode = {}
+    for r in runs:
+        by_mode.setdefault(r.attack_mode, []).append(r)
+    order = _RUN_MODE_ORDER + [m for m in sorted(by_mode) if m not in _RUN_MODE_ORDER]
+    return [{'mode': m, 'label': labels.get(m, 'Mode %s' % m),
+             'count': len(by_mode[m]), 'runs': by_mode[m]}
+            for m in order if m in by_mode]
+
+
 def project_detail(request, pk):
     launcher.adopt_live_orphans()  # adopt live orphans lazily (non-mutating on GET)
     project = get_object_or_404(Project, pk=pk)
@@ -180,6 +201,8 @@ def project_detail(request, pk):
         rem = row['remaining']
         row['remaining_eta'] = (_format_duration(rem / rate)
                                 if rate and rem else None)
+    runs = list(Run.objects.filter(project=project).select_related('mask', 'project')
+                .prefetch_related('cracks', 'hashes', 'wordlists', 'rules')[:50])
     context = {
         'coverage_total': _coverage_total(coverage, rate),
         'project': project,
@@ -189,8 +212,8 @@ def project_detail(request, pk):
         'cracked_pct': (100.0 * cracked / total_hashes) if total_hashes else 0.0,
         'coverage': coverage,
         'universe_chars': ch.expand_universe(project.universe),
-        'runs': (Run.objects.filter(project=project).select_related('mask', 'project')
-                 .prefetch_related('cracks', 'hashes', 'wordlists', 'rules')[:50]),
+        'runs': runs,
+        'run_groups': _group_runs_by_mode(runs),
         'benchmark_display': _format_hashrate(project.benchmark_hs),
         'hashcat_available': hc.configured_runner().available(),
         'bench_message': request.GET.get('bench_msg'),
