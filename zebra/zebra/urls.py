@@ -7,7 +7,6 @@ urlpatterns = [
     path("project/new/", views.project_new, name="project_new"),
     path("project/<int:pk>/", views.project_detail, name="project_detail"),
     path("project/<int:pk>/delete/", views.project_delete, name="project_delete"),
-    path("project/<int:pk>/hashes/add/", views.hashes_add, name="hashes_add"),
     path("project/<int:pk>/mask/new/", views.mask_new, name="mask_new"),
     path("run/<int:pk>/", views.run_detail, name="run_detail"),
     path("run/<int:pk>/delete/", views.run_delete, name="run_delete"),

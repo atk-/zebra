@@ -678,34 +678,12 @@ def _apply_file_source(project, request):
     return True, None
 
 
-def hashes_add(request, pk):
-    project = get_object_or_404(Project, pk=pk)
-    context = {'project': project}
-    if request.method == 'POST':
-        if project.is_file_backed:
-            # File-backed: "add hashes" = point at a new file (path or upload) and
-            # re-count. We never mutate an operator's server-side file, so this
-            # replaces the reference rather than appending.
-            ok, err = _apply_file_source(project, request)
-            if ok:
-                context['message'] = ('Hash file set to %s (%s hashes).'
-                                      % (project.hashfile_path,
-                                         project.hash_count if project.hash_count is not None else '?'))
-            else:
-                context['error'] = err
-        elif project.hashtype is None:
-            context['error'] = ('This project has no hash type set. Set one in the '
-                                'admin before adding hashes.')
-        else:
-            hashlist_raw = request.POST.get('hashlist') or ''
-            context['hashlist'] = hashlist_raw
-            added, skipped = _create_hashes(project, _hashlist_from_request(request))
-            context['message'] = (
-                'Added %d hash(es) as %s%s.'
-                % (added, project.hashtype.name,
-                   ' (%d duplicate(s) skipped)' % skipped if skipped else ''))
-            context['hashlist'] = ''  # clear the textarea after a successful add
-    return render(request, 'zebra/hashes_add.html', context)
+# NOTE: there is deliberately no post-creation "add hashes" view. A project's target
+# hash set is locked at creation (see project_new): adding hashes to an ongoing
+# campaign would require re-running every already-tried mask against them to give them
+# the same rigor, which is indistinguishable from starting a new project -- and it
+# would silently invalidate the coverage math (which is keyed on the project, not on
+# which hashes were targeted). Work a new/larger hash set as a new project.
 
 
 def _parse_custom_charsets(raw):

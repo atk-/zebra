@@ -6,7 +6,9 @@ Validation: all **262 existing tests passed** using `uv run python zebra/manage.
 
 Priority: **P1** = incorrect campaign state, lost recovery/data, or broken execution exclusivity; **P2** = other correctness or availability problems.
 
-## 1. [P1] The launch guard does not reserve the execution slot
+## 1. [P1] The launch guard does not reserve the execution slot — fixed
+
+**Resolution:** the in-process races were already closed by serializing `start_run`/`resume_run`/`reconcile`/`_adopt` on the lifecycle lock. This change adds the cross-process guarantee: both launch paths now reserve the single slot via `_claim_slot`, which does the "no running row → set this run running" check-and-write inside a `transaction.atomic()`. With the IMMEDIATE+WAL SQLite config (issue 9), `BEGIN` takes the write lock up front, so a concurrent claimer — another thread *or* another server process on the same DB — blocks, then sees the reserved row and gets `BUSY`. The reservation records `started_at` with no pid yet; `reconcile_stale_runs` grants a `LAUNCH_GRACE_SECONDS` window so it never aborts a launch mid-flight, and any prep/spawn failure calls `_release_slot` so a botched launch can't strand a `running` row. Regression tests cover slot exclusivity, the reconcile launch grace, and slot release on prep failure. (Under multi-worker cross-process contention a page-load reconcile can block up to the 30 s busy timeout; acceptable for this local tool.)
 
 **Locations:** `zebra/zebra/services/launcher.py:134`, `:170`, `:522`.
 
@@ -38,7 +40,9 @@ Both deletion handlers remove recovery files and database rows without checking 
 
 **Suggested fix:** reject deletion while starting/running, or explicitly stop and wait for finalization before removing rows and files. Apply the same rule to project cascades.
 
-## 4. [P1] Changing the hashlist leaves old coverage valid for new targets
+## 4. [P1] Changing the hashlist leaves old coverage valid for new targets — resolved by design
+
+**Resolution:** a project's target hash set is now **immutable after creation**. The post-creation "add hashes" / "replace file" flow (the `hashes_add` view, its URL, template, and the project-page button) was removed; hash/file entry lives only in `project_new`. Adding hashes to an ongoing campaign would require re-running every already-tried mask against them to give them equal rigor — indistinguishable from starting a new project — and it was exactly what let coverage (keyed on the project, not on which hashes were targeted) go stale. With targets fixed, coverage is correct by construction. Deferred "later" item: file-backed projects still trust the external file to stay stable; detecting external drift (snapshot the line-count/hash at creation, warn on mismatch) is not yet done. (Admin CRUD can still edit `Hash` rows — a deliberate power-user backdoor, not a UI path.)
 
 **Locations:** `zebra/zebra/views.py:672`, `zebra/zebra/coverage_helpers.py:61`, `:78`, `zebra/zebra/models.py:375`.
 
@@ -46,7 +50,9 @@ Adding DB-backed hashes or replacing a file-backed hashlist does not invalidate 
 
 **Suggested fix:** version target lists and associate coverage, execution inputs, and recovery counts with a target version, or explicitly reset campaign state when targets change.
 
-## 5. [P1] Stopping an orphan releases the slot before the process exits
+## 5. [P1] Stopping an orphan releases the slot before the process exits — fixed
+
+**Resolution:** `stop_run` now distinguishes three cases. A run tracked in `_active` is signalled and finalised by its reader (unchanged). An **adopted** run is signalled and left `running` for its `_adopt_watch` watcher to finalise on real pid death — so the slot stays held until exit. A **truly-orphaned** run is signalled *by session* (via `_pid_is_hashcat(pid, session)` — no more bare-pid signalling of a reused pid) and `_signal_and_wait_exit` waits for the process to exit, escalating SIGINT→SIGKILL, before the run is marked `aborted`; the slot is released only once exit is confirmed. Regression tests cover the adopted-defers-to-watcher path and the orphan session-check + wait-for-exit path.
 
 **Location:** `zebra/zebra/services/launcher.py:483`.
 

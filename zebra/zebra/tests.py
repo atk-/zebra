@@ -168,35 +168,10 @@ class RecordAttackViewTests(TestCase):
         self.assertEqual(ch.project_coverage(self.project), [])
 
 
-class AddHashesViewTests(TestCase):
-    def setUp(self):
-        self.ht = HashType.objects.create(name='A-MD5', hashcat_module=0)
-        self.project = Project.objects.create(name='ADDTEST', hashtype=self.ht)
-        Hash.objects.create(hashstring='dup', project=self.project, cracked=False)
-
-    def test_add_hashes_dedups_and_skips_existing(self):
-        url = '/zebra/project/%d/hashes/add/' % self.project.pk
-        r = self.client.post(url, {'hashlist': 'a\nb\na\n dup \n\n'})  # dup + repeat + blank
-        self.assertEqual(r.status_code, 200)
-        self.assertContains(r, 'Added 2 hash(es)')
-        self.assertContains(r, '2 duplicate(s) skipped')  # repeated 'a' + existing 'dup'
-        self.assertContains(r, 'A-MD5')  # the project's fixed type is shown
-        got = set(self.project.hash_set.values_list('hashstring', flat=True))
-        self.assertEqual(got, {'dup', 'a', 'b'})
-
-    def test_add_form_shows_fixed_type_and_no_picker(self):
-        d = self.client.get('/zebra/project/%d/hashes/add/' % self.project.pk)
-        self.assertContains(d, 'Adding hashes as')
-        self.assertContains(d, 'A-MD5')
-        self.assertNotContains(d, 'name="hashtype"')  # no per-add type picker
-
-    def test_add_without_project_hashtype_shows_notice(self):
-        typeless = Project.objects.create(name='NOTYPE')  # hashtype null
-        d = self.client.get('/zebra/project/%d/hashes/add/' % typeless.pk)
-        self.assertContains(d, 'no hash type set')
-        r = self.client.post('/zebra/project/%d/hashes/add/' % typeless.pk,
-                             {'hashlist': 'x'})
-        self.assertFalse(typeless.hash_set.exists())
+# The post-creation "add hashes" view was removed: a project's hash set is locked at
+# creation (adding to an ongoing campaign == a new project). Dedup/type handling of the
+# shared hash-entry helpers is now covered at creation time (see HashlistUploadTests and
+# the project-creation dedup test); the absent route is asserted there too.
 
 
 from .services import similarity as sim
@@ -667,6 +642,85 @@ class LauncherUnitTests(TestCase):
         # Guard set is now clear, so a new launch is no longer refused.
         self.assertFalse(Run.objects.filter(status='running').exists())
 
+    def test_claim_slot_is_exclusive(self):
+        # Issue 1: the slot claim is atomic -- once one run reserves 'running', a second
+        # claim fails and leaves that run untouched.
+        r1, r2 = self._mask_run(), self._mask_run('?l?l')
+        self.assertTrue(launcher._claim_slot(r1))
+        r1.refresh_from_db()
+        self.assertEqual(r1.status, 'running')
+        self.assertIsNotNone(r1.started_at)
+        self.assertFalse(launcher._claim_slot(r2))  # slot already taken
+        r2.refresh_from_db()
+        self.assertEqual(r2.status, 'planned')       # untouched
+
+    def test_reconcile_respects_launch_grace(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        # A fresh pid-less reservation (mid-launch) must be spared; an aged one swept.
+        run = self._mask_run(status='running')  # pid=None
+        run.started_at = timezone.now()
+        run.save(update_fields=['started_at'])
+        self.assertEqual(launcher.reconcile_stale_runs(), 0)   # in grace -> spared
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'running')
+        run.started_at = timezone.now() - timedelta(seconds=launcher.LAUNCH_GRACE_SECONDS + 1)
+        run.save(update_fields=['started_at'])
+        self.assertEqual(launcher.reconcile_stale_runs(), 1)   # aged out -> swept
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'aborted')
+
+    def test_start_releases_slot_when_prep_fails(self):
+        from zebra.models import Project
+        run = self._mask_run()
+        with tempfile.TemporaryDirectory() as d:
+            runner = hc.HashcatRunner(binary=_write_stub(d, 'exit 0\n'))
+            with mock.patch.object(Project, 'launch_hashfile', side_effect=OSError('disk full')):
+                err = launcher.start_run(run, runner=runner)
+        self.assertIn('Failed to prepare', err)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'error')                       # slot released
+        self.assertFalse(Run.objects.filter(status='running').exists())
+
+    def test_stop_adopted_run_defers_to_watcher(self):
+        # Issue 5: an adopted run's watcher owns finalisation; stop only signals and
+        # keeps the slot held (status stays 'running') until the process really exits.
+        run = self._mask_run(status='running')
+        run.pid, run.session = 4242, 'zebra-x'
+        run.save(update_fields=['pid', 'session'])
+        with launcher._lock:
+            launcher._adopted.add(run.pk)
+        try:
+            with mock.patch.object(launcher, '_pid_is_hashcat', return_value=True), \
+                    mock.patch('os.kill') as kill:
+                self.assertIsNone(launcher.stop_run(run))
+        finally:
+            with launcher._lock:
+                launcher._adopted.discard(run.pk)
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'running')   # not aborted here -- watcher does it
+        kill.assert_called_once()
+
+    def test_stop_orphan_checks_session_and_waits_for_exit(self):
+        # Issue 5: the orphan branch signals by session (not a bare pid) and only
+        # releases the slot after confirming exit.
+        run = self._mask_run(status='running')
+        run.pid, run.session = 4242, 'zebra-y'
+        run.save(update_fields=['pid', 'session'])
+        seen = {}
+
+        def fake_is_hashcat(pid, session=None):
+            seen['session'] = session
+            return True  # pretend alive so stop takes the wait-for-exit path
+
+        with mock.patch.object(launcher, '_pid_is_hashcat', side_effect=fake_is_hashcat), \
+                mock.patch.object(launcher, '_signal_and_wait_exit') as wait:
+            self.assertIsNone(launcher.stop_run(run))
+        self.assertEqual(seen['session'], 'zebra-y')   # session passed, not omitted
+        wait.assert_called_once()                       # waited for exit
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'aborted')         # slot released only after
+
     def test_recover_and_advance_sweeps_dead_orphan_on_page_view(self):
         # A run stranded 'running' (dead process, no tracking thread) must self-heal
         # when the dashboard/queue is loaded -- otherwise it blocks the queue/autopilot
@@ -911,33 +965,36 @@ class HashlistUploadTests(TestCase):
         f.name = name
         return f
 
-    def test_add_hashes_from_uploaded_file(self):
-        url = '/zebra/project/%d/hashes/add/' % self.project.pk
-        r = self.client.post(url, {'hashlist': '', 'hashfile': self._file('a\nb\nc\n')})
-        self.assertContains(r, 'Added 3 hash(es)')
-        self.assertEqual(set(self.project.hash_set.values_list('hashstring', flat=True)),
-                         {'a', 'b', 'c'})
-
-    def test_textarea_and_file_combine_and_dedup(self):
-        url = '/zebra/project/%d/hashes/add/' % self.project.pk
-        r = self.client.post(url, {'hashlist': 'a\nb', 'hashfile': self._file('b\nc\n')})
-        self.assertContains(r, 'Added 3 hash(es)')  # a,b,c ; the duplicate b skipped
-        self.assertEqual(set(self.project.hash_set.values_list('hashstring', flat=True)),
-                         {'a', 'b', 'c'})
-
-    def test_new_project_accepts_uploaded_hashlist(self):
-        Project.objects.filter(name='UPFROMNEW').delete()
+    # Hashes are locked at creation (no post-creation add/replace flow), so the upload
+    # path is exercised via project creation.
+    def test_new_project_from_uploaded_file(self):
         r = self.client.post('/zebra/project/new/', {
-            'name': 'UPFROMNEW', 'hashtype': str(self.ht.pk), 'hashlist': '',
-            'hashfile': self._file('h1\nh2\n')})
+            'name': 'UPFILE', 'hashtype': str(self.ht.pk), 'hashlist': '',
+            'hashfile': self._file('a\nb\nc\n')})
         self.assertEqual(r.status_code, 302)
-        p = Project.objects.get(name='UPFROMNEW')
-        self.assertEqual(p.hash_set.count(), 2)
+        p = Project.objects.get(name='UPFILE')
+        self.assertEqual(set(p.hash_set.values_list('hashstring', flat=True)),
+                         {'a', 'b', 'c'})
 
-    def test_add_form_is_multipart(self):
-        d = self.client.get('/zebra/project/%d/hashes/add/' % self.project.pk)
+    def test_new_project_textarea_and_file_combine_and_dedup(self):
+        r = self.client.post('/zebra/project/new/', {
+            'name': 'UPCOMBINE', 'hashtype': str(self.ht.pk),
+            'hashlist': 'a\nb', 'hashfile': self._file('b\nc\n')})
+        self.assertEqual(r.status_code, 302)
+        p = Project.objects.get(name='UPCOMBINE')  # a,b,c ; the duplicate b skipped
+        self.assertEqual(set(p.hash_set.values_list('hashstring', flat=True)),
+                         {'a', 'b', 'c'})
+
+    def test_new_project_form_is_multipart(self):
+        d = self.client.get('/zebra/project/new/')
         self.assertContains(d, 'enctype="multipart/form-data"')
         self.assertContains(d, 'name="hashfile"')
+
+    def test_no_post_creation_add_hashes_route(self):
+        # The route is intentionally gone; hashes are immutable after creation.
+        from django.urls import NoReverseMatch, reverse
+        with self.assertRaises(NoReverseMatch):
+            reverse('hashes_add', args=[self.project.pk])
 
 
 class ExpandCharsetTests(SimpleTestCase):
@@ -2086,17 +2143,6 @@ class FileBackedViewTests(TestCase):
         self.assertTrue(os.path.exists(p.hashfile_path))
         self.assertEqual(p.hash_count, 2)
         self.assertEqual(p.hash_set.count(), 0)
-
-    def test_hashes_add_replaces_path_for_file_backed(self):
-        p = Project.objects.create(name='RP', hashtype=self.ht,
-                                   hashfile_path=self.ext, hash_count=4)
-        other = os.path.join(self.d, 'other.txt'); open(other, 'w').write('a\nb\n')
-        r = self.client.post('/zebra/project/%d/hashes/add/' % p.pk,
-                             {'hashfile_path': other})
-        self.assertEqual(r.status_code, 200)
-        p.refresh_from_db()
-        self.assertEqual(p.hashfile_path, other)
-        self.assertEqual(p.hash_count, 2)
 
     def test_import_results_appends_to_project_potfile(self):
         p = Project.objects.create(name='IMP', hashtype=self.ht,
