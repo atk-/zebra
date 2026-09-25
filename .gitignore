@@ -5,6 +5,9 @@ __pycache__/
 *.py[cod]
 # Django
 *.sqlite3
+# SQLite WAL sidecar files (created while the server runs in WAL mode)
+*.sqlite3-wal
+*.sqlite3-shm
 /zebra/db.sqlite3
 # zebra-managed hash files & per-project potfiles (may be huge / contain plaintexts)
 /data/

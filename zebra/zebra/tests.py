@@ -488,6 +488,7 @@ class RunDeleteViewTests(TestCase):
 
 import os
 import stat
+import signal
 import subprocess
 import tempfile
 from unittest import mock
@@ -666,6 +667,19 @@ class LauncherUnitTests(TestCase):
         # Guard set is now clear, so a new launch is no longer refused.
         self.assertFalse(Run.objects.filter(status='running').exists())
 
+    def test_recover_and_advance_sweeps_dead_orphan_on_page_view(self):
+        # A run stranded 'running' (dead process, no tracking thread) must self-heal
+        # when the dashboard/queue is loaded -- otherwise it blocks the queue/autopilot
+        # until an explicit launch/stop action reconciles it.
+        run = self._mask_run(status='running')
+        run.pid = 999999  # not a live hashcat
+        run.save(update_fields=['pid'])
+        with mock.patch.object(launcher, '_advance_queue', return_value=None):
+            launcher.recover_and_advance()
+        run.refresh_from_db()
+        self.assertEqual(run.status, 'aborted')
+        self.assertFalse(Run.objects.filter(status='running').exists())
+
 
 class LauncherExecuteTests(TransactionTestCase):
     """Drive the spawn->stream->finalise->ingest path with a stub binary,
@@ -752,6 +766,105 @@ class LauncherExecuteTests(TransactionTestCase):
         self.assertEqual(self.run.recovered, 2)        # pinned to final potfile count
         self.assertEqual(self.run.crack_range_end, 2)  # end of this run's row range
         self.assertEqual(self.run.crack_count(), 1)    # rows [1, 2) = this run
+
+    def test_finalize_rides_out_a_transient_db_lock(self):
+        # The reported failure: a SQLite lock during the terminal-status write used to
+        # cascade -- the run was mislabelled 'error' or stranded 'running' (an orphan
+        # that blocked the queue). The status write must now retry through the lock.
+        from django.db import OperationalError
+        d = tempfile.mkdtemp()
+        pot = os.path.join(d, 'zebra.pot')
+        stub = _write_stub(d, "exit 1\n")  # exhausted
+        proc = subprocess.Popen([stub], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+        real_save, calls = Run.save, {'n': 0}
+
+        def flaky_save(self, *a, **k):
+            # Fail the terminal-status write a couple of times, then let it through.
+            if 'status' in (k.get('update_fields') or []) and calls['n'] < 2:
+                calls['n'] += 1
+                raise OperationalError('database is locked')
+            return real_save(self, *a, **k)
+
+        with mock.patch.object(launcher, 'SAVE_RETRY_SLEEP', 0), \
+                mock.patch.object(Run, 'save', flaky_save):
+            launcher._execute(self.run, proc, proc.stdout.fileno(), d, pot)
+
+        self.run.refresh_from_db()
+        self.assertEqual(calls['n'], 2)                  # it really did hit the lock
+        self.assertEqual(self.run.status, 'exhausted')   # ...and still finalised cleanly
+        self.assertFalse(Run.objects.filter(status='running').exists())  # queue unblocked
+
+    def test_post_finalise_error_does_not_reopen_a_finished_run(self):
+        # A hiccup AFTER the terminal status is committed (here: crack ingest raising)
+        # must not downgrade an exhausted run to 'error'.
+        d = tempfile.mkdtemp()
+        pot = os.path.join(d, 'zebra.pot')
+        open(pot, 'w').write('aaa:secret\n')
+        stub = _write_stub(d, "exit 1\n")  # exhausted
+        proc = subprocess.Popen([stub], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        with mock.patch.object(hc, 'ingest_cracks', side_effect=RuntimeError('boom')):
+            launcher._execute(self.run, proc, proc.stdout.fileno(), d, pot)
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, 'exhausted')   # committed status survives
+        self.assertIn('post-finalise', self.run.comment or '')
+
+    def _seed_recovery_files(self, pot):
+        # Stand in for what start_run leaves on disk: a checkpoint, a per-run potfile,
+        # and (DB-backed) the materialized hashfile dir that --restore re-reads.
+        restore = os.path.join(tempfile.mkdtemp(), 'r.restore')
+        open(restore, 'w').write('checkpoint')
+        open(pot, 'w').write('aaa:secret\n')
+        self.run.restore_path, self.run.potfile_path = restore, pot
+        self.run.save(update_fields=['restore_path', 'potfile_path'])
+        hashdir = launcher._run_hashdir(self.run)
+        os.makedirs(hashdir, exist_ok=True)
+        open(os.path.join(hashdir, 'hashes.txt'), 'w').write('aaa\n')
+        return restore, hashdir
+
+    def test_aborted_run_keeps_its_checkpoint_and_hashfile(self):
+        # Issue 2: a non-terminal exit (here code 2 = aborted) must remain resumable,
+        # so its checkpoint AND materialized hashfile survive finalisation.
+        d = tempfile.mkdtemp()
+        pot = os.path.join(d, 'run.pot')
+        restore, hashdir = self._seed_recovery_files(pot)
+        stub = _write_stub(d, "exit 2\n")  # aborted (checkpoint-abort)
+        proc = subprocess.Popen([stub], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        launcher._execute(self.run, proc, proc.stdout.fileno(), d, pot)
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, 'aborted')
+        self.assertTrue(os.path.isfile(restore))                       # checkpoint kept
+        self.assertTrue(os.path.isfile(os.path.join(hashdir, 'hashes.txt')))  # inputs kept
+        self.assertTrue(self.run.recovery_ready())                     # ...so resume is offered
+
+    def test_exhausted_run_drops_its_recovery_files(self):
+        # The complement: a terminal exit is done, so its recovery files are cleaned up.
+        d = tempfile.mkdtemp()
+        pot = os.path.join(d, 'run.pot')
+        restore, hashdir = self._seed_recovery_files(pot)
+        stub = _write_stub(d, "exit 1\n")  # exhausted (terminal)
+        proc = subprocess.Popen([stub], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        launcher._execute(self.run, proc, proc.stdout.fileno(), d, pot)
+        self.run.refresh_from_db()
+        self.assertEqual(self.run.status, 'exhausted')
+        self.assertFalse(os.path.exists(restore))    # checkpoint dropped
+        self.assertFalse(os.path.exists(hashdir))    # hashfile dir dropped
+
+
+class ExactBigIntegerFieldTests(TestCase):
+    """Issue 9: keyspaces/hash rates must round-trip exactly, not round to a float."""
+
+    def test_big_keyspace_round_trips_exactly(self):
+        ht = HashType.objects.create(name='EBI', hashcat_module=0)
+        project = Project.objects.create(name='EBI', hashtype=ht)
+        mask = Mask.objects.create(project=project, pattern='ZT', keyspace=95 ** 24)
+        mask.refresh_from_db()
+        self.assertEqual(mask.keyspace, 95 ** 24)      # exact, not 2.9e+47
+        self.assertIsInstance(mask.keyspace, int)      # plain int, not Decimal
+        project.benchmark_hs = 2 ** 200 + 1
+        project.save(update_fields=['benchmark_hs'])
+        project.refresh_from_db()
+        self.assertEqual(project.benchmark_hs, 2 ** 200 + 1)
 
 
 class RunLaunchTemplateTests(TestCase):
@@ -2749,6 +2862,172 @@ class ComplementViewTests(TestCase):
         self.assertEqual(d2['queued'], 0)
         # The length is now fully covered by queued masks -> zero untried keyspace.
         self.assertEqual(ch.project_complement_masks(self.project, 4)['summary']['untried'], 0)
+
+
+class ActiveDeletionTests(TransactionTestCase):
+    """Deletion must finish process shutdown before removing rows or files."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.override = self.settings(ZEBRA_DATA_DIR=self.temp.name)
+        self.override.enable()
+        self.addCleanup(self.override.disable)
+        launcher.set_queue_mode('off')
+        self.project = Project.objects.create(
+            name='active-delete',
+            hashtype=HashType.objects.create(name='delete-ht', hashcat_module=0))
+        Hash.objects.create(project=self.project, hashstring='h1')
+        self.mask = Mask.objects.create(project=self.project, pattern='?d')
+        self.procs = []
+
+    def tearDown(self):
+        for proc in self.procs:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        launcher._active.clear()
+        launcher._workers.clear()
+        launcher._adopted.clear()
+
+    def _orphan(self, session='delete-session', tracked=False):
+        proc = subprocess.Popen(['hashcat --session ' + session, '30'],
+                                executable='/bin/sleep', start_new_session=True)
+        self.procs.append(proc)
+        run = Run.objects.create(project=self.project, mask=self.mask,
+                                 status='running', pid=proc.pid, session=session)
+        if tracked:
+            launcher._active[run.pk] = proc
+        return run, proc
+
+    def test_attack_delete_stops_tracked_process_before_cleanup(self):
+        run, proc = self._orphan(tracked=True)
+        def cleanup(*args, **kwargs):
+            self.assertIsNotNone(proc.poll())
+            self.assertTrue(Run.objects.filter(pk=run.pk).exists())
+        with mock.patch.object(launcher, '_cleanup_run_files', side_effect=cleanup):
+            response = self.client.post('/zebra/run/%d/delete/' % run.pk)
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(Run.objects.filter(pk=run.pk).exists())
+
+    def test_project_delete_stops_all_orphans_and_removes_queued_runs(self):
+        first, a = self._orphan('first')
+        second, b = self._orphan('second')
+        Run.objects.create(project=self.project, mask=self.mask, status='queued')
+        other = Project.objects.create(name='unrelated', hashtype=self.project.hashtype)
+        unrelated = Run.objects.create(project=other, status='planned')
+        from . import views
+        def cleanup(project):
+            self.assertIsNotNone(a.poll())
+            self.assertIsNotNone(b.poll())
+            self.assertEqual(project.runs.count(), 3)
+        with mock.patch.object(views, '_cleanup_project_files', side_effect=cleanup):
+            response = self.client.post('/zebra/project/%d/delete/' % self.project.pk,
+                {'confirm_text': views._project_delete_phrase(self.project)})
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(Project.objects.filter(pk=self.project.pk).exists())
+        self.assertTrue(Run.objects.filter(pk=unrelated.pk).exists())
+
+    def test_shutdown_failure_keeps_records_and_files(self):
+        run, proc = self._orphan(tracked=True)
+        with mock.patch.object(launcher.os, 'killpg', side_effect=PermissionError('denied')), \
+             mock.patch.object(launcher, '_cleanup_run_files') as cleanup:
+            response = self.client.post('/zebra/run/%d/delete/' % run.pk)
+        self.assertIn('error=', response['Location'])
+        self.assertTrue(Run.objects.filter(pk=run.pk).exists())
+        self.assertIsNone(proc.poll())
+        cleanup.assert_not_called()
+
+    def test_unrelated_reused_pid_is_not_signalled(self):
+        run, proc = self._orphan('different-session')
+        run.session = 'expected-session'
+        run.save(update_fields=['session'])
+        with mock.patch.object(launcher.os, 'killpg') as kill:
+            self.client.post('/zebra/run/%d/delete/' % run.pk)
+        kill.assert_not_called()
+        self.assertIsNone(proc.poll())
+
+    def test_worker_finishes_before_delete_and_queue_advances_afterward(self):
+        run = Run.objects.create(project=self.project, mask=self.mask)
+        binary = _write_stub(self.temp.name, 'exec sleep 30\n')
+        self.assertIsNone(launcher.start_run(run, hc.HashcatRunner(binary)))
+        proc = launcher._active[run.pk]
+        worker = launcher._workers[run.pk]
+        self.procs.append(proc)
+        def advance(*args, **kwargs):
+            self.assertFalse(Run.objects.filter(pk=run.pk).exists())
+        # Real _advance_queue must skip the reader's attempt while deletion holds
+        # the lifecycle lock; its underlying implementation runs only afterward.
+        with mock.patch.object(launcher, '_advance_queue_unlocked', side_effect=advance) as next_run:
+            self.client.post('/zebra/run/%d/delete/' % run.pk)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNotNone(proc.poll())
+        next_run.assert_called_once()
+
+    def test_force_kill_when_process_ignores_interrupt(self):
+        import sys
+        proc = subprocess.Popen([sys.executable, '-c',
+            'import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); '
+            'print("ready", flush=True); time.sleep(30)'],
+            stdout=subprocess.PIPE, start_new_session=True)
+        self.procs.append(proc)
+        self.assertEqual(proc.stdout.readline(), b'ready\n')
+        proc.stdout.close()
+        run = Run.objects.create(project=self.project, mask=self.mask,
+                                 status='running', pid=proc.pid)
+        launcher._active[run.pk] = proc
+        with mock.patch.object(launcher, 'DELETE_STOP_SECONDS', 0.1):
+            self.client.post('/zebra/run/%d/delete/' % run.pk)
+        self.assertEqual(proc.poll(), -signal.SIGKILL)
+        self.assertFalse(Run.objects.filter(pk=run.pk).exists())
+
+    def test_adopted_watcher_is_joined_before_deletion(self):
+        run, proc = self._orphan()
+        run.potfile_path = os.path.join(self.temp.name, 'adopted.pot')
+        run.save(update_fields=['potfile_path'])
+        with mock.patch.object(launcher, 'POLL_SECONDS', 0.01):
+            launcher._adopt(run)
+            worker = launcher._workers[run.pk]
+            self.client.post('/zebra/run/%d/delete/' % run.pk)
+        self.assertFalse(worker.is_alive())
+        self.assertIsNotNone(proc.poll())
+        self.assertFalse(Run.objects.filter(pk=run.pk).exists())
+
+    def test_project_shutdown_failure_preserves_project(self):
+        from . import views
+        run, proc = self._orphan(tracked=True)
+        with mock.patch.object(launcher.os, 'killpg', side_effect=PermissionError('denied')), \
+             mock.patch.object(views, '_cleanup_project_files') as cleanup:
+            response = self.client.post('/zebra/project/%d/delete/' % self.project.pk,
+                {'confirm_text': views._project_delete_phrase(self.project)})
+        self.assertContains(response, 'nothing was deleted')
+        self.assertTrue(Project.objects.filter(pk=self.project.pk).exists())
+        self.assertTrue(Run.objects.filter(pk=run.pk).exists())
+        cleanup.assert_not_called()
+
+    def test_descendant_ignoring_interrupt_is_killed_after_leader_exits(self):
+        import sys
+        script = '''import os, signal, time
+if os.fork() == 0:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    print('ready', flush=True)
+time.sleep(30)
+'''
+        proc = subprocess.Popen([sys.executable, '-c', script], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+        self.procs.append(proc)
+        self.assertEqual(proc.stdout.readline(), b'ready\n')
+        proc.stdout.close()
+        run = Run.objects.create(project=self.project, mask=self.mask,
+                                 status='running', pid=proc.pid)
+        launcher._active[run.pk] = proc
+        with mock.patch.object(launcher, 'DELETE_STOP_SECONDS', 0.2):
+            self.client.post('/zebra/run/%d/delete/' % run.pk)
+        self.assertIsNotNone(proc.poll())
+        self.assertFalse(launcher._process_group_live(proc.pid))
+        self.assertFalse(Run.objects.filter(pk=run.pk).exists())
 
 
 class RunRecoveryTests(TestCase):

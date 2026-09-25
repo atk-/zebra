@@ -24,9 +24,12 @@ import shutil
 import signal
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
+from functools import wraps
 
 from django.conf import settings as dj_settings
-from django.db import connection
+from django.db import OperationalError, connection
 from django.utils import timezone
 
 from ..models import Run, Settings
@@ -34,6 +37,28 @@ from . import hashcat as hc
 from . import hashfile
 
 POLL_SECONDS = 10  # send hashcat an 's' keypress this often to refresh status
+
+# A background finaliser MUST land its terminal-status write even if SQLite is briefly
+# locked -- a dropped write strands the run in 'running' (an orphan that blocks the
+# queue). WAL + busy_timeout (config/settings.py) makes locks rare and self-clearing;
+# this is the last-resort retry for the residual case so the state machine never wedges.
+SAVE_RETRIES = 6
+SAVE_RETRY_SLEEP = 0.5  # seconds between retries (total ~3s on top of the busy timeout)
+
+
+def _save_run(run, **kwargs):
+    """``run.save(**kwargs)`` that rides out a transient SQLite lock.
+
+    Retries on OperationalError ("database is locked") so a finaliser can't leave a
+    run stuck in a non-terminal state. Re-raises if it never succeeds."""
+    for attempt in range(SAVE_RETRIES):
+        try:
+            run.save(**kwargs)
+            return
+        except OperationalError:
+            if attempt == SAVE_RETRIES - 1:
+                raise
+            time.sleep(SAVE_RETRY_SLEEP)
 
 # Finished run states: the search is complete (whole keyspace exhausted, or all
 # targeted hashes cracked), so there is nothing left to (re)launch or queue.
@@ -67,6 +92,18 @@ _active = {}
 # we can't re-attach hashcat's status stream, so a watcher tails the potfile instead.
 _adopted = set()
 _lock = threading.Lock()
+_lifecycle_lock = threading.RLock()
+_workers = {}
+DELETE_STOP_SECONDS = 5
+DELETE_JOIN_SECONDS = POLL_SECONDS + 5
+
+
+def _serialize_lifecycle(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _lifecycle_lock:
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 def _iter_lines(fd):
@@ -106,12 +143,16 @@ def _final_status(returncode):
             2: 'aborted', 3: 'aborted', 4: 'aborted'}.get(returncode, 'error')
 
 
+@_serialize_lifecycle
 def start_run(run, runner=None):
     """Launch ``run`` with hashcat in a background thread.
 
     Returns None on success or an error string (guard failure) to show the user.
     """
     runner = runner or hc.configured_runner()
+    if not Run.objects.filter(pk=run.pk).exists():
+        return 'This attack has been deleted.'
+    run.refresh_from_db()
     if not runner.available():
         return 'hashcat is not installed on this machine.'
     if run.attack_mode != 3:
@@ -139,11 +180,12 @@ def start_run(run, runner=None):
     session = _session_name(run)
     # File-backed: hashcat reads the external file directly (zero-copy) and writes to
     # a *persistent per-project* potfile; this run is credited its delta over the
-    # baseline. DB-backed: materialize hashes into workdir, and use a *persistent
-    # per-run* potfile (run-<pk>.pot, outside workdir so it survives cleanup and stays
-    # tail-able after a restart) whose whole contents are this run's cracks -- so no
-    # baseline (kept None; recovered = count - (baseline or 0) works for both).
-    hashpath = run.project.launch_hashfile(workdir)
+    # baseline. DB-backed: materialize hashes into a *stable per-run* dir (not the temp
+    # workdir), and use a *persistent per-run* potfile (run-<pk>.pot) whose whole
+    # contents are this run's cracks -- so no baseline (kept None; recovered = count -
+    # (baseline or 0) works for both). The stable hashfile is what ``--restore`` re-reads
+    # on resume, so it must outlive the disposable workdir (see _cleanup_run_files).
+    hashpath = run.project.launch_hashfile(_run_hashdir(run))
     if run.project.is_file_backed:
         pot = run.project.resolve_potfile_path()
         run.crack_baseline = hashfile.potfile_cracked_count(pot)
@@ -208,8 +250,11 @@ def _spawn_and_track(run, argv, pot, workdir):
     run.save(update_fields=['pid'])
     with _lock:
         _active[run.pk] = proc
-    threading.Thread(target=_execute, args=(run, proc, master_fd, workdir, pot),
-                     daemon=True).start()
+    worker = threading.Thread(target=_execute, args=(run, proc, master_fd, workdir, pot),
+                              daemon=True)
+    with _lock:
+        _workers[run.pk] = worker
+    worker.start()
     return None
 
 
@@ -230,6 +275,7 @@ def _execute(run, proc, fd, workdir, pot):
                 break
 
     threading.Thread(target=_poll, daemon=True).start()
+    finalised = False  # terminal status committed -> a later hiccup must not undo it
     try:
         for line in _iter_lines(fd):
             line = line.strip()
@@ -243,7 +289,12 @@ def _execute(run, proc, fd, workdir, pot):
                     if k in ('progress', 'speed_hs', 'recovered',
                              'base_offset', 'base_count')}
             if live:
-                hc.ingest_status(run, live)  # progress/speed only; status from exit code
+                # Live progress/speed is a throwaway display update -- a transient DB
+                # lock here must not abort an otherwise-healthy run; just skip the tick.
+                try:
+                    hc.ingest_status(run, live)  # status itself comes from the exit code
+                except OperationalError:
+                    pass
 
         code = proc.wait()
         run.status = _final_status(code)
@@ -261,30 +312,51 @@ def _execute(run, proc, fd, workdir, pot):
             run.recovered = final
             run.crack_range_end = final
             fields += ['recovered', 'crack_range_end']
-        run.save(update_fields=fields)
+        # Critical write: retry through a transient lock so the run reaches a terminal
+        # status. Once it lands, the run is finalised -- later steps must not clobber it.
+        _save_run(run, update_fields=fields)
+        finalised = True
 
-        # DB-backed: import the run's potfile into Crack rows + the cracked flag.
-        # File-backed: the persistent potfile IS the source of truth (no Crack
-        # rows), so there is nothing to ingest.
-        if not run.project.is_file_backed:
+        # Post-finalise bookkeeping (crack import + recovery-file cleanup). A failure
+        # here (e.g. a lock during ingest, a cleanup error) must NOT reopen the
+        # already-committed terminal status, so it is guarded on its own.
+        try:
+            # DB-backed: import the run's potfile into Crack rows + the cracked flag.
+            # File-backed: the persistent potfile IS the source of truth (no Crack
+            # rows), so there is nothing to ingest.
+            if not run.project.is_file_backed:
+                try:
+                    with open(pot, encoding='utf-8') as f:
+                        pairs = hc.parse_potfile(f.read())
+                    if pairs:
+                        hc.ingest_cracks(run.project, pairs, run)
+                except FileNotFoundError:
+                    pass
+            # Drop recovery files ONLY on a terminal finalize (exhausted/cracked):
+            # the search is complete, so the checkpoint/hashfile are spent. An
+            # aborted/error run stays resumable, so keep them for resume_run
+            # (reconcile/delete clean them if the run is later abandoned).
+            if run.status in TERMINAL_STATUSES:
+                _cleanup_run_files(run, drop_potfile=not run.project.is_file_backed)
+        except Exception as exc:
+            run.comment = ('%s | post-finalise warning: %s' % (run.comment or '', exc))[:1000]
             try:
-                with open(pot, encoding='utf-8') as f:
-                    pairs = hc.parse_potfile(f.read())
-                if pairs:
-                    hc.ingest_cracks(run.project, pairs, run)
-            except FileNotFoundError:
-                pass
-        # Clean finalize: the run's cracks are committed (Crack rows for DB-backed,
-        # the shared potfile for file-backed) and the checkpoint is spent, so drop
-        # this run's recovery files. Skipped on the exception path so a crashed
-        # finalize leaves the potfile/restore intact for recovery.
-        _cleanup_run_files(run, drop_potfile=not run.project.is_file_backed)
+                _save_run(run, update_fields=['comment'])
+            except Exception:
+                pass  # best-effort note; the terminal status already stuck
     except Exception as exc:  # never let the thread die silently
-        run.status = 'error'
-        run.ended_at = timezone.now()
-        run.pid = None
-        run.comment = ('%s | launch error: %s' % (run.comment or '', exc))[:1000]
-        run.save(update_fields=['status', 'ended_at', 'pid', 'comment'])
+        # Only downgrade to 'error' if we never committed a terminal status; otherwise
+        # a finished run stays finished. A dropped write here leaves the run 'running',
+        # but its process is gone, so reconcile_stale_runs sweeps it on the next tick.
+        if not finalised:
+            run.status = 'error'
+            run.ended_at = timezone.now()
+            run.pid = None
+            run.comment = ('%s | launch error: %s' % (run.comment or '', exc))[:1000]
+            try:
+                _save_run(run, update_fields=['status', 'ended_at', 'pid', 'comment'])
+            except Exception:
+                pass
     finally:
         stop_poll.set()
         try:
@@ -294,17 +366,32 @@ def _execute(run, proc, fd, workdir, pot):
         with _lock:
             _active.pop(run.pk, None)
         shutil.rmtree(workdir, ignore_errors=True)
+        connection.close()
+        with _lock:
+            _workers.pop(run.pk, None)
         # This run's status is already terminal, so the one-at-a-time guard is now
         # clear: chain to the next queued attack (unless the queue is paused).
         _advance_queue()
         connection.close()
 
 
-def _cleanup_run_files(run, drop_potfile):
-    """Best-effort removal of a run's recovery files (restore + its per-run potfile).
+def _run_hashdir(run):
+    """Stable per-run directory holding a DB-backed run's materialized hashfile.
 
-    Never removes a file-backed project's *shared* potfile (``drop_potfile`` is False
-    there). Called on a clean finalize and on run delete."""
+    Kept outside the disposable temp workdir so ``hashcat --restore`` can re-read the
+    hashes on resume; removed by ``_cleanup_run_files`` once the run is no longer
+    resumable (terminal completion or delete)."""
+    return os.path.join(dj_settings.ZEBRA_DATA_DIR, 'hashfiles', 'run-%d' % run.pk)
+
+
+def _cleanup_run_files(run, drop_potfile):
+    """Best-effort removal of a run's recovery files: its checkpoint, per-run potfile,
+    and materialized hashfile dir.
+
+    Only called once a run is no longer resumable -- a clean terminal finalize
+    (exhausted/cracked) or an explicit delete -- so an aborted/error run keeps these
+    for ``resume_run``. Never removes a file-backed project's *shared* potfile
+    (``drop_potfile`` is False there) or its external hashfile."""
     paths = [run.restore_path] if run.restore_path else []
     if drop_potfile and run.potfile_path:
         paths.append(run.potfile_path)
@@ -313,6 +400,10 @@ def _cleanup_run_files(run, drop_potfile):
             os.remove(p)
         except OSError:
             pass
+    # DB-backed only: the per-run materialized hashfile dir (file-backed references an
+    # external file we must never delete).
+    if run.project_id and not run.project.is_file_backed:
+        shutil.rmtree(_run_hashdir(run), ignore_errors=True)
 
 
 def _pid_is_hashcat(pid, session=None):
@@ -347,6 +438,7 @@ def _run_is_live(run):
     return bool(run.pid) and _pid_is_hashcat(run.pid, run.session or None)
 
 
+@_serialize_lifecycle
 def reconcile_stale_runs():
     """Reconcile orphaned ``running`` rows so the launcher self-heals.
 
@@ -359,6 +451,10 @@ def reconcile_stale_runs():
     * **dead** -> mark ``aborted`` (as before). Its restore checkpoint, if any, stays
       on disk so it can be resumed. This clears the guard.
 
+    Serialised on the lifecycle lock so it can't observe (and wrongly abort) a run in
+    ``start_run``'s status->pid registration window. Per-row failures are isolated and
+    the abort write is retried, so one locked row can't wedge the whole sweep.
+
     Returns the number of dead orphans aborted."""
     aborted = 0
     for run in Run.objects.filter(status='running'):
@@ -370,7 +466,10 @@ def reconcile_stale_runs():
         run.status = 'aborted'
         run.pid = None
         run.ended_at = timezone.now()
-        run.save(update_fields=['status', 'pid', 'ended_at'])
+        try:
+            _save_run(run, update_fields=['status', 'pid', 'ended_at'])
+        except OperationalError:
+            continue  # still locked after retries; next tick will sweep it
         aborted += 1
     return aborted
 
@@ -394,17 +493,41 @@ def adopt_live_orphans():
             _adopt(run)
 
 
+def recover_and_advance():
+    """Lazy self-heal for page views: sweep orphaned runs and keep the queue moving.
+
+    Adopting a live orphan and aborting a dead one now that ``reconcile_stale_runs`` is
+    lifecycle-serialised (so it can't race a starting run), then advancing the queue.
+    Without this a run stranded in ``running`` -- e.g. by a transient DB lock during
+    finalisation -- would block the one-at-a-time guard, and thus the queue and
+    autopilot, until an explicit launch/stop action happened to reconcile it. Reconcile
+    runs unconditionally (so a dead orphan is cleared even when the queue is off);
+    ``_advance_queue`` then starts the next run only if the queue is on/auto and idle.
+    Best-effort and side-effect-light: it writes nothing unless there is an orphan to
+    sweep or a run to start, and never raises into request handling."""
+    try:
+        reconcile_stale_runs()
+        _advance_queue()
+    except Exception:
+        pass
+
+
+@_serialize_lifecycle
 def _adopt(run):
     """Start a watcher that recovers a live orphaned run via its potfile.
 
     hashcat's status stream can't be re-attached, but because only one hashcat runs
     at a time, potfile growth is unambiguously this run's cracks. The watcher tails
     the potfile for the live crack count and finalises when the pid disappears."""
+    if not Run.objects.filter(pk=run.pk).exists():
+        return
     with _lock:
         if run.pk in _active or run.pk in _adopted:
             return
         _adopted.add(run.pk)
-    threading.Thread(target=_adopt_watch, args=(run,), daemon=True).start()
+        worker = threading.Thread(target=_adopt_watch, args=(run,), daemon=True)
+        _workers[run.pk] = worker
+    worker.start()
 
 
 def _adopt_potfile_count(run):
@@ -462,8 +585,10 @@ def _adopt_watch(run):
                 pass  # a transient error mustn't kill the watcher
         _adopt_finalize(run)
     finally:
+        connection.close()
         with _lock:
             _adopted.discard(run.pk)
+            _workers.pop(run.pk, None)
         _advance_queue()
         connection.close()
 
@@ -503,6 +628,7 @@ def stop_run(run):
     return None
 
 
+@_serialize_lifecycle
 def resume_run(run, runner=None):
     """Resume a dead run from its hashcat checkpoint. Returns None or an error string.
 
@@ -512,6 +638,9 @@ def resume_run(run, runner=None):
     (real exit code -> correct exhausted/cracked finalise). Guarded so it never runs
     while the process is still alive or another attack is running."""
     runner = runner or hc.configured_runner()
+    if not Run.objects.filter(pk=run.pk).exists():
+        return 'This attack has been deleted.'
+    run.refresh_from_db()
     if not runner.available():
         return 'hashcat is not installed on this machine.'
     if not run.recovery_ready():
@@ -578,6 +707,17 @@ def _next_queued():
 
 
 def _advance_queue(runner=None):
+    # Finalizers must never wait for a deletion which is joining their thread.
+    # The deletion retries queue advancement after releasing the lifecycle lock.
+    if not _lifecycle_lock.acquire(blocking=False):
+        return None
+    try:
+        return _advance_queue_unlocked(runner)
+    finally:
+        _lifecycle_lock.release()
+
+
+def _advance_queue_unlocked(runner=None):
     """Start the next queued run if the queue is active and nothing is running.
 
     Relies on ``start_run``'s DB guard as the real gate, so it does not hold
@@ -595,6 +735,100 @@ def _advance_queue(runner=None):
         return None
     err = start_run(nxt, runner=runner)
     return None if err else nxt
+
+
+@contextmanager
+def deleting_runs(runs):
+    """Quiesce processes and readers before the caller deletes rows/files.
+
+    Yields an error on failure: the caller must then retain the records/files.
+    Launches and queue advancement are excluded until deletion finishes.
+    """
+    success = False
+    with _lifecycle_lock:
+        error = None
+        targets = []
+        groups = {}
+        with _lock:
+            for run in runs:
+                targets.append((run, _active.get(run.pk), _workers.get(run.pk)))
+
+        def leader_live(run, proc):
+            if proc is not None:
+                return proc.poll() is None
+            return _pid_is_hashcat(run.pid, run.session or None)
+
+        def live(run, proc):
+            alive = leader_live(run, proc)  # poll also reaps our child
+            group = groups.get(run.pk)
+            return alive or (group is not None and _process_group_live(group))
+
+        def send(run, proc, sig):
+            group = groups.get(run.pk)
+            if group is not None:
+                os.killpg(group, sig)
+            elif leader_live(run, proc):
+                pid = proc.pid if proc is not None else run.pid
+                os.kill(pid, sig)
+
+        try:
+            for run, proc, _ in targets:
+                if leader_live(run, proc):
+                    pid = proc.pid if proc is not None else run.pid
+                    try:
+                        if os.getpgid(pid) == pid:
+                            groups[run.pk] = pid
+                    except ProcessLookupError:
+                        pass
+            for run, proc, _ in targets:
+                try:
+                    send(run, proc, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + DELETE_STOP_SECONDS
+            while any(live(r, p) for r, p, _ in targets) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            for run, proc, _ in targets:
+                try:
+                    send(run, proc, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + DELETE_STOP_SECONDS
+            while any(live(r, p) for r, p, _ in targets) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if any(live(r, p) for r, p, _ in targets):
+                error = 'Could not stop all attack processes; nothing was deleted.'
+            else:
+                for _, _, worker in targets:
+                    if worker is not None:
+                        worker.join(DELETE_JOIN_SECONDS)
+                        if worker.is_alive():
+                            error = 'Attack finalization is still running; retry deletion.'
+                            break
+        except OSError as exc:
+            error = 'Could not stop attack processes; nothing was deleted: %s' % exc
+        yield error
+        success = error is None
+    if success:
+        _advance_queue()
+
+
+def _process_group_live(pgid):
+    """Whether a Linux process group contains any non-zombie processes."""
+    with os.scandir('/proc') as entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(os.path.join(entry.path, 'stat')) as f:
+                    # comm can contain spaces and parentheses; fields after it
+                    # begin with state, ppid, pgrp.
+                    fields = f.read().rsplit(')', 1)[1].split()
+                if int(fields[2]) == pgid and fields[0] not in ('Z', 'X'):
+                    return True
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+    return False
 
 
 def _fill_auto():

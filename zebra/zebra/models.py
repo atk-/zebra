@@ -1,5 +1,7 @@
 from django.db import models
 
+from .fields import ExactBigIntegerField
+
 
 class Settings(models.Model):
     """Global, project-independent program settings — a single row (pk=1).
@@ -56,10 +58,9 @@ class Project(models.Model):
     universe = models.CharField(max_length=1000, blank=True, null=True)
     # Measured/estimated hashcat speed (H/s) for this project's hash type on the
     # current machine -- either entered by hand or filled from ``hashcat -m N -b``.
-    # DecimalField (not BigIntegerField) because hash rates for fast modes overflow
-    # 64 bits; the engine treats it as a plain int.
-    benchmark_hs = models.DecimalField(max_digits=80, decimal_places=0,
-                                       null=True, blank=True)
+    # Exact text-backed integer (not BigIntegerField, which overflows 64 bits for
+    # fast modes; not DecimalField, which SQLite rounds -- see fields.py). Plain int.
+    benchmark_hs = ExactBigIntegerField(null=True, blank=True)
     # --- hash source (hybrid: DB-backed OR file-backed) ---------------------
     # When set, the project's hashes live in this external file and are NEVER
     # ingested as Hash rows -- hashcat reads the file directly (zero-copy). This
@@ -143,16 +144,19 @@ class Project(models.Model):
             self.save(update_fields=['hash_count'])
         return self.hash_count
 
-    def launch_hashfile(self, workdir):
+    def launch_hashfile(self, target_dir):
         """Path to the hashfile hashcat should read for this project.
 
         File-backed: the external file itself (zero-copy). DB-backed: materialize
-        the project's Hash rows to ``workdir/hashes.txt`` (one per line) and return
-        that -- the caller's workdir cleanup disposes of it."""
+        the project's Hash rows to ``target_dir/hashes.txt`` (one per line, creating
+        the directory) and return that path. The caller decides the directory's
+        lifetime (the launcher uses a stable per-run dir so ``--restore`` can re-read
+        it on resume)."""
         if self.is_file_backed:
             return self.hashfile_path
         import os
-        path = os.path.join(workdir, 'hashes.txt')
+        os.makedirs(target_dir, exist_ok=True)
+        path = os.path.join(target_dir, 'hashes.txt')
         with open(path, 'w', encoding='utf-8') as f:
             for hs in self.hash_set.values_list('hashstring', flat=True):
                 f.write('%s\n' % hs)
@@ -228,7 +232,7 @@ class Mask(models.Model):
     # covers the union of its length-prefixes. Null means a plain single-length mask.
     increment_min = models.IntegerField(null=True, blank=True)
     increment_max = models.IntegerField(null=True, blank=True)
-    keyspace = models.DecimalField(max_digits=80, decimal_places=0, null=True, blank=True)
+    keyspace = ExactBigIntegerField(null=True, blank=True)  # exact big int (see fields.py)
     comment = models.CharField(max_length=1024, null=True, blank=True)
 
     class Meta:
@@ -321,7 +325,7 @@ class Run(models.Model):
     optimized = models.BooleanField(default=True)
     command = models.CharField(max_length=4096, null=True, blank=True)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default='planned')
-    speed_hs = models.DecimalField(max_digits=80, decimal_places=0, null=True, blank=True)
+    speed_hs = ExactBigIntegerField(null=True, blank=True)  # exact big int (see fields.py)
     progress = models.FloatField(default=0.0)  # 0..1 (of the current sub-run)
     # Recovered-hash count reported by hashcat --status-json (recovered_hashes).
     # Live while running; for a file-backed run (shared persistent potfile) this is
@@ -499,7 +503,7 @@ class Benchmark(models.Model):
     (feasible keyspace = speed_hs * time_budget)."""
     hashtype = models.ForeignKey(HashType, on_delete=models.CASCADE, related_name='benchmarks')
     device = models.CharField(max_length=200)
-    speed_hs = models.DecimalField(max_digits=80, decimal_places=0)
+    speed_hs = ExactBigIntegerField()  # exact big int (see fields.py)
     measured_at = models.DateTimeField(auto_now_add=True, null=True)
 
     class Meta:

@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 
 def index(request):
+    launcher.recover_and_advance()  # sweep orphans + keep the queue/autopilot moving
     projects = Project.objects.all()
     return render(request, 'zebra/index.html',
                   {'projects': projects, 'deleted': request.GET.get('deleted')})
@@ -492,7 +493,7 @@ def queue_resume(request):
 
 def queue(request):
     """The machine-wide attack queue: what's running, what's next, ETA to clear it."""
-    launcher.adopt_live_orphans()  # adopt live orphans lazily (non-mutating on GET)
+    launcher.recover_and_advance()  # sweep orphans + keep the queue/autopilot moving
     running = (Run.objects.filter(status='running')
                .select_related('mask', 'project').first())
     queued = list(Run.objects.filter(status='queued')
@@ -530,12 +531,15 @@ def run_delete(request, pk):
     mask = run.mask
     # Remove this run's recovery files (its checkpoint, and per-run potfile for
     # DB-backed; never a file-backed project's shared potfile).
-    launcher._cleanup_run_files(
-        run, drop_potfile=not (run.project and run.project.is_file_backed))
-    run.delete()
-    # Tidy up a mode-3 mask left with no runs (created for this attack alone).
-    if mask and not mask.runs.exists():
-        mask.delete()
+    with launcher.deleting_runs(Run.objects.filter(pk=pk)) as error:
+        if error:
+            return redirect(reverse('run_detail', args=[pk]) + '?error=' + quote(error))
+        launcher._cleanup_run_files(
+            run, drop_potfile=not (run.project and run.project.is_file_backed))
+        run.delete()
+        # Tidy up a mode-3 mask left with no runs (created for this attack alone).
+        if mask and not mask.runs.exists():
+            mask.delete()
     if project_pk:
         return redirect(reverse('project_detail', args=[project_pk]))
     return redirect(reverse('index'))
@@ -590,8 +594,13 @@ def project_delete(request, pk):
             context['typed'] = typed
             return render(request, 'zebra/project_delete.html', context)
         name = project.name
-        _cleanup_project_files(project)
-        project.delete()
+        with launcher.deleting_runs(project.runs.all()) as error:
+            if error:
+                context['error'] = error
+                context['typed'] = typed
+                return render(request, 'zebra/project_delete.html', context)
+            _cleanup_project_files(project)
+            project.delete()
         return redirect(reverse('index') + '?deleted=' + quote(name))
     return render(request, 'zebra/project_delete.html', context)
 

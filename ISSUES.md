@@ -16,7 +16,9 @@ Priority: **P1** = incorrect campaign state, lost recovery/data, or broken execu
 
 **Suggested fix:** atomically claim a machine-wide execution slot before preparing/spawning, distinguish starting from orphaned runs, and release the claim on failure.
 
-## 2. [P1] Normal abort finalization deletes the checkpoint needed to resume
+## 2. [P1] Normal abort finalization deletes the checkpoint needed to resume — fixed
+
+**Resolution:** recovery files are now dropped only on a *terminal* finalize (`exhausted`/`cracked`) or an explicit delete; an `aborted`/`error` run keeps its checkpoint so `resume_run` still works. DB-backed hashes are also materialized to a *stable* per-run dir (`data/hashfiles/run-<pk>/`) instead of the disposable temp workdir, so `hashcat --restore` — which replays the original command line, hashfile path included — can re-read them after the workdir is cleaned; `_cleanup_run_files` removes that dir alongside the checkpoint/per-run potfile when the run is finally done or deleted. Regression tests cover an aborted run keeping its checkpoint + hashfile (and reporting `recovery_ready()`) and an exhausted run dropping both.
 
 **Locations:** `zebra/zebra/services/launcher.py:281`, `:296`, `:303`.
 
@@ -26,7 +28,9 @@ Priority: **P1** = incorrect campaign state, lost recovery/data, or broken execu
 
 **Suggested fix:** retain the checkpoint, input files, and required execution directory while a run remains resumable; clean them only after completion or explicit abandonment.
 
-## 3. [P1] Deleting a running attack or project leaves its process running
+## 3. [P1] Deleting a running attack or project leaves its process running — fixed
+
+**Resolution:** deletion now interrupts all associated processes, force-kills surviving process groups after a grace period, and waits for local tracking threads before removing rows/files. Launches and queue advancement are serialized with deletion within the server process. Failed shutdown retains the records and reports an error. Regression tests cover tracked/orphaned/adopted processes, project-wide shutdown, signal failures, unrelated sessions, and stubborn descendants. Cross-worker execution coordination remains the separate limitation described in issue 1.
 
 **Locations:** `zebra/zebra/views.py:524`, `:574`.
 
@@ -80,7 +84,9 @@ Mode-3 signatures include the mask text and increment bounds but omit custom cha
 
 **Suggested fix:** include canonical custom charset definitions in mask signatures and update all signature producers and existing stored signatures.
 
-## 9. [P2] SQLite rounds supposedly exact cached keyspaces
+## 9. [P1] SQLite rounds supposedly exact cached keyspaces — fixed
+
+**Resolution:** the four affected columns (`Mask.keyspace`, `Project.benchmark_hs`, `Run.speed_hs`, `Benchmark.speed_hs`) moved from `DecimalField` (stored as SQLite `REAL`, i.e. a rounded C double) to a new text-backed `ExactBigIntegerField` (`zebra/zebra/fields.py`) that stores the value as `TEXT` and surfaces a plain Python `int`, so 80-digit values round-trip exactly. No DB-side numeric ordering/aggregation is done on these columns (only an `__isnull` check), so text storage is transparent; `to_python` also tolerantly parses legacy float/scientific-notation text left by the migration. A `recompute_keyspaces` management command recomputes cached mask keyspaces exactly from the pure engine (no hashcat needed); benchmark/speed values must be re-measured. Reprioritized to **P1**: the rounding silently corrupted the tool's headline "exact keyspace" values wherever a cached figure (display, ETA, recommender budget) was read. Migration `0023`; regression test asserts `95**24` and `2**200+1` round-trip.
 
 **Locations:** `zebra/zebra/models.py:231`, `:61`, `:324`, `:502`; `zebra/config/settings.py` database configuration.
 
@@ -169,3 +175,29 @@ Both project display paths use a running run's `recovered` directly as the campa
 Command planners join argv elements with spaces without shell quoting. Paths/project names containing spaces split into multiple arguments, mask question marks undergo filename expansion, and valid literal mask characters such as `;`, `$`, and backticks acquire shell meaning. The active launcher correctly uses an argv list, but the saved/displayed command does not reliably reproduce it when pasted into a terminal.
 
 **Suggested fix:** use shell-aware quoting such as `shlex.join()` for displayed POSIX commands while retaining argv lists for execution.
+
+## 19. [P1] A SQLite lock during finalisation stranded runs and blocked the queue — fixed
+
+**Resolution:** the launcher runs mask attacks in background threads that write to the
+DB concurrently with request threads. On stock SQLite that contention threw "database
+is locked" mid-finalise: the terminal-status write was lost, so a *finished* run was
+either mislabelled `error` or left stuck in `running` — an orphan that blocked the
+one-at-a-time guard, and thus the queue and autopilot, and (because the GET pages only
+adopted live orphans, never swept dead ones) was never recaught until an explicit
+launch/stop action. Three changes address it: (a) SQLite now runs in WAL mode with a
+30 s busy timeout and `IMMEDIATE` write transactions (`config/settings.py`), so
+concurrent writers wait for the lock instead of failing; (b) the finaliser's
+terminal-status write retries through a transient lock (`_save_run`), a post-finalise
+hiccup (crack ingest / file cleanup) can no longer reopen an already-committed status,
+and `reconcile_stale_runs` is per-row resilient; (c) `reconcile_stale_runs` is now
+lifecycle-serialised (so it cannot race a starting run) and the dashboard/queue GETs
+call `recover_and_advance()`, which sweeps a dead orphan and re-advances the queue on
+an ordinary page load. Regression tests cover the flaky-lock finalise, the
+post-finalise non-clobber, and the page-view sweep.
+
+**Locations:** `zebra/config/settings.py` (database config); `zebra/zebra/services/launcher.py` (`_save_run`, `_execute`, `reconcile_stale_runs`, `recover_and_advance`); `zebra/zebra/views.py` (`index`, `queue`).
+
+**Note:** WAL sharply reduces contention but two writers still serialize; a write that
+exceeds the 30 s busy timeout would still raise. The retry/self-heal path above keeps
+that residual case from wedging the state machine. Cross-worker coordination remains
+the separate limitation in issue 1.

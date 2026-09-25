@@ -88,10 +88,26 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/4.2/ref/settings/#databases
 
+# zebra runs mask attacks in background threads (services/launcher.py) that write to
+# the DB (progress, finalisation, crack ingest) concurrently with request threads.
+# On stock SQLite that contention throws "database is locked" mid-finalise, which used
+# to strand a finished run in 'running' -- an orphan that blocked the queue/autopilot.
+# WAL lets readers and a writer coexist; a long busy timeout makes a writer wait for
+# the lock instead of failing; IMMEDIATE takes the write lock up front so two writers
+# queue cleanly rather than deadlock on an upgrade. See services/launcher.py.
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {
+            'timeout': 30,  # seconds a writer waits for the lock before erroring
+            'transaction_mode': 'IMMEDIATE',
+            'init_command': (
+                'PRAGMA journal_mode=WAL;'
+                'PRAGMA synchronous=NORMAL;'
+                'PRAGMA busy_timeout=30000;'
+            ),
+        },
     }
 }
 
