@@ -74,6 +74,56 @@ class UnionTests(SimpleTestCase):
         with self.assertRaises(ValueError):
             cov.union_keyspace([P('?d'), P('?d?d')])
 
+    def test_empty_and_singleton(self):
+        self.assertEqual(cov.union_keyspace([]), 0)
+        self.assertEqual(cov.union_keyspace([P('?d?d')]), 100)
+
+    def test_custom_charset_partial_overlap(self):
+        # Two length-2 masks sharing some chars at each position: cell de-dup must
+        # count the shared cells once. pos0: {a,b} vs {b,c}; pos1: {x,y} vs {y,z}.
+        m1 = P('?1?2', custom_charsets={'1': 'ab', '2': 'xy'})
+        m2 = P('?1?2', custom_charsets={'1': 'bc', '2': 'yz'})
+        # |m1|=4, |m2|=4, overlap = {b}x{y} = 1 -> union 7
+        self.assertEqual(cov.union_keyspace([m1, m2]), 4 + 4 - 1)
+
+    def test_cell_method_matches_inclusion_exclusion(self):
+        # The fast cell-sum path (union_keyspace) and the retained
+        # inclusion-exclusion fallback must agree on overlapping/disjoint/nested/
+        # identical mask sets.
+        cases = [
+            [P('?a?l'), P('?l?a')],
+            [P('?a?a'), P('?l?l'), P('?u?u'), P('?d?d')],
+            [P('?u?l?d'), P('?a?a?a'), P('?l?l?l')],
+            [P('?d?d'), P('?d?d')],  # identical -> counted once
+            [P('?a?a'), P('?a?l'), P('?l?a'), P('?l?l')],
+        ]
+        for masks in cases:
+            self.assertEqual(cov.union_keyspace(masks),
+                             self._incl_excl(masks), msg=str(masks))
+
+    def test_fallback_triggers_and_agrees_when_cell_cap_exceeded(self):
+        # A low cap forces the inclusion-exclusion fallback; it must return the same
+        # value as the cell path (which succeeds under the default high cap).
+        masks = [P('?a?l'), P('?l?a'), P('?a?a')]
+        distinct = list({s for m in masks for s in m})
+        weights, bits = cov.atom_partition(distinct)
+        index = {s: bits[i] for i, s in enumerate(distinct)}
+        mask_atoms = [[cov._atoms_in(index[s]) for s in m] for m in masks]
+        self.assertIsNone(cov._union_via_cells(mask_atoms, weights, cap=0))
+        self.assertEqual(cov.union_keyspace(masks), self._incl_excl(masks))
+
+    @staticmethod
+    def _incl_excl(masks):
+        """Reference inclusion-exclusion via the retained fallback helper."""
+        masks = [m for m in masks if m]
+        if not masks:
+            return 0
+        distinct = list({s for m in masks for s in m})
+        weights, bits = cov.atom_partition(distinct)
+        index = {s: bits[i] for i, s in enumerate(distinct)}
+        bmasks = [[index[s] for s in m] for m in masks]
+        return cov._union_inclusion_exclusion(bmasks, weights, len(masks[0]))
+
 
 class CoverageByLengthTests(SimpleTestCase):
     def test_explicit_universe(self):

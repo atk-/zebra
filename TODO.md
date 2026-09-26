@@ -30,7 +30,20 @@ value-to-effort. See `DESIGN.md` for the seams these build on.
       `b_complement.hcchr`); dashboard clamps remaining≥0 / coverage≤100%. Still
       deferred: the underlying universe/keyspace mismatch (covered can exceed the
       universe total) is only papered over for display.
-- [ ] Cache coverage results (invalidate on mask add) for large projects
+- [x] Cache coverage results for large projects: `union_keyspace` rewritten from
+      2ⁿ inclusion–exclusion to a **disjoint-cell sum** (linear in mask count; see
+      `DESIGN.md` §3.4), and `project_coverage` memoized on `Project.coverage_cache`
+      (signature-keyed, self-invalidating — no add hooks needed). Measured: ~50
+      overlapping same-length masks went from a multi-second dashboard load to ms.
+- [ ] **Exact union volume for the fallback corner** (deferred; low priority):
+      `union_keyspace` still keeps a 2ⁿ inclusion–exclusion fallback
+      (`_union_inclusion_exclusion`) used past `UNION_CELL_CAP` (200k distinct
+      cells). A project that both exceeds that cap (long masks / many custom
+      charsets, e.g. all-`?a` length ≥ 9) **and** accumulates dozens of overlapping
+      masks at that length can still be slow. Real fix is a better exact algorithm
+      (coordinate-compressed sweep / Klee's-measure family), not bounding the DFS —
+      capping it would sacrifice exactness, which is zebra's differentiator. Add a
+      flag/guard first if it shows up in real use.
 
 ## Runs (make executions first-class)
 - [x] `Run` model surfaced: recording an attack creates a `Run` (mask + targeted

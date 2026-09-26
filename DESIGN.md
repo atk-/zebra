@@ -87,11 +87,17 @@ The core idea and why exact is feasible:
    groups of characters with identical membership across all sets in play. Every set
    is then exactly a union of atoms, so a position becomes a **bitmask over atoms**
    and any set/intersection size is a sum of integer atom weights.
-4. **Exact union volume** via **inclusion–exclusion** over the masks of a length,
-   using a DFS that prunes the moment an intersection becomes empty. Real mask sets
-   overlap sparsely, so this runs far below the 2ⁿ worst case. (If a length ever
-   accumulates too many mutually overlapping masks, the documented fallback is
-   per-axis atom refinement / disjoint-box decomposition.)
+4. **Exact union volume** via a **disjoint-cell sum**. Over the shared atom
+   partition each mask's box is a disjoint union of grid *cells* (one atom per
+   position), so the union of all masks is the union of their cell-sets and its
+   volume is simply the sum of the **distinct** cells' sizes — overlap is absorbed
+   by de-duplicating cells, with no inclusion–exclusion. This is **linear in the
+   mask count** (an already-covered mask contributes no new cells); its cost is
+   instead bounded by the number of distinct covered cells (≤ (atoms per position)^L).
+   Above `UNION_CELL_CAP` (200 000 distinct cells) — reachable only by a long mask
+   over a finely-split partition, e.g. an all-`?a` mask of length ≥ 9 — it falls back
+   to the older **inclusion–exclusion DFS** (`_union_inclusion_exclusion`), which
+   prunes the moment an intersection becomes empty but is 2ⁿ in the mask count.
 
 Public surface:
 
@@ -100,7 +106,8 @@ Public surface:
   project-defined wildcards, literals, and `??` (literal `?`).
 - `mask_keyspace(positions)` — product of per-position sizes.
 - `atom_partition(charsets)` — `(weights, bitmasks)`.
-- `union_keyspace(masks_same_length)` — exact union size.
+- `union_keyspace(masks_same_length)` — exact union size (disjoint-cell sum;
+  inclusion–exclusion `_union_inclusion_exclusion` fallback past the cell cap).
 - `marginal_keyspace` / `is_subsumed` / `overlap_keyspace` — redundancy checks used
   by the mask-planning UI.
 - `coverage_by_length(masks, universe)` — per-length `{covered, total, masks}`.
@@ -111,10 +118,23 @@ Public surface:
   box as a hashcat mask (`?token`/literal, or a `-1..-4` custom charset, never `?c`).
   Powers the "Fill gaps" UI via `coverage_helpers.project_complement_masks`.
 
-**Complexity note.** Union-of-boxes volume is #P-hard in general dimension, but here
-dimension = password length (small, ~6–12) and atoms per position are few, so
-inclusion–exclusion with pruning is fine in practice. This is a deliberate,
-documented trade-off.
+**Complexity note.** Union-of-boxes volume is #P-hard in general dimension. The
+disjoint-cell sum trades inclusion–exclusion's cost — exponential in the *mask
+count* — for one bounded by the covered region's distinct-cell count
+(≤ (atoms per position)^L). That is the right trade for zebra: lengths are modest
+(~6–12) and masks reuse a few character classes (so the cell count stays small),
+whereas the mask count grows without bound as a campaign accumulates work. The
+result is memoized per project (`Project.coverage_cache`, keyed by a signature of
+the covered masks + universe + wildcards; see `coverage_helpers.project_coverage`),
+so it recomputes only when the covered-mask set changes, not on every dashboard
+load.
+
+The retained inclusion–exclusion fallback (past `UNION_CELL_CAP`) is still 2ⁿ in
+the mask count, so a project that **both** exceeds the cell cap (long masks and/or
+many custom charsets) **and** piles up dozens of overlapping masks at that same
+length can still be slow. A genuinely better exact method for that corner
+(coordinate-compressed sweep / Klee's-measure family) is **deferred** — see TODO.
+This is a deliberate, documented trade-off.
 
 ## 3b. Similarity engine (`services/similarity.py`)
 

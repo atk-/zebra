@@ -194,12 +194,31 @@ def _popweight(bits, weights):
     return w
 
 
+# Above this many distinct covered cells, union_keyspace abandons the cell-sum
+# method and falls back to inclusion-exclusion. The cell method is linear in the
+# distinct-cell count; this cap bounds its cost for the pathological shape it is
+# bad at -- a long mask over a finely-split partition (e.g. a length-12 ?a mask),
+# whose cell count is huge though its mask count is tiny. In zebra's data (modest
+# lengths, few character classes) the cap is essentially never reached, so the
+# cell path is the normal path. See the two helpers below.
+UNION_CELL_CAP = 200_000
+
+
 def union_keyspace(masks):
     """Exact size of the union of the candidate sets of ``masks``.
 
     ``masks`` is a list of parsed masks (each a list of frozensets). They must
     all be the same length; different-length masks are disjoint, so callers
     group by length first (``coverage_by_length`` does this).
+
+    Every mask is a box over a shared *atom* partition (disjoint character groups),
+    so its candidate set is a disjoint union of grid *cells* -- one atom per
+    position. The union of all masks is then the union of their cell-sets, whose
+    size is just the sum of the *distinct* cells' sizes: overlap is absorbed by
+    de-duplicating cells, with no inclusion-exclusion. This is linear in the mask
+    count (an already-covered mask adds no new cells), unlike the 2**n
+    inclusion-exclusion fallback, used only when the distinct-cell count would
+    exceed ``UNION_CELL_CAP``.
     """
     masks = [m for m in masks if m]
     if not masks:
@@ -212,9 +231,46 @@ def union_keyspace(masks):
     distinct = list({s for m in masks for s in m})
     weights, bits = atom_partition(distinct)
     index = {s: bits[i] for i, s in enumerate(distinct)}
-    bmasks = [[index[s] for s in m] for m in masks]
-    n = len(bmasks)
 
+    # Fast path: sum of distinct covered grid-cell sizes.
+    mask_atoms = [[_atoms_in(index[s]) for s in m] for m in masks]
+    total = _union_via_cells(mask_atoms, weights, UNION_CELL_CAP)
+    if total is not None:
+        return total
+
+    # Fallback (rare -- see UNION_CELL_CAP): inclusion-exclusion over atom bitmasks.
+    bmasks = [[index[s] for s in m] for m in masks]
+    return _union_inclusion_exclusion(bmasks, weights, L)
+
+
+def _union_via_cells(mask_atoms, weights, cap):
+    """Union size as the sum of distinct covered grid-cell sizes.
+
+    ``mask_atoms`` is the per-mask, per-position list of atom ids composing that
+    position (a mask's cells are the Cartesian product of these). Returns the exact
+    union size, or ``None`` if the distinct-cell count would exceed ``cap`` (the
+    caller then falls back to inclusion-exclusion). The cap is tested inside the
+    product loop, so a single mask with an enormous cell count bails early rather
+    than materialising all of it first.
+    """
+    cells = set()
+    for ma in mask_atoms:
+        for combo in product(*ma):
+            cells.add(combo)
+            if len(cells) > cap:
+                return None
+    return sum(_cell_size(c, weights) for c in cells)
+
+
+def _union_inclusion_exclusion(bmasks, weights, L):
+    """Inclusion-exclusion union size over atom bitmasks (the 2**n fallback).
+
+    Kept for the pathological case ``_union_via_cells`` bails on: a covered region
+    with an enormous disjoint-cell count but few masks, where summing cells would
+    itself blow up. DFS over mask subsets, pruning a branch the moment its running
+    intersection is empty (so are all its supersets).
+    """
+    n = len(bmasks)
     total = 0
 
     def dfs(start, cur, sign):
