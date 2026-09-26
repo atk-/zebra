@@ -140,6 +140,71 @@ class RunCoverageTests(TestCase):
                          {'h1', 'h2'})  # the project's single hash type = all hashes
 
 
+class CoverageCacheTests(TestCase):
+    """project_coverage memoizes on Project.coverage_cache, keyed by an input sig."""
+
+    def setUp(self):
+        self.ht = HashType.objects.create(name='T-MD5', hashcat_module=0)
+        self.project = Project.objects.create(name='CACHE', hashtype=self.ht,
+                                              universe='0123456789')
+
+    def _exhaust(self, pattern):
+        mask = Mask.objects.create(project=self.project, pattern=pattern)
+        ch.compute_and_cache_keyspace(mask); mask.save()
+        Run.objects.create(mask=mask, project=self.project, attack_mode=3,
+                           status='exhausted')
+        return mask
+
+    def test_first_call_populates_cache(self):
+        self._exhaust('?d?d')
+        self.assertIsNone(self.project.coverage_cache)
+        rows = ch.project_coverage(self.project)
+        self.assertEqual(next(r for r in rows if r['length'] == 2)['covered'], 100)
+        self.project.refresh_from_db()
+        self.assertIn('sig', self.project.coverage_cache)
+        self.assertTrue(self.project.coverage_cache['rows'])
+
+    def test_second_call_hits_cache_without_recompute(self):
+        self._exhaust('?d?d')
+        ch.project_coverage(self.project)  # populate
+        # Corrupt the stored rows: a cache hit must return them verbatim (proving no
+        # recompute), so a sentinel covered value survives.
+        self.project.refresh_from_db()
+        self.project.coverage_cache['rows'][0]['covered'] = '42'
+        self.project.save(update_fields=['coverage_cache'])
+        rows = ch.project_coverage(self.project)
+        self.assertEqual(rows[0]['covered'], 42)  # served from cache, coerced to int
+
+    def test_new_exhausted_mask_invalidates(self):
+        self._exhaust('?d?d')
+        first = ch.project_coverage(self.project)
+        self.assertEqual(len(first), 1)
+        self._exhaust('?d?d?d')  # different length -> new row, signature changes
+        second = ch.project_coverage(self.project)
+        self.assertEqual({r['length'] for r in second}, {2, 3})
+
+    def test_universe_change_invalidates(self):
+        self._exhaust('?d?d')
+        row = next(r for r in ch.project_coverage(self.project) if r['length'] == 2)
+        self.assertEqual(row['total'], 100)  # 10**2
+        self.project.universe = '0123456789abcdef'
+        self.project.save(update_fields=['universe'])
+        row = next(r for r in ch.project_coverage(self.project) if r['length'] == 2)
+        self.assertEqual(row['total'], 256)  # 16**2, recomputed
+
+    def test_bigint_roundtrips_through_cache(self):
+        # A length-12 ?a mask has keyspace 95**12 -- far past 2**63; the string-based
+        # cache must preserve it exactly across a hit.
+        self.project.universe = None
+        self.project.save(update_fields=['universe'])
+        self._exhaust('?a' * 12)
+        expected = 95 ** 12
+        self.assertEqual(ch.project_coverage(self.project)[0]['covered'], expected)
+        cached = ch.project_coverage(self.project)[0]  # cache hit
+        self.assertEqual(cached['covered'], expected)
+        self.assertIsInstance(cached['covered'], int)
+
+
 class RecordAttackViewTests(TestCase):
     def setUp(self):
         self.ht = HashType.objects.create(name='V-MD5', hashcat_module=0)

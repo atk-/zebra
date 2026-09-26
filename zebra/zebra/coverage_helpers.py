@@ -1,6 +1,10 @@
 """DB-aware glue between the pure coverage engine and the Django models."""
 
+import hashlib
+import json
 from decimal import Decimal
+
+from django.db import OperationalError
 
 from .models import Wildcard, Mask
 from .services import coverage as cov
@@ -81,20 +85,65 @@ def planned_masks(project):
         project=project, runs__status__in=PLANNED_RUN_STATES).distinct()
 
 
-def project_coverage(project):
-    """Coverage-by-length summary for a project's exhausted-run masks.
+# Row fields holding arbitrary-precision keyspace ints. They can exceed 2**63, so
+# they're stored as strings in the JSON cache (SQLite/JSON-number-safe) and coerced
+# back to int on read. ``remaining`` may be None (unknown total) -- handled below.
+_COVERAGE_BIGINT_FIELDS = ('covered', 'total', 'remaining')
 
-    Returns a sorted list of row dicts ready for templating, each with:
-    length, masks, covered, total, remaining, percent.
-    """
-    wmap = project_wildcard_map()
+
+def _coverage_signature(masks, wmap, universe):
+    """Cheap fingerprint of everything ``project_coverage`` depends on.
+
+    Changes exactly when the memoized rows could change: which masks are covered
+    (id + the pattern/charset/increment fields that drive their keyspace), the
+    project universe, and the wildcard map used to parse them. Deliberately does
+    NOT include ``benchmark_hs`` -- the ETA is derived from the rows in the view,
+    not cached here."""
+    payload = {
+        'universe': universe or '',
+        'wildcards': sorted(wmap.items()),
+        'masks': sorted(
+            (m.id, m.pattern, json.dumps(m.custom_charsets or {}, sort_keys=True),
+             m.increment_min, m.increment_max)
+            for m in masks),
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def _serialize_coverage_rows(rows):
+    """Rows -> JSON-safe form (big ints as strings)."""
+    out = []
+    for r in rows:
+        d = dict(r)
+        for f in _COVERAGE_BIGINT_FIELDS:
+            v = d.get(f)
+            d[f] = None if v is None else str(v)
+        out.append(d)
+    return out
+
+
+def _deserialize_coverage_rows(rows):
+    """Cached JSON rows -> live form (big-int strings back to int)."""
+    out = []
+    for r in rows:
+        d = dict(r)
+        for f in _COVERAGE_BIGINT_FIELDS:
+            v = d.get(f)
+            d[f] = None if v is None else int(v)
+        out.append(d)
+    return out
+
+
+def _compute_coverage_rows(masks, wmap, universe):
+    """The actual (potentially expensive) coverage math over the covered masks."""
     parsed = []
-    for m in covered_masks(project):
+    for m in masks:
         try:
             parsed.extend(mask_expansion(m, wmap))  # incremental masks -> prefixes
         except cov.MaskParseError:
             continue  # skip malformed masks rather than break the dashboard
-    summary = cov.coverage_by_length(parsed, universe=expand_universe(project.universe))
+    summary = cov.coverage_by_length(parsed, universe=expand_universe(universe))
     rows = []
     for length, data in sorted(summary.items()):
         covered, total = data['covered'], data['total']
@@ -111,6 +160,36 @@ def project_coverage(project):
             'remaining': max(total - covered, 0) if total else None,
             'percent': min(percent, 100.0),
         })
+    return rows
+
+
+def project_coverage(project):
+    """Coverage-by-length summary for a project's exhausted-run masks.
+
+    Returns a sorted list of row dicts ready for templating, each with:
+    length, masks, covered, total, remaining, percent.
+
+    Memoized on ``project.coverage_cache`` keyed by a cheap signature of the inputs
+    (see ``_coverage_signature``): the exponential inclusion-exclusion re-runs only
+    when the covered-mask set / universe / wildcards change, not on every load.
+    """
+    wmap = project_wildcard_map()
+    masks = list(covered_masks(project))
+    sig = _coverage_signature(masks, wmap, project.universe)
+
+    cache = project.coverage_cache
+    if isinstance(cache, dict) and cache.get('sig') == sig:
+        return _deserialize_coverage_rows(cache.get('rows', []))
+
+    rows = _compute_coverage_rows(masks, wmap, project.universe)
+    project.coverage_cache = {'sig': sig, 'rows': _serialize_coverage_rows(rows)}
+    try:
+        project.save(update_fields=['coverage_cache'])
+    except OperationalError:
+        # A transient SQLite write lock (background launcher writes contend here --
+        # see the launcher's resilient save) must never break a dashboard GET. Skip
+        # persisting the cache this time; it'll be recomputed and retried next load.
+        pass
     return rows
 
 

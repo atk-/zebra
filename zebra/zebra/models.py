@@ -79,6 +79,16 @@ class Project(models.Model):
     # True when zebra *saved* an upload into its managed dir (so it may replace
     # that file on refresh); False for a zero-copy server-side path we never touch.
     hashfile_managed = models.BooleanField(default=False)
+    # Memoized per-length coverage rows for the dashboard. Computing coverage runs
+    # an inclusion-exclusion over the exhausted masks (``services.coverage`` /
+    # ``coverage_helpers.project_coverage``), which is exponential in the number of
+    # overlapping same-length masks and dominates dashboard load once a campaign has
+    # dozens of them. This caches the result as ``{"sig": <inputs fingerprint>,
+    # "rows": [...]}``: the signature is recomputed cheaply on every load from the
+    # covered masks + universe + wildcard map, and the heavy math re-runs only when
+    # it changes. Self-invalidating, so no status-transition hooks are needed. Big
+    # ints are stored as strings inside ``rows`` (JS/SQLite-safe; see coverage_helpers).
+    coverage_cache = models.JSONField(null=True, blank=True, default=None)
 
     @property
     def is_file_backed(self):
